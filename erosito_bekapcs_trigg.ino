@@ -4,15 +4,18 @@
 // Kikapcsolás (gomb / trigger): mindig teljes RL1-RL2 ciklus, az RL2 legalább RL2_MIN_ON_MS-ig behúzva marad, csak utána ki
 // Minimális kikapcsolt idő (MIN_OFF_MS): addig nincs bekapcsolás; a kérés megmarad (gomb: feltétel nélkül, trigger: ha még aktív)
 // Függő gombos kérés (be / ki) alatt a további gombnyomások hatástalanok
-// LED: be = világít; hiba = FAULT_BLINK_MS villogás, utána minden KI; trigger tiltva + kézi bekapcsolás = 2 villanás
-// Hiba után FAULT_LOCKOUT_MS ideig nincs bekapcsolás; utána beragadt gomb = újabb hiba, különben aktív triggerre be (AUTO_ON_AFTER_FAULT)
+// LED: be = világít; hiba = FAULT_BLINK_MS villogás (bemenet-hibánál közben a relék BE, hálózati hibánál már KI), utána minden KI;
+// trigger tiltva + kézi bekapcsolás = 2 villanás
+// Hiba után FAULT_LOCKOUT_MS ideig nincs bekapcsolás (a kérés ilyenkor elvész, nem kerül sorba); utána beragadt gomb = újabb hiba,
+// különben aktív triggerre be (AUTO_ON_AFTER_FAULT)
 // Hardveres hibát (beragadt gomb, hálózat hiánya / KI relénél) az NVS tárolja: reset után az ok megszűnéséig nem kapcsol be magától
 // Hálózat-visszajelzés (MAINS_CHECK): H11AA1M csak az RL1 kimenetén (LOW = van hálózat); az RL2 csak az RL1 visszajelzése után húz be
 // (az RL2 a toroid lágyindító NTC-jét zárja rövidre, utána külön visszajelzés nem kell)
 // Hálózatkiesés bekapcsolt állapotban (MAINS_LOSS_MS): a relék azonnal elengednek, LED villog; a MIN_OFF_MS után
-// aktív triggerre újra bekapcsol lágyindítással (ha a hálózat nem jön vissza: F_NOMAINS, nincs több próbálkozás)
+// aktív triggerre újra bekapcsol lágyindítással (ha a hálózat nem jön vissza: F_NOMAINS, nincs több próbálkozás);
+// ha a kiesés előtt kikapcsolás volt függőben, nincs újrakapcsolás. Hiba-villogás alatti kiesésnél is azonnal KI
 // Opto: 3 x 22k sorosan a hálózat felé, kimenet 47k felhúzóval a 3V3-ra; az 's' parancs a LOW mintaszámot is kiírja (~28-37 normális)
-// Boot alatt a relék KI; aktív triggerre induláskor bekapcsol (TRIGGER_ON_BOOT); watchdog: WDT_MS
+// Boot alatt a relék KI; aktív triggerre induláskor bekapcsol (TRIGGER_ON_BOOT, fagyás után mindig), a MIN_OFF_MS a boottól számít; watchdog: WDT_MS
 // Áramszünet után (tápfeltöltés / brownout reset) POWERUP_HOLD_MS ideig a gomb és a trigger hatástalan, a LED ritkán felvillan;
 // utána a beállítások szerint. A hátralévő idő RTC memóriában van: a várakozás alatti fagyás / reset nem rövidíti le
 // Soros 115200, 's' = állapot; kötelező az "USB CDC On Boot: Enabled"; core: Arduino-ESP32 3.x / 4.x, board: XIAO_ESP32C3
@@ -76,6 +79,16 @@ const uint8_t       MAINS_MIN_LOW    = 8;      // ennyi LOW minta / ablak = van 
 const unsigned long MAINS_FAULT_MS   = 150;    // ennyi ideig tartó eltérés = hiba
 const unsigned long MAINS_OFF_GRACE_MS = 1000; // elengedés után ennyi ideig nem hiba a maradék feszültség
 const unsigned long MAINS_LOSS_MS    = 25;     // bekapcsolva, visszajelzés után: ennyi ideig folyamatos HIGH = hálózatkiesés (>= 2 félperiódus)
+const unsigned long MAINS_GAP_MS     = 5;      // ennél hosszabb mintavételi szünet (pl. NVS írás) nem számít kiesésnek
+
+// Időzítések egymáshoz való viszonya (fordításkor ellenőrizve)
+static_assert(MAINS_LOSS_MS >= 20, "MAINS_LOSS_MS: legalabb 2 felperiodus (20 ms) kell, kulonben a nullatmenet hamis kiesest okoz");
+static_assert(MAINS_GAP_MS < MAINS_LOSS_MS, "MAINS_GAP_MS < MAINS_LOSS_MS kell");
+static_assert(MAINS_FAULT_MS > MAINS_WIN_MS, "MAINS_FAULT_MS > MAINS_WIN_MS kell (legalabb egy teljes meresi ablak)");
+static_assert(RL2_DELAY_MS > MAINS_WIN_MS + MAINS_FAULT_MS, "RL2_DELAY_MS: az RL1 visszajelzesnek (vagy hibajanak) az RL2 elott ki kell derulnie");
+static_assert(MAINS_OFF_GRACE_MS < MIN_OFF_MS, "MAINS_OFF_GRACE_MS < MIN_OFF_MS kell (bekapcsolaskor mar ervenyes a KI-rele ellenorzes)");
+static_assert(LONG_PRESS_MS < DOUBLE_GAP_MS, "LONG_PRESS_MS < DOUBLE_GAP_MS kell");
+static_assert(WDT_MS >= 1000, "WDT_MS: az NVS iras miatt legalabb 1 s kell");
 
 // ---- Diagnosztika ----
 const unsigned long BTN_STUCK_MS = 10000;  // ennyi ideig nyomva tartott gomb = hiba
@@ -279,7 +292,7 @@ void mainsClearBad() {
 void mainsUpdate() {
   if (!MAINS_CHECK) return;
   unsigned long now = millis();
-  if (now - fbLastSample > 5) fbLastLow = now;   // mintavételi szünet (pl. NVS írás): nincs adat, nem kiesés
+  if (now - fbLastSample > MAINS_GAP_MS) fbLastLow = now;   // mintavételi szünet (pl. NVS írás): nincs adat, nem kiesés
   fbLastSample = now;
   if (digitalRead(PIN_FB1) == LOW) {
     fbLastLow = now;
@@ -306,10 +319,15 @@ void mainsUpdate() {
   }
 }
 
-// hibakód: gyors kiesés (már igazolt hálózat után), vagy tartós eltérés a várttól
+// gyors kiesés: bekapcsolva, már igazolt hálózat után MAINS_LOSS_MS ideig nincs LOW minta
+bool mainsLost() {
+  return MAINS_CHECK && on && fbConfirmed && (millis() - fbLastLow) >= MAINS_LOSS_MS;
+}
+
+// hibakód: gyors kiesés, vagy tartós eltérés a várttól
 int mainsFault() {
   if (!MAINS_CHECK) return F_NONE;
-  if (on && fbConfirmed && (millis() - fbLastLow) >= MAINS_LOSS_MS) return F_MAINSLOST;
+  if (mainsLost()) return F_MAINSLOST;
   if (fbBad && (millis() - fbBadSince) >= MAINS_FAULT_MS) return on ? F_NOMAINS : F_MAINSOFF;
   return F_NONE;
 }
@@ -417,9 +435,9 @@ void startFault(int idx, int f) {
   onReqTrig = false;
   if (idx == IN_FB1) {
     // hálózati hiba: a relék AZONNAL elengednek (visszatérő hálózatnál ne maradjon áthidalva az NTC)
-    bool wasOn = on;
+    bool retry = on && !offPending;    // függő kikapcsolásnál (gomb / trigger) nincs újrakapcsolás
     setState(false, (f == F_MAINSLOST) ? "halozatkieses" : "halozati hiba");
-    if (f == F_MAINSLOST && wasOn) {   // MIN_OFF_MS után aktív triggerre újra be (lágyindítással)
+    if (f == F_MAINSLOST && retry) {   // MIN_OFF_MS után aktív triggerre újra be (lágyindítással)
       onReqTrig = true;
       onReqSrc = "trigger halozatkieses utan";
     }
@@ -433,8 +451,11 @@ void startFault(int idx, int f) {
   ledT = faultStart;
   if (idx == IN_FB1) {
     if (f == F_MAINSLOST) {
-      slogc("!!! HALOZATKIESES az RL1 utan: relek AZONNAL KI, LED villog; %lu ms mulva aktiv triggerre ujra be\n",
-            (unsigned long)MIN_OFF_MS);
+      if (onReqTrig)
+        slogc("!!! HALOZATKIESES az RL1 utan: relek AZONNAL KI, LED villog; %lu ms mulva aktiv triggerre ujra be\n",
+              (unsigned long)MIN_OFF_MS);
+      else
+        slogc("!!! HALOZATKIESES az RL1 utan: relek AZONNAL KI, LED villog (kikapcsolas volt fuggoben: nincs ujrakapcsolas)\n");
     } else {
       slogc("!!! RL1 kimenet HIBA: %s -> relek KI, LED villog\n",
             (f == F_NOMAINS) ? "nincs halozati feszultseg: az RL1 nem huzott be (vagy elveszett)"
@@ -588,7 +609,7 @@ void buttonLogic(bool changed) {
 
 void printStatus() {
   char lk[64] = "";
-  if (powerHold)
+  if (powerHold && (long)(powerHoldUntil - millis()) > 0)
     snprintf(lk, sizeof lk, " [aramszunet utani varakozas: %lu s]", (unsigned long)((powerHoldUntil - millis()) / 1000));
   else if (lockoutPending && (long)(millis() - lockoutUntil) < 0)
     snprintf(lk, sizeof lk, " [tiltas: %lu ms]", (unsigned long)(lockoutUntil - millis()));
@@ -748,6 +769,10 @@ void loop() {
     }
   } else if (faultActive) {
     // villogás: bemenetek nem számítanak, a végén minden KI
+    if (mainsLost()) {                    // bemenet-hiba villogása alatt (relék még BE) is azonnal KI
+      setState(false, "halozatkieses hiba-villogas alatt");
+      slogc("!!! HALOZATKIESES hiba-villogas alatt: relek AZONNAL KI\n");
+    }
     if (btnChanged) lastShortRel = now;   // a hiba alatti nyomás is a sorozat része
     if (now - faultStart >= FAULT_BLINK_MS) endFault();
   } else {
