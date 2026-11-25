@@ -1,14 +1,20 @@
 // XIAO ESP32-C3 relé szekvenszer: gomb + 12 V trigger, RL1 azonnal, RL2 késleltetve, hálózat-visszajelzés, hibakezelés
 // Gomb: hosszú nyomás = be/ki; 2 rövid nyomás = trigger tiltás/engedés (NVS); 3+ rövid nyomás = hiba
-// Trigger: aktív élre be, inaktív élre ki; mindig teljes RL1-RL2 ciklus: az RL2 legalább RL2_MIN_ON_MS-ig behúzva marad, csak utána ki
+// Trigger: aktív élre be, inaktív élre ki
+// Kikapcsolás (gomb / trigger): mindig teljes RL1-RL2 ciklus, az RL2 legalább RL2_MIN_ON_MS-ig behúzva marad, csak utána ki
+// Minimális kikapcsolt idő (MIN_OFF_MS): addig nincs bekapcsolás; a kérés megmarad (gomb: feltétel nélkül, trigger: ha még aktív)
+// Függő gombos kérés (be / ki) alatt a további gombnyomások hatástalanok
 // LED: be = világít; hiba = FAULT_BLINK_MS villogás, utána minden KI; trigger tiltva + kézi bekapcsolás = 2 villanás
 // Hiba után FAULT_LOCKOUT_MS ideig nincs bekapcsolás; utána beragadt gomb = újabb hiba, különben aktív triggerre be (AUTO_ON_AFTER_FAULT)
 // Hardveres hibát (beragadt gomb, hálózat hiánya / KI relénél) az NVS tárolja: reset után az ok megszűnéséig nem kapcsol be magától
 // Hálózat-visszajelzés (MAINS_CHECK): H11AA1M csak az RL1 kimenetén (LOW = van hálózat); az RL2 csak az RL1 visszajelzése után húz be
 // (az RL2 a toroid lágyindító NTC-jét zárja rövidre, utána külön visszajelzés nem kell)
+// Hálózatkiesés bekapcsolt állapotban (MAINS_LOSS_MS): a relék azonnal elengednek, LED villog; a MIN_OFF_MS után
+// aktív triggerre újra bekapcsol lágyindítással (ha a hálózat nem jön vissza: F_NOMAINS, nincs több próbálkozás)
 // Opto: 3 x 22k sorosan a hálózat felé, kimenet 47k felhúzóval a 3V3-ra; az 's' parancs a LOW mintaszámot is kiírja (~28-37 normális)
 // Boot alatt a relék KI; aktív triggerre induláskor bekapcsol (TRIGGER_ON_BOOT); watchdog: WDT_MS
-// Áramszünet után (tápfeltöltés / brownout reset) POWERUP_HOLD_MS ideig a gomb és a trigger hatástalan; utána a beállítások szerint
+// Áramszünet után (tápfeltöltés / brownout reset) POWERUP_HOLD_MS ideig a gomb és a trigger hatástalan, a LED ritkán felvillan;
+// utána a beállítások szerint. A hátralévő idő RTC memóriában van: a várakozás alatti fagyás / reset nem rövidíti le
 // Soros 115200, 's' = állapot; kötelező az "USB CDC On Boot: Enabled"; core: Arduino-ESP32 3.x / 4.x, board: XIAO_ESP32C3
 
 #include <Arduino.h>
@@ -20,6 +26,7 @@
 #include <freertos/queue.h>
 #include <esp_task_wdt.h>
 #include <esp_system.h>
+#include <esp_attr.h>
 
 // Core 3.x / 4.x kell (a verzió-makró az Arduino.h-ból jön, ezért az include-ok után ellenőrzünk)
 #if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
@@ -39,7 +46,8 @@ const int PIN_RL2  = 7;   // D5:  RL2 tranzisztor
 const int PIN_FB1  = 6;   // D4:  RL1 kimenet opto, LOW = van hálózat, 47k felhúzó 3V3-ra
 
 // ---- Beállítások ----
-const unsigned long RL2_DELAY_MS    = 400;    // RL2 késleltetése
+const unsigned long RL2_DELAY_MS    = 1000;   // RL2 késleltetése (lágyindítás az NTC-n át; 250 VA toroid + 20000 uF: ~100-300 ms töltés, 1 s bőven elég)
+const unsigned long MIN_OFF_MS      = 5000;   // minimális kikapcsolt idő (NTC hűlés, relék kímélése); induláskor is a boottól számít
 const unsigned long DEBOUNCE_MS     = 30;     // bemenet szűrés
 const uint32_t      WDT_MS          = 3000;   // watchdog időkorlát
 
@@ -48,16 +56,18 @@ const unsigned long DOUBLE_GAP_MS   = 800;    // rövid nyomások közti max. sz
 const uint8_t       SHORT_FAULT_COUNT = 3;    // ennyi rövid nyomás = hiba
 const unsigned long FLASH_ON_MS     = 150;    // villanás: világít
 const unsigned long FLASH_OFF_MS    = 150;    // villanás: sötét
-const unsigned long FAULT_BLINK_MS  = 1000;   // hibavillogás hossza (közben a relék BE), utána minden KI
+const unsigned long FAULT_BLINK_MS  = 1000;   // hibavillogás hossza (bemenet-hibánál közben a relék BE; hálózati hibánál már KI), utána minden KI
 const unsigned long FAULT_HALF_MS   = 100;    // hibavillogás fél periódusa
 
 const bool TRIGGER_ON_BOOT      = true;    // true: induláskor aktív triggerre bekapcsol
 const bool BROWNOUT_IS_POWERLOSS = true;   // true: a brownout reset áramszünetnek számít (POWERUP_HOLD_MS); false: fagyásnak
 const unsigned long POWERUP_HOLD_MS = 120000UL; // áramszünet után ennyi ideig a gomb és a trigger hatástalan (0 = nincs)
+const unsigned long HOLD_FLASH_PERIOD_MS = 3000; // várakozás alatt: felvillanás periódusa
+const unsigned long HOLD_FLASH_MS   = 40;        // várakozás alatt: felvillanás hossza
 
 const unsigned long FAULT_LOCKOUT_MS = 5000; // hiba után ennyi ideig nincs bekapcsolás
 const bool AUTO_ON_AFTER_FAULT  = true;    // true: a tiltás végén aktív triggerre bekapcsol
-const unsigned long RL2_MIN_ON_MS = 2000;  // trigger: az RL2 legalább ennyi ideig behúzva marad kikapcsolás előtt
+const unsigned long RL2_MIN_ON_MS = 2000;  // az RL2 legalább ennyi ideig behúzva marad kikapcsolás előtt (gomb és trigger)
 
 // ---- Hálózati feszültség visszajelzés ----
 const bool          MAINS_CHECK      = false;   // false: nincs hálózat-visszajelzés (opto nélkül ezt használd)
@@ -65,6 +75,7 @@ const unsigned long MAINS_WIN_MS     = 40;     // mérési ablak
 const uint8_t       MAINS_MIN_LOW    = 8;      // ennyi LOW minta / ablak = van hálózat (~1 kHz mintavétel)
 const unsigned long MAINS_FAULT_MS   = 150;    // ennyi ideig tartó eltérés = hiba
 const unsigned long MAINS_OFF_GRACE_MS = 1000; // elengedés után ennyi ideig nem hiba a maradék feszültség
+const unsigned long MAINS_LOSS_MS    = 25;     // bekapcsolva, visszajelzés után: ennyi ideig folyamatos HIGH = hálózatkiesés (>= 2 félperiódus)
 
 // ---- Diagnosztika ----
 const unsigned long BTN_STUCK_MS = 10000;  // ennyi ideig nyomva tartott gomb = hiba
@@ -87,8 +98,13 @@ int lastFault = 0;              // utolsó hiba kódja (F_*)
 int storedFault = 0;            // NVS-ben tárolt hibakód
 bool lockoutPending = false;    // hiba utáni tiltás (lejártakor egyszer kiértékeljük)
 unsigned long lockoutUntil = 0;
-bool offPending = false;        // trigger elment: kikapcsolás az RL2 minimális behúzási ideje után
+bool offPending = false;        // kikapcsolás az RL2 minimális behúzási ideje után
+bool offByBtn = false;          // a függő kikapcsolást a gomb kérte (a trigger nem vonhatja vissza)
 unsigned long offAt = 0;
+unsigned long offTime = 0;      // utolsó kikapcsolás ideje (0 = boot: a minimális kikapcsolt idő a boottól számít)
+bool onReqBtn = false;          // függő bekapcsolás (gomb): a MIN_OFF_MS végén feltétel nélkül
+bool onReqTrig = false;         // függő bekapcsolás (trigger / automatika): a MIN_OFF_MS végén, ha a trigger még aktív
+const char *onReqSrc = "";
 volatile bool statusReq = false;
 
 // Gomb-gesztusok
@@ -113,10 +129,33 @@ bool          fbValid     = false;  // van teljes ablak a parancs óta
 bool          fbPresent   = false;  // az utolsó ablak szerint van hálózat
 bool          fbBad       = false;  // eltért a várttól
 bool          fbConfirmed = false;  // megjelent a hálózat a bekapcsolás után
+unsigned long fbLastLow   = 0;      // utolsó LOW minta ideje (gyors kiesés-figyelés)
+unsigned long fbLastSample = 0;     // utolsó minta ideje
 unsigned long fbBadSince  = 0;
 unsigned long fbCmdT      = 0;      // utolsó relé-parancs ideje
 
 Preferences prefs;
+
+// Áramszünet utáni várakozás hátralévő ideje: túléli a szoftveres / watchdog resetet, tápvesztéskor elvész
+const uint32_t HOLD_MAGIC = 0x484F4C44UL;
+RTC_NOINIT_ATTR uint32_t rtcHoldLeft;
+RTC_NOINIT_ATTR uint32_t rtcHoldCheck;      // HOLD_MAGIC ^ rtcHoldLeft, ha érvényes
+unsigned long lastHoldSave = 0;
+
+void holdSave(unsigned long left) {
+  rtcHoldLeft = (uint32_t)left;
+  rtcHoldCheck = HOLD_MAGIC ^ rtcHoldLeft;
+}
+void holdClear() {
+  rtcHoldLeft = 0;
+  rtcHoldCheck = 0;
+}
+// érvényes, még le nem járt várakozás az előző futásból (ms), különben 0
+unsigned long holdLoad() {
+  if (rtcHoldCheck != (HOLD_MAGIC ^ rtcHoldLeft)) return 0;
+  if (rtcHoldLeft > POWERUP_HOLD_MS) return 0;
+  return rtcHoldLeft;
+}
 
 // ---- Soros napló: sor + külön task ----
 struct LogMsg { char text[160]; };
@@ -207,12 +246,14 @@ void ledUpdate() {
       if (ledFlashes > 0) { ledFlashOn = true; ledT = now; }
     }
     level = (ledFlashes > 0) ? ledFlashOn : ledBase;
+  } else if (powerHold) {
+    level = (now % HOLD_FLASH_PERIOD_MS) < HOLD_FLASH_MS;   // várakozás: ritka felvillanás
   }
   digitalWrite(PIN_LED, level ? HIGH : LOW);
 }
 
 // Hibakódok és bemenet-azonosítók (int, nem enum: az Arduino IDE prototípusai miatt)
-const int F_NONE = 0, F_STUCK = 1, F_CHATTER = 2, F_PRESSES = 3, F_NOMAINS = 4, F_MAINSOFF = 5;
+const int F_NONE = 0, F_STUCK = 1, F_CHATTER = 2, F_PRESSES = 3, F_NOMAINS = 4, F_MAINSOFF = 5, F_MAINSLOST = 6;
 const int IN_BTN = 0, IN_TRIG = 1, IN_FB1 = 2;
 
 // ---- Hálózati feszültség visszajelzés ----
@@ -227,6 +268,7 @@ void mainsCmd() {
   fbBad = false;
   fbConfirmed = false;
   fbCmdT = t;
+  fbLastLow = t;
 }
 
 // függő eltérés törlése
@@ -237,7 +279,12 @@ void mainsClearBad() {
 void mainsUpdate() {
   if (!MAINS_CHECK) return;
   unsigned long now = millis();
-  if (digitalRead(PIN_FB1) == LOW && fbLow < 255) fbLow++;
+  if (now - fbLastSample > 5) fbLastLow = now;   // mintavételi szünet (pl. NVS írás): nincs adat, nem kiesés
+  fbLastSample = now;
+  if (digitalRead(PIN_FB1) == LOW) {
+    fbLastLow = now;
+    if (fbLow < 255) fbLow++;
+  }
   if (now - fbWinStart < MAINS_WIN_MS) return;
   fbWinStart = now;
   bool present = (fbLow >= MAINS_MIN_LOW);
@@ -259,9 +306,10 @@ void mainsUpdate() {
   }
 }
 
-// hibakód, ha az RL1 kimenete tartósan eltér a várttól
+// hibakód: gyors kiesés (már igazolt hálózat után), vagy tartós eltérés a várttól
 int mainsFault() {
   if (!MAINS_CHECK) return F_NONE;
+  if (on && fbConfirmed && (millis() - fbLastLow) >= MAINS_LOSS_MS) return F_MAINSLOST;
   if (fbBad && (millis() - fbBadSince) >= MAINS_FAULT_MS) return on ? F_NOMAINS : F_MAINSOFF;
   return F_NONE;
 }
@@ -270,6 +318,9 @@ void setState(bool s, const char *src) {
   if (s == on) return;
   on = s;
   offPending = false;
+  offByBtn = false;
+  onReqBtn = false;
+  onReqTrig = false;
   if (on) {
     digitalWrite(PIN_RL1, HIGH);
     onTime = millis();                 // az RL2 a loop()-ban jön
@@ -280,6 +331,7 @@ void setState(bool s, const char *src) {
     digitalWrite(PIN_RL2, LOW);        // mindkettő azonnal, RL2 előbb
     digitalWrite(PIN_RL1, LOW);
     rl2On = false;
+    offTime = millis();                // minimális kikapcsolt idő innen
     ledBase = false;
     ledFlashes = 0;
     mainsCmd();
@@ -361,6 +413,17 @@ void saveFault(int f) {
 }
 
 void startFault(int idx, int f) {
+  onReqBtn = false;                    // függő bekapcsolási kérések elvetése
+  onReqTrig = false;
+  if (idx == IN_FB1) {
+    // hálózati hiba: a relék AZONNAL elengednek (visszatérő hálózatnál ne maradjon áthidalva az NTC)
+    bool wasOn = on;
+    setState(false, (f == F_MAINSLOST) ? "halozatkieses" : "halozati hiba");
+    if (f == F_MAINSLOST && wasOn) {   // MIN_OFF_MS után aktív triggerre újra be (lágyindítással)
+      onReqTrig = true;
+      onReqSrc = "trigger halozatkieses utan";
+    }
+  }
   lastFault = f;
   saveFault(f);
   faultActive = true;
@@ -369,9 +432,14 @@ void startFault(int idx, int f) {
   ledFlashes = 0;
   ledT = faultStart;
   if (idx == IN_FB1) {
-    slogc("!!! RL1 kimenet HIBA: %s -> LED villog, majd relek es LED KI\n",
-          (f == F_NOMAINS) ? "nincs halozati feszultseg: az RL1 nem huzott be (vagy elveszett)"
-                           : "halozati feszultseg van KIKAPCSOLT rele mellett (ragadt / osszehegedt erintkezo?)");
+    if (f == F_MAINSLOST) {
+      slogc("!!! HALOZATKIESES az RL1 utan: relek AZONNAL KI, LED villog; %lu ms mulva aktiv triggerre ujra be\n",
+            (unsigned long)MIN_OFF_MS);
+    } else {
+      slogc("!!! RL1 kimenet HIBA: %s -> relek KI, LED villog\n",
+            (f == F_NOMAINS) ? "nincs halozati feszultseg: az RL1 nem huzott be (vagy elveszett)"
+                             : "halozati feszultseg van KIKAPCSOLT rele mellett (ragadt / osszehegedt erintkezo?)");
+    }
     return;
   }
   const Input &in = inputs[idx];
@@ -389,16 +457,58 @@ void endFault() {
   faultActive = false;
   faultHold = true;                    // a következő bekapcsolásig nincs hibafigyelés
   resyncInputs();
+  if (lastFault == F_MAINSLOST) {      // hálózatkiesés: nem hiba-tiltás, csak a minimális kikapcsolt idő
+    slogc("Halozatkieses: villogas vege%s\n", onReqTrig ? ", bekapcsolas a minimalis kikapcsolt ido utan, ha a trigger aktiv" : "");
+    return;
+  }
   lockoutPending = true;               // tiltás kezdete
   lockoutUntil = millis() + FAULT_LOCKOUT_MS;
   slogc("Hiba vege: relek es LED KI. %lu ms-ig nincs bekapcsolas, utana tiszta lappal indulhat.\n", (unsigned long)FAULT_LOCKOUT_MS);
 }
+
+// a minimális kikapcsolt időből hátralévő ms (0 = lejárt / be van kapcsolva)
+unsigned long minOffLeft() {
+  if (on) return 0;
+  unsigned long el = millis() - offTime;
+  return (el >= MIN_OFF_MS) ? 0 : (MIN_OFF_MS - el);
+}
+
+// kikapcsolási kérés (gomb / trigger): az RL2 legalább RL2_MIN_ON_MS-ig behúzva marad
+void requestOff(const char *src, bool byBtn) {
+  if (!on) return;
+  unsigned long now = millis();
+  if (rl2On && (long)(now - rl2Time) >= (long)RL2_MIN_ON_MS) {
+    setState(false, src);
+    return;
+  }
+  if (byBtn) offByBtn = true;
+  if (offPending) return;              // már függőben
+  offPending = true;
+  if (rl2On) {
+    offAt = rl2Time + RL2_MIN_ON_MS;
+    slog("Kikapcsolas (%s) %lu ms mulva: RL2 minimum ido\n", src, (unsigned long)(offAt - now));
+  } else {
+    slog("Kikapcsolas (%s) az RL2 behuzasa + %lu ms utan: teljes ciklus\n", src, (unsigned long)RL2_MIN_ON_MS);
+  }
+}
+
+// függő gombos kérés: a további gombnyomások hatástalanok
+bool btnBusy() { return onReqBtn || (offPending && offByBtn); }
 
 // bekapcsolási kérés; hiba után az első kérés tiszta lappal indul
 void switchOn(const char *src, bool manual) {
   if (on || faultActive) return;
   if (lockoutPending && (long)(millis() - lockoutUntil) < 0) {      // tiltás alatt eldobjuk
     slog("Bekapcsolas tiltva (%s): hiba utan meg %lu ms\n", src, (unsigned long)(lockoutUntil - millis()));
+    return;
+  }
+  unsigned long left = minOffLeft();
+  if (left > 0) {                      // minimális kikapcsolt idő: a kérés megmarad
+    if (manual) onReqBtn = true;
+    else onReqTrig = true;
+    onReqSrc = src;
+    slog("Bekapcsolas (%s) %lu ms mulva: minimalis kikapcsolt ido%s\n", src, left,
+         manual ? "" : " (ha a trigger meg aktiv)");
     return;
   }
   if (faultHold) {
@@ -433,6 +543,15 @@ void toggleTrigOff() {
 // gesztusok: hosszú = be/ki; pontosan 2 rövid = trigger váltás (a sorozat végén); 3+ rövid = hiba, tiltás nem változik
 void buttonLogic(bool changed) {
   unsigned long now = millis();
+  if (btnBusy()) {                     // függő gombos be / ki: minden nyomás hatástalan
+    if (changed && btn.stable == LOW) {
+      pressConsumed = true;
+      slog("Gomb: fuggo %s, a nyomas hatastalan\n", onReqBtn ? "bekapcsolas" : "kikapcsolas");
+    }
+    shortCount = 0;
+    burstTaint = false;
+    return;
+  }
   if (changed) {
     if (btn.stable == LOW) {
       pressStart = btn.t;
@@ -454,7 +573,7 @@ void buttonLogic(bool changed) {
     pressConsumed = true;                        // hosszú nyomás
     shortCount = 0;
     burstTaint = false;                              // elveti a függő sorozatot
-    if (on) setState(false, "gomb (hosszu nyomas)");
+    if (on) requestOff("gomb (hosszu nyomas)", true);
     else switchOn("gomb", true);
   }
   // sorozat lezárása: gomb fent, DOUBLE_GAP_MS csend
@@ -473,9 +592,12 @@ void printStatus() {
     snprintf(lk, sizeof lk, " [aramszunet utani varakozas: %lu s]", (unsigned long)((powerHoldUntil - millis()) / 1000));
   else if (lockoutPending && (long)(millis() - lockoutUntil) < 0)
     snprintf(lk, sizeof lk, " [tiltas: %lu ms]", (unsigned long)(lockoutUntil - millis()));
-  slogc("ALLAPOT: RL1=%s RL2=%s LED=%s%s%s%s\n", on ? "BE" : "KI", rl2On ? "BE" : "KI",
+  char rq[64] = "";
+  if (onReqBtn || onReqTrig)
+    snprintf(rq, sizeof rq, " (bekapcs. fuggoben: %s, %lu ms)", onReqBtn ? "gomb" : "trigger", minOffLeft());
+  slogc("ALLAPOT: RL1=%s RL2=%s LED=%s%s%s%s%s\n", on ? "BE" : "KI", rl2On ? "BE" : "KI",
         (ledFaultBlink) ? "hiba-villog" : (ledBase ? "vilagit" : "sotet"),
-        faultHold ? " (hiba utan: figyeles szunetel)" : "", offPending ? " (kikapcs. fuggoben)" : "", lk);
+        faultHold ? " (hiba utan: figyeles szunetel)" : "", offPending ? " (kikapcs. fuggoben)" : "", rq, lk);
   slogc("  GOMB:    %s\n", btn.stable == LOW ? "nyomva" : "nyugalom");
   slogc("  TRIGGER: %s, %s\n", trig.stable == LOW ? "aktiv (12 V)" : "nincs", trigOff ? "TILTVA" : "engedelyezve");
   if (MAINS_CHECK) {
@@ -556,9 +678,16 @@ void setup() {
                      rr == ESP_RST_WDT      || rr == ESP_RST_PANIC);
   bool powerLoss = (rr == ESP_RST_POWERON) || (rr == ESP_RST_BROWNOUT && BROWNOUT_IS_POWERLOSS);
   if (rr == ESP_RST_BROWNOUT && !BROWNOUT_IS_POWERLOSS) crashReset = true;
-  if (powerLoss && POWERUP_HOLD_MS > 0) {
+  // áramszünet: teljes várakozás; egyéb reset a várakozás alatt: a hátralévő idő folytatódik (RTC)
+  unsigned long holdMs = powerLoss ? POWERUP_HOLD_MS : holdLoad();
+  bool holdResumed = !powerLoss && holdMs > 0;
+  if (holdMs > 0) {
     powerHold = true;
-    powerHoldUntil = millis() + POWERUP_HOLD_MS;
+    powerHoldUntil = millis() + holdMs;
+    holdSave(holdMs);
+    lastHoldSave = millis();
+  } else {
+    holdClear();
   }
 
   slogc("\n=== Rele szekvenszer indul ===\n");
@@ -570,11 +699,12 @@ void setup() {
   slogc("Halozat-visszajelzes: %s\n", MAINS_CHECK ? "BE (RL1 kimenet: D4/GPIO6)" : "KI (MAINS_CHECK = false)");
 
   if (powerHold) {
-    slogc("Aramszunet utan: %lu s-ig a gomb es a trigger hatastalan\n", (unsigned long)(POWERUP_HOLD_MS / 1000));
+    slogc("Aramszunet utan: %lu s-ig a gomb es a trigger hatastalan%s\n", holdMs / 1000,
+          holdResumed ? " (a varakozas alatti ujraindulas: a hatralevo ido folytatodik)" : "");
   }
   if (storedFault != F_NONE) {
     // mentett hiba: nem kapcsol be magától, a tiltás végén ellenőrzi az okot (áramszünet után a várakozás végén)
-    unsigned long wait = powerHold ? POWERUP_HOLD_MS : FAULT_LOCKOUT_MS;
+    unsigned long wait = powerHold ? holdMs : FAULT_LOCKOUT_MS;
     lastFault = storedFault;
     faultHold = true;
     lockoutPending = true;
@@ -585,7 +715,7 @@ void setup() {
   } else if (powerHold) {
     // a várakozás végén a loop() dönt (TRIGGER_ON_BOOT)
   } else if (!trigOff && trig.stable == LOW && (crashReset || TRIGGER_ON_BOOT)) {
-    // aktív triggerre: fagyás után mindig, egyébként TRIGGER_ON_BOOT szerint
+    // aktív triggerre: fagyás után mindig, egyébként TRIGGER_ON_BOOT szerint (a MIN_OFF_MS a boottól számít)
     switchOn(crashReset ? "fagyas utani ujrainditas" : "indulaskor aktiv trigger", false);
   }
 }
@@ -600,8 +730,14 @@ void loop() {
 
   if (powerHold) {
     // áramszünet utáni várakozás: gomb és trigger hatástalan, hibafigyelés szünetel
-    if ((long)(now - powerHoldUntil) >= 0) {
+    if ((long)(now - powerHoldUntil) < 0) {
+      if (now - lastHoldSave >= 1000) {  // hátralévő idő mentése (RTC), resetnél innen folytatódik
+        lastHoldSave = now;
+        holdSave(powerHoldUntil - now);
+      }
+    } else {
       powerHold = false;
+      holdClear();
       resyncInputs();                    // a várakozás alatti nyomások / váltások nem számítanak
       slogc("Aramszunet utani varakozas vege: gomb es trigger ujra aktiv\n");
       if (lockoutPending) {
@@ -615,8 +751,13 @@ void loop() {
     if (btnChanged) lastShortRel = now;   // a hiba alatti nyomás is a sorozat része
     if (now - faultStart >= FAULT_BLINK_MS) endFault();
   } else {
-    // hibafigyelés (tiltott triggert nem figyelünk)
+    // hálózat-visszajelzés elsőként: kiesésnél a relék azonnal KI
     if (!faultHold) {
+      int mf = mainsFault();
+      if (mf != F_NONE) startFault(IN_FB1, mf);
+    }
+    // bemenetek hibafigyelése (tiltott triggert nem figyelünk)
+    if (!faultActive && !faultHold) {
       int f = checkFault(IN_BTN);
       if (f != F_NONE) {
         startFault(IN_BTN, f);
@@ -625,10 +766,6 @@ void loop() {
         if (f != F_NONE) startFault(IN_TRIG, f);
       }
     }
-    if (!faultActive && !faultHold) {    // hálózat-visszajelzés
-      int mf = mainsFault();
-      if (mf != F_NONE) startFault(IN_FB1, mf);
-    }
     if (!faultActive) {
       buttonLogic(btnChanged);
     }
@@ -636,19 +773,28 @@ void loop() {
       // trigger: aktív élre be, inaktív élre ki; mindig teljes ciklus (RL2 legalább RL2_MIN_ON_MS)
       if (trigChanged && !trigOff) {
         if (trig.stable == LOW) {
-          if (offPending) slog("Trigger ujra aktiv: a fuggo kikapcsolas elmarad\n");
-          offPending = false;              // újra aktív: a függő kikapcsolás elmarad
+          if (offPending && !offByBtn) {   // újra aktív: a trigger függő kikapcsolása elmarad (a gombé nem)
+            offPending = false;
+            slog("Trigger ujra aktiv: a fuggo kikapcsolas elmarad\n");
+          }
           switchOn("trigger", false);
-        } else if (on && !rl2On) {
-          offPending = true;               // előbb az RL2 behúz, RL2_MIN_ON_MS után ki
-          slog("Trigger elment az RL2 behuzasa elott: teljes ciklus, utana kikapcsol\n");
-        } else if (on && (long)(now - rl2Time) < (long)RL2_MIN_ON_MS) {
-          offPending = true;               // az RL2 még nem volt behúzva RL2_MIN_ON_MS-ig
-          offAt = rl2Time + RL2_MIN_ON_MS;
-          slog("Trigger elment: kikapcsolas %lu ms mulva (RL2 minimum ido)\n", (unsigned long)(offAt - now));
         } else {
-          setState(false, "trigger");
+          requestOff("trigger", false);
         }
+      }
+    }
+    // függő bekapcsolás a minimális kikapcsolt idő végén
+    if (!faultActive && !on && (onReqBtn || onReqTrig) && minOffLeft() == 0) {
+      bool byBtn = onReqBtn;
+      const char *src = onReqSrc;
+      onReqBtn = false;
+      onReqTrig = false;
+      if (byBtn) {
+        switchOn("gomb (minimalis kikapcsolt ido utan)", true);
+      } else if (!trigOff && trig.stable == LOW) {
+        switchOn(src, false);
+      } else {
+        slog("Fuggo bekapcsolas (%s) elmarad: a trigger mar nem aktiv\n", src);
       }
     }
     // tiltás vége: ok ellenőrzése, mentett hiba törlése, automata bekapcsolás
@@ -683,7 +829,7 @@ void loop() {
     slog("RL2 BE\n");
   }
   if (offPending && rl2On && !faultActive && (long)(now - offAt) >= 0) {
-    setState(false, "trigger elment (teljes ciklus vege)");
+    setState(false, "fuggo kikapcsolas (teljes ciklus vege)");
   }
 
   ledUpdate();
