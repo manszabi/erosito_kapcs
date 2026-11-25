@@ -15,7 +15,7 @@
 // aktív triggerre újra bekapcsol lágyindítással (ha a hálózat nem jön vissza: F_NOMAINS, nincs több próbálkozás);
 // ha a kiesés előtt kikapcsolás volt függőben, nincs újrakapcsolás. Hiba-villogás alatti kiesésnél is azonnal KI
 // Opto: RL1 kimenet (L) - 3 x 43k / 0,6 W sorosan - DB106 ~ ; DB106 ~ - N; DB106 + -> CNY17-3 anód (1), - -> katód (2)
-// (LED-áram csúcs ~2,5 mA, ellenállásonként ~0,14 W); CNY17-3 kollektor (5) -> D4 + 47k felhúzó 3V3-ra, emitter (4) -> GND,
+// (LED-áram csúcs ~2,5 mA, ellenállásonként ~0,14 W); CNY17-3 kollektor (5) -> D4 + 43k felhúzó 3V3-ra, emitter (4) -> GND,
 // bázis (6) szabadon. A híd miatt 100 Hz: az 's' parancs a LOW mintaszámot is kiírja (~28-37 / ablak normális, határ: 8)
 // Boot alatt a relék KI; aktív triggerre induláskor bekapcsol (TRIGGER_ON_BOOT, fagyás után mindig), a MIN_OFF_MS a boottól számít; watchdog: WDT_MS
 // Áramszünet után (tápfeltöltés / brownout reset) POWERUP_HOLD_MS ideig a gomb és a trigger hatástalan, a LED ritkán felvillan;
@@ -48,7 +48,7 @@ const int PIN_BTN  = 4;   // D2:  gomb -> GND (belső felhúzó)
 const int PIN_TRIG = 5;   // D3:  opto kimenet, LOW = aktív, külső 10k felhúzó 3V3-ra
 const int PIN_RL1  = 10;  // D10: RL1 tranzisztor
 const int PIN_RL2  = 7;   // D5:  RL2 tranzisztor
-const int PIN_FB1  = 6;   // D4:  RL1 kimenet opto (CNY17-3 + DB106), LOW = van hálózat, 47k felhúzó 3V3-ra
+const int PIN_FB1  = 6;   // D4:  RL1 kimenet opto (CNY17-3 + DB106), LOW = van hálózat, 43k felhúzó 3V3-ra (a kollektoron)
 
 // ---- Beállítások ----
 const unsigned long RL2_DELAY_MS    = 1000;   // RL2 késleltetése (lágyindítás az NTC-n át; 250 VA toroid + 20000 uF: ~100-300 ms töltés, 1 s bőven elég)
