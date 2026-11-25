@@ -1,12 +1,14 @@
 // XIAO ESP32-C3 relé szekvenszer: gomb + 12 V trigger, RL1 azonnal, RL2 késleltetve, hálózat-visszajelzés, hibakezelés
 // Gomb: hosszú nyomás = be/ki; 2 rövid nyomás = trigger tiltás/engedés (NVS); 3+ rövid nyomás = hiba
-// Trigger: aktív élre be, inaktív élre ki; ha az RL2 előtt elmegy, a teljes RL1-RL2 ciklus lefut, utána ki
+// Trigger: aktív élre be, inaktív élre ki; mindig teljes RL1-RL2 ciklus: az RL2 legalább RL2_MIN_ON_MS-ig behúzva marad, csak utána ki
 // LED: be = világít; hiba = FAULT_BLINK_MS villogás, utána minden KI; trigger tiltva + kézi bekapcsolás = 2 villanás
 // Hiba után FAULT_LOCKOUT_MS ideig nincs bekapcsolás; utána beragadt gomb = újabb hiba, különben aktív triggerre be (AUTO_ON_AFTER_FAULT)
 // Hardveres hibát (beragadt gomb, hálózat hiánya / KI relénél) az NVS tárolja: reset után az ok megszűnéséig nem kapcsol be magától
-// Hálózat-visszajelzés (MAINS_CHECK): H11AA1M a relék kimenetén (LOW = van hálózat); az RL2 csak az RL1 visszajelzése után húz be
+// Hálózat-visszajelzés (MAINS_CHECK): H11AA1M csak az RL1 kimenetén (LOW = van hálózat); az RL2 csak az RL1 visszajelzése után húz be
+// (az RL2 a toroid lágyindító NTC-jét zárja rövidre, utána külön visszajelzés nem kell)
 // Opto: 3 x 22k sorosan a hálózat felé, kimenet 47k felhúzóval a 3V3-ra; az 's' parancs a LOW mintaszámot is kiírja (~28-37 normális)
-// Boot alatt a relék KI; aktív triggerre induláskor bekapcsol (TRIGGER_ON_BOOT, BROWNOUT_IS_CRASH); watchdog: WDT_MS
+// Boot alatt a relék KI; aktív triggerre induláskor bekapcsol (TRIGGER_ON_BOOT); watchdog: WDT_MS
+// Áramszünet után (tápfeltöltés / brownout reset) POWERUP_HOLD_MS ideig a gomb és a trigger hatástalan; utána a beállítások szerint
 // Soros 115200, 's' = állapot; kötelező az "USB CDC On Boot: Enabled"; core: Arduino-ESP32 3.x / 4.x, board: XIAO_ESP32C3
 
 #include <Arduino.h>
@@ -23,9 +25,9 @@
 #if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
 #error "Arduino-ESP32 core 3.x kell (Eszkozok > Alaplap > Boards Manager: esp32 by Espressif Systems, 3.x)"
 #endif
-// USB CDC nélkül a Serial a GPIO20/21 UART-ra kerülne, ami ütközik az RL2 visszajelzővel
+// USB CDC nélkül a Serial a GPIO20/21 UART-ra kerülne, a soros napló nem az USB-n jelenne meg
 #if !defined(ARDUINO_USB_CDC_ON_BOOT) || (ARDUINO_USB_CDC_ON_BOOT == 0)
-#warning "Allitsd be: Eszkozok > USB CDC On Boot > Enabled (kulonben a Serial a GPIO20/21 UART-ra kerul, ami utkozik az RL2 visszajelzovel)"
+#warning "Allitsd be: Eszkozok > USB CDC On Boot > Enabled (kulonben a soros naplo nem az USB-n jelenik meg)"
 #endif
 
 // ---- Lábak (GPIO számok; kerülendő: GPIO2/8/9 strapping, GPIO21 UART TX) ----
@@ -35,7 +37,6 @@ const int PIN_TRIG = 5;   // D3:  opto kimenet, LOW = aktív, külső 10k felhú
 const int PIN_RL1  = 10;  // D10: RL1 tranzisztor
 const int PIN_RL2  = 7;   // D5:  RL2 tranzisztor
 const int PIN_FB1  = 6;   // D4:  RL1 kimenet opto, LOW = van hálózat, 47k felhúzó 3V3-ra
-const int PIN_FB2  = 20;  // D7:  RL2 kimenet opto (U0RXD: csak USB CDC On Boot mellett szabad)
 
 // ---- Beállítások ----
 const unsigned long RL2_DELAY_MS    = 400;    // RL2 késleltetése
@@ -51,11 +52,12 @@ const unsigned long FAULT_BLINK_MS  = 1000;   // hibavillogás hossza (közben a
 const unsigned long FAULT_HALF_MS   = 100;    // hibavillogás fél periódusa
 
 const bool TRIGGER_ON_BOOT      = true;    // true: induláskor aktív triggerre bekapcsol
-const bool BROWNOUT_IS_CRASH    = true;    // true: a brownout reset is fagyásnak számít
+const bool BROWNOUT_IS_POWERLOSS = true;   // true: a brownout reset áramszünetnek számít (POWERUP_HOLD_MS); false: fagyásnak
+const unsigned long POWERUP_HOLD_MS = 120000UL; // áramszünet után ennyi ideig a gomb és a trigger hatástalan (0 = nincs)
 
 const unsigned long FAULT_LOCKOUT_MS = 5000; // hiba után ennyi ideig nincs bekapcsolás
 const bool AUTO_ON_AFTER_FAULT  = true;    // true: a tiltás végén aktív triggerre bekapcsol
-const unsigned long RL2_MIN_ON_MS = 100;   // teljes ciklus: az RL2 legalább ennyi ideig behúzva marad
+const unsigned long RL2_MIN_ON_MS = 2000;  // trigger: az RL2 legalább ennyi ideig behúzva marad kikapcsolás előtt
 
 // ---- Hálózati feszültség visszajelzés ----
 const bool          MAINS_CHECK      = false;   // false: nincs hálózat-visszajelzés (opto nélkül ezt használd)
@@ -74,6 +76,9 @@ const uint8_t       BTN_CHANGE_LIMIT = 8;  // gomb: ennyinél több váltás / a
 bool on = false;                // relék BE
 bool rl2On = false;             // RL2 ténylegesen meghúzott
 unsigned long onTime = 0;
+unsigned long rl2Time = 0;      // RL2 behúzásának ideje
+bool powerHold = false;         // áramszünet utáni várakozás: gomb és trigger hatástalan
+unsigned long powerHoldUntil = 0;
 bool trigOff = false;           // trigger tiltva (NVS)
 bool faultActive = false;       // hiba-villogás folyamatban
 bool faultHold = false;         // hibafigyelés szünetel a következő bekapcsolásig
@@ -82,7 +87,7 @@ int lastFault = 0;              // utolsó hiba kódja (F_*)
 int storedFault = 0;            // NVS-ben tárolt hibakód
 bool lockoutPending = false;    // hiba utáni tiltás (lejártakor egyszer kiértékeljük)
 unsigned long lockoutUntil = 0;
-bool offPending = false;        // trigger elment az RL2 előtt: kikapcsolás az RL2 után
+bool offPending = false;        // trigger elment: kikapcsolás az RL2 minimális behúzási ideje után
 unsigned long offAt = 0;
 volatile bool statusReq = false;
 
@@ -100,17 +105,16 @@ bool ledFlashOn = false;
 unsigned long ledT = 0;
 bool ledFaultBlink = false;
 
-// Hálózat-visszajelzés állapota (0 = RL1, 1 = RL2)
-unsigned long fbWinStart[2] = {0, 0};   // az aktuális mérési ablak kezdete
-uint8_t       fbLow[2]      = {0, 0};   // LOW minták az ablakban
-uint8_t       fbCount[2]    = {0, 0};   // utolsó ablak LOW mintái (diagnosztika)
-bool          fbValid[2]    = {false, false};   // van teljes ablak a parancs óta
-bool          fbPresent[2]  = {false, false};   // az utolsó ablak szerint van hálózat
-bool          fbBad[2]      = {false, false};   // eltért a várttól
-bool          fbConfirmed[2] = {false, false};  // megjelent a hálózat a bekapcsolás után
-unsigned long fbBadSince[2] = {0, 0};
-unsigned long fbCmdT[2]     = {0, 0};   // utolsó relé-parancs ideje
-int           mainsFaultCh  = 0;        // a hibás csatorna
+// Hálózat-visszajelzés állapota (csak RL1 kimenet)
+unsigned long fbWinStart  = 0;      // az aktuális mérési ablak kezdete
+uint8_t       fbLow       = 0;      // LOW minták az ablakban
+uint8_t       fbCount     = 0;      // utolsó ablak LOW mintái (diagnosztika)
+bool          fbValid     = false;  // van teljes ablak a parancs óta
+bool          fbPresent   = false;  // az utolsó ablak szerint van hálózat
+bool          fbBad       = false;  // eltért a várttól
+bool          fbConfirmed = false;  // megjelent a hálózat a bekapcsolás után
+unsigned long fbBadSince  = 0;
+unsigned long fbCmdT      = 0;      // utolsó relé-parancs ideje
 
 Preferences prefs;
 
@@ -209,67 +213,56 @@ void ledUpdate() {
 
 // Hibakódok és bemenet-azonosítók (int, nem enum: az Arduino IDE prototípusai miatt)
 const int F_NONE = 0, F_STUCK = 1, F_CHATTER = 2, F_PRESSES = 3, F_NOMAINS = 4, F_MAINSOFF = 5;
-const int IN_BTN = 0, IN_TRIG = 1, IN_FB1 = 2, IN_FB2 = 3;
+const int IN_BTN = 0, IN_TRIG = 1, IN_FB1 = 2;
 
 // ---- Hálózati feszültség visszajelzés ----
 // Az AC opto kimenete 100 Hz-es impulzusokban LOW: ablakonként (MAINS_WIN_MS) számoljuk a LOW mintákat
-bool fbExpected(int ch) { return ch == 0 ? on : rl2On; }
-
 // relé-parancs: új, tiszta mérés
-void mainsCmd(int ch) {
+void mainsCmd() {
   if (!MAINS_CHECK) return;
   unsigned long t = millis();
-  fbWinStart[ch] = t;
-  fbLow[ch] = 0;
-  fbValid[ch] = false;
-  fbBad[ch] = false;
-  fbConfirmed[ch] = false;
-  fbCmdT[ch] = t;
+  fbWinStart = t;
+  fbLow = 0;
+  fbValid = false;
+  fbBad = false;
+  fbConfirmed = false;
+  fbCmdT = t;
 }
 
 // függő eltérés törlése
 void mainsClearBad() {
-  fbBad[0] = false;
-  fbBad[1] = false;
+  fbBad = false;
 }
 
 void mainsUpdate() {
   if (!MAINS_CHECK) return;
   unsigned long now = millis();
-  for (int ch = 0; ch < 2; ch++) {
-    if (digitalRead(ch == 0 ? PIN_FB1 : PIN_FB2) == LOW && fbLow[ch] < 255) fbLow[ch]++;
-    if (now - fbWinStart[ch] < MAINS_WIN_MS) continue;
-    fbWinStart[ch] = now;
-    bool present = (fbLow[ch] >= MAINS_MIN_LOW);
-    fbCount[ch] = fbLow[ch];
-    fbLow[ch] = 0;
-    fbPresent[ch] = present;
-    fbValid[ch] = true;
-    bool expected = fbExpected(ch);
-    bool mismatch = (present != expected);
-    if (mismatch && !expected && (now - fbCmdT[ch]) < MAINS_OFF_GRACE_MS) mismatch = false;   // türelmi idő kikapcsolás után
-    if (mismatch) {
-      if (!fbBad[ch]) { fbBad[ch] = true; fbBadSince[ch] = now; }
-    } else {
-      fbBad[ch] = false;
-      if (expected && !fbConfirmed[ch]) {
-        fbConfirmed[ch] = true;
-        slog("RL%d kimenet: halozat OK (%lu ms)\n", ch + 1, now - fbCmdT[ch]);
-      }
+  if (digitalRead(PIN_FB1) == LOW && fbLow < 255) fbLow++;
+  if (now - fbWinStart < MAINS_WIN_MS) return;
+  fbWinStart = now;
+  bool present = (fbLow >= MAINS_MIN_LOW);
+  fbCount = fbLow;
+  fbLow = 0;
+  fbPresent = present;
+  fbValid = true;
+  bool expected = on;
+  bool mismatch = (present != expected);
+  if (mismatch && !expected && (now - fbCmdT) < MAINS_OFF_GRACE_MS) mismatch = false;   // türelmi idő kikapcsolás után
+  if (mismatch) {
+    if (!fbBad) { fbBad = true; fbBadSince = now; }
+  } else {
+    fbBad = false;
+    if (expected && !fbConfirmed) {
+      fbConfirmed = true;
+      slog("RL1 kimenet: halozat OK (%lu ms)\n", now - fbCmdT);
     }
   }
 }
 
-// hibakód, ha egy kimenet tartósan eltér a várttól (csatorna: mainsFaultCh)
+// hibakód, ha az RL1 kimenete tartósan eltér a várttól
 int mainsFault() {
   if (!MAINS_CHECK) return F_NONE;
-  unsigned long now = millis();
-  for (int ch = 0; ch < 2; ch++) {
-    if (fbBad[ch] && (now - fbBadSince[ch]) >= MAINS_FAULT_MS) {
-      mainsFaultCh = ch;
-      return fbExpected(ch) ? F_NOMAINS : F_MAINSOFF;
-    }
-  }
+  if (fbBad && (millis() - fbBadSince) >= MAINS_FAULT_MS) return on ? F_NOMAINS : F_MAINSOFF;
   return F_NONE;
 }
 
@@ -281,7 +274,7 @@ void setState(bool s, const char *src) {
     digitalWrite(PIN_RL1, HIGH);
     onTime = millis();                 // az RL2 a loop()-ban jön
     ledBase = true;
-    mainsCmd(0);
+    mainsCmd();
     slog("RL1 BE (%s), RL2 %lu ms mulva\n", src, (unsigned long)RL2_DELAY_MS);
   } else {
     digitalWrite(PIN_RL2, LOW);        // mindkettő azonnal, RL2 előbb
@@ -289,8 +282,7 @@ void setState(bool s, const char *src) {
     rl2On = false;
     ledBase = false;
     ledFlashes = 0;
-    mainsCmd(0);
-    mainsCmd(1);
+    mainsCmd();
     slog("RL1+RL2 KI (%s)\n", src);
   }
 }
@@ -376,13 +368,10 @@ void startFault(int idx, int f) {
   ledFaultBlink = true;
   ledFlashes = 0;
   ledT = faultStart;
-  if (idx >= IN_FB1) {
-    const char *nm = (idx == IN_FB1) ? "RL1" : "RL2";
-    slogc("!!! %s kimenet HIBA: %s -> LED villog, majd relek es LED KI\n", nm,
-          (f == F_NOMAINS)
-              ? ((idx == IN_FB2) ? "nincs halozati feszultseg: az RL2 nem huzott be az RL1 utan (vagy elveszett)"
-                                 : "nincs halozati feszultseg: az RL1 nem huzott be (vagy elveszett)")
-              : "halozati feszultseg van KIKAPCSOLT rele mellett (ragadt / osszehegedt erintkezo?)");
+  if (idx == IN_FB1) {
+    slogc("!!! RL1 kimenet HIBA: %s -> LED villog, majd relek es LED KI\n",
+          (f == F_NOMAINS) ? "nincs halozati feszultseg: az RL1 nem huzott be (vagy elveszett)"
+                           : "halozati feszultseg van KIKAPCSOLT rele mellett (ragadt / osszehegedt erintkezo?)");
     return;
   }
   const Input &in = inputs[idx];
@@ -417,14 +406,10 @@ void switchOn(const char *src, bool manual) {
     faultHold = false;
     slog("Tiszta lap: hibafigyeles ujra aktiv\n");
   }
-  if (MAINS_CHECK) {                   // KI relé kimenetén nem lehet hálózat
-    for (int ch = 0; ch < 2; ch++) {
-      if (fbValid[ch] && fbPresent[ch] && (millis() - fbCmdT[ch]) >= MAINS_OFF_GRACE_MS) {
-        slogc("Bekapcsolas megtagadva: RL%d kimeneten halozati feszultseg van, pedig a rele KI\n", ch + 1);
-        startFault(IN_FB1 + ch, F_MAINSOFF);
-        return;
-      }
-    }
+  if (MAINS_CHECK && fbValid && fbPresent && (millis() - fbCmdT) >= MAINS_OFF_GRACE_MS) {   // KI relé kimenetén nem lehet hálózat
+    slogc("Bekapcsolas megtagadva: RL1 kimeneten halozati feszultseg van, pedig a rele KI\n");
+    startFault(IN_FB1, F_MAINSOFF);
+    return;
   }
   setState(true, src);
   if (manual && trigOff) ledFlash(2);  // tiltott trigger + kézi bekapcsolás: 2 villanás
@@ -483,8 +468,10 @@ void buttonLogic(bool changed) {
 }
 
 void printStatus() {
-  char lk[40] = "";
-  if (lockoutPending && (long)(millis() - lockoutUntil) < 0)
+  char lk[64] = "";
+  if (powerHold)
+    snprintf(lk, sizeof lk, " [aramszunet utani varakozas: %lu s]", (unsigned long)((powerHoldUntil - millis()) / 1000));
+  else if (lockoutPending && (long)(millis() - lockoutUntil) < 0)
     snprintf(lk, sizeof lk, " [tiltas: %lu ms]", (unsigned long)(lockoutUntil - millis()));
   slogc("ALLAPOT: RL1=%s RL2=%s LED=%s%s%s%s\n", on ? "BE" : "KI", rl2On ? "BE" : "KI",
         (ledFaultBlink) ? "hiba-villog" : (ledBase ? "vilagit" : "sotet"),
@@ -492,10 +479,9 @@ void printStatus() {
   slogc("  GOMB:    %s\n", btn.stable == LOW ? "nyomva" : "nyugalom");
   slogc("  TRIGGER: %s, %s\n", trig.stable == LOW ? "aktiv (12 V)" : "nincs", trigOff ? "TILTVA" : "engedelyezve");
   if (MAINS_CHECK) {
-    for (int ch = 0; ch < 2; ch++)
-      slogc("  RL%d kimenet: halozat %s%s (LOW minta/ablak: %u, kuszob: %u)\n", ch + 1,
-            !fbValid[ch] ? "meres folyamatban" : (fbPresent[ch] ? "VAN" : "nincs"),
-            fbBad[ch] ? " (ELTERES a varttol)" : "", (unsigned)fbCount[ch], (unsigned)MAINS_MIN_LOW);
+    slogc("  RL1 kimenet: halozat %s%s (LOW minta/ablak: %u, kuszob: %u)\n",
+          !fbValid ? "meres folyamatban" : (fbPresent ? "VAN" : "nincs"),
+          fbBad ? " (ELTERES a varttol)" : "", (unsigned)fbCount, (unsigned)MAINS_MIN_LOW);
   } else {
     slogc("  Halozat-visszajelzes: KIKAPCSOLVA (MAINS_CHECK = false)\n");
   }
@@ -545,11 +531,8 @@ void setup() {
   pinMode(PIN_TRIG, INPUT_PULLUP);
   if (MAINS_CHECK) {
     pinMode(PIN_FB1, INPUT_PULLUP);
-    pinMode(PIN_FB2, INPUT_PULLUP);
-    mainsCmd(0);
-    mainsCmd(1);
-    fbCmdT[0] -= MAINS_OFF_GRACE_MS;   // induláskor nincs türelmi idő
-    fbCmdT[1] -= MAINS_OFF_GRACE_MS;
+    mainsCmd();
+    fbCmdT -= MAINS_OFF_GRACE_MS;      // induláskor nincs türelmi idő
   }
   for (int i = 0; i < 50; i++) {       // a bemenetek beállnak, közben mintavétel
     mainsUpdate();
@@ -571,7 +554,12 @@ void setup() {
   esp_reset_reason_t rr = esp_reset_reason();
   bool crashReset = (rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT ||
                      rr == ESP_RST_WDT      || rr == ESP_RST_PANIC);
-  if (BROWNOUT_IS_CRASH && rr == ESP_RST_BROWNOUT) crashReset = true;
+  bool powerLoss = (rr == ESP_RST_POWERON) || (rr == ESP_RST_BROWNOUT && BROWNOUT_IS_POWERLOSS);
+  if (rr == ESP_RST_BROWNOUT && !BROWNOUT_IS_POWERLOSS) crashReset = true;
+  if (powerLoss && POWERUP_HOLD_MS > 0) {
+    powerHold = true;
+    powerHoldUntil = millis() + POWERUP_HOLD_MS;
+  }
 
   slogc("\n=== Rele szekvenszer indul ===\n");
   slogc("Indulas oka: %s\n", resetName(rr));
@@ -579,17 +567,23 @@ void setup() {
                                    trig.stable == LOW ? "LOW (aktiv)" : "HIGH (nincs)");
   slogc("Trigger bemenet: %s%s\n", trigOff ? "TILTVA" : "engedelyezve",
         nvsOk ? " (mentett beallitas)" : " (FIGYELEM: NVS hiba, alapertelmezett)");
-  slogc("Halozat-visszajelzes: %s\n", MAINS_CHECK ? "BE (RL1: D4/GPIO6, RL2: D7/GPIO20)" : "KI (MAINS_CHECK = false)");
+  slogc("Halozat-visszajelzes: %s\n", MAINS_CHECK ? "BE (RL1 kimenet: D4/GPIO6)" : "KI (MAINS_CHECK = false)");
 
+  if (powerHold) {
+    slogc("Aramszunet utan: %lu s-ig a gomb es a trigger hatastalan\n", (unsigned long)(POWERUP_HOLD_MS / 1000));
+  }
   if (storedFault != F_NONE) {
-    // mentett hiba: nem kapcsol be magától, a tiltás végén ellenőrzi az okot
+    // mentett hiba: nem kapcsol be magától, a tiltás végén ellenőrzi az okot (áramszünet után a várakozás végén)
+    unsigned long wait = powerHold ? POWERUP_HOLD_MS : FAULT_LOCKOUT_MS;
     lastFault = storedFault;
     faultHold = true;
     lockoutPending = true;
-    lockoutUntil = millis() + FAULT_LOCKOUT_MS;
+    lockoutUntil = millis() + wait;
     slogc("Mentett hiba az elozo futasbol (%s): %lu ms-ig nincs bekapcsolas, utana az ok ellenorzese\n",
-          storedFault == F_STUCK ? "beragadt gomb" : (storedFault == F_NOMAINS ? "nincs halozat a relek utan" : "halozat KI rele mellett"),
-          (unsigned long)FAULT_LOCKOUT_MS);
+          storedFault == F_STUCK ? "beragadt gomb" : (storedFault == F_NOMAINS ? "nincs halozat az RL1 utan" : "halozat KI rele mellett"),
+          wait);
+  } else if (powerHold) {
+    // a várakozás végén a loop() dönt (TRIGGER_ON_BOOT)
   } else if (!trigOff && trig.stable == LOW && (crashReset || TRIGGER_ON_BOOT)) {
     // aktív triggerre: fagyás után mindig, egyébként TRIGGER_ON_BOOT szerint
     switchOn(crashReset ? "fagyas utani ujrainditas" : "indulaskor aktiv trigger", false);
@@ -604,7 +598,19 @@ void loop() {
   bool trigChanged = updateInput(IN_TRIG);
   mainsUpdate();
 
-  if (faultActive) {
+  if (powerHold) {
+    // áramszünet utáni várakozás: gomb és trigger hatástalan, hibafigyelés szünetel
+    if ((long)(now - powerHoldUntil) >= 0) {
+      powerHold = false;
+      resyncInputs();                    // a várakozás alatti nyomások / váltások nem számítanak
+      slogc("Aramszunet utani varakozas vege: gomb es trigger ujra aktiv\n");
+      if (lockoutPending) {
+        // mentett hiba: a tiltás-vége ág értékel (AUTO_ON_AFTER_FAULT)
+      } else if (TRIGGER_ON_BOOT && !trigOff && trig.stable == LOW) {
+        switchOn("aktiv trigger aramszunet utan", false);
+      }
+    }
+  } else if (faultActive) {
     // villogás: bemenetek nem számítanak, a végén minden KI
     if (btnChanged) lastShortRel = now;   // a hiba alatti nyomás is a sorozat része
     if (now - faultStart >= FAULT_BLINK_MS) endFault();
@@ -621,20 +627,25 @@ void loop() {
     }
     if (!faultActive && !faultHold) {    // hálózat-visszajelzés
       int mf = mainsFault();
-      if (mf != F_NONE) startFault(IN_FB1 + mainsFaultCh, mf);
+      if (mf != F_NONE) startFault(IN_FB1, mf);
     }
     if (!faultActive) {
       buttonLogic(btnChanged);
     }
     if (!faultActive) {
-      // trigger: aktív élre be, inaktív élre ki
+      // trigger: aktív élre be, inaktív élre ki; mindig teljes ciklus (RL2 legalább RL2_MIN_ON_MS)
       if (trigChanged && !trigOff) {
         if (trig.stable == LOW) {
+          if (offPending) slog("Trigger ujra aktiv: a fuggo kikapcsolas elmarad\n");
           offPending = false;              // újra aktív: a függő kikapcsolás elmarad
           switchOn("trigger", false);
         } else if (on && !rl2On) {
-          offPending = true;               // teljes ciklus: előbb az RL2 behúz, utána ki
+          offPending = true;               // előbb az RL2 behúz, RL2_MIN_ON_MS után ki
           slog("Trigger elment az RL2 behuzasa elott: teljes ciklus, utana kikapcsol\n");
+        } else if (on && (long)(now - rl2Time) < (long)RL2_MIN_ON_MS) {
+          offPending = true;               // az RL2 még nem volt behúzva RL2_MIN_ON_MS-ig
+          offAt = rl2Time + RL2_MIN_ON_MS;
+          slog("Trigger elment: kikapcsolas %lu ms mulva (RL2 minimum ido)\n", (unsigned long)(offAt - now));
         } else {
           setState(false, "trigger");
         }
@@ -643,22 +654,19 @@ void loop() {
     // tiltás vége: ok ellenőrzése, mentett hiba törlése, automata bekapcsolás
     if (!faultActive && lockoutPending && (long)(now - lockoutUntil) >= 0) {
       lockoutPending = false;
-      int offCh = -1;                    // KI relé kimenetén hálózat van
-      if (MAINS_CHECK && lastFault == F_MAINSOFF) {
-        for (int ch = 0; ch < 2; ch++) if (fbValid[ch] && fbPresent[ch]) offCh = ch;
-      }
+      bool offMains = MAINS_CHECK && lastFault == F_MAINSOFF && fbValid && fbPresent;   // KI relé kimenetén hálózat van
       if (btn.stable == LOW || btn.raw == LOW) {
         slog("Tiltas vege, de a gomb meg nyomva: beragadt gomb, a relek nem kapcsolnak be\n");
         startFault(IN_BTN, F_STUCK);
-      } else if (offCh >= 0) {
-        slog("Tiltas vege, de RL%d kimeneten meg van halozat KI relenel: a relek nem kapcsolnak be\n", offCh + 1);
-        startFault(IN_FB1 + offCh, F_MAINSOFF);
+      } else if (offMains) {
+        slog("Tiltas vege, de RL1 kimeneten meg van halozat KI relenel: a relek nem kapcsolnak be\n");
+        startFault(IN_FB1, F_MAINSOFF);
       } else {
         int was = lastFault;
         lastFault = F_NONE;
         saveFault(F_NONE);               // az ok megszűnt / nem ellenőrizhető
         if (was == F_NOMAINS) {
-          slog("A hiba (nincs halozat a relek utan) nem ellenorizheto relek nelkul: nincs automata ujrakapcsolas, uj gomb / trigger el kell\n");
+          slog("A hiba (nincs halozat az RL1 utan) nem ellenorizheto relek nelkul: nincs automata ujrakapcsolas, uj gomb / trigger el kell\n");
         } else if (AUTO_ON_AFTER_FAULT && !trigOff && trig.stable == LOW) {
           switchOn("aktiv trigger hiba utan", false);
         }
@@ -667,11 +675,11 @@ void loop() {
   }
 
   // RL2 késleltetve (előjeles különbség: a "now" régebbi lehet az onTime-nál)
-  if (on && !rl2On && !faultActive && (!MAINS_CHECK || fbConfirmed[0]) && (long)(now - onTime) >= (long)RL2_DELAY_MS) {
+  if (on && !rl2On && !faultActive && (!MAINS_CHECK || fbConfirmed) && (long)(now - onTime) >= (long)RL2_DELAY_MS) {
     digitalWrite(PIN_RL2, HIGH);       // (MAINS_CHECK: csak ha az RL1 kimenetén már van hálózat)
     rl2On = true;
-    mainsCmd(1);
-    if (offPending) offAt = millis() + RL2_MIN_ON_MS;   // teljes ciklus: minimum behúzási idő
+    rl2Time = millis();
+    if (offPending) offAt = rl2Time + RL2_MIN_ON_MS;   // teljes ciklus: minimum behúzási idő
     slog("RL2 BE\n");
   }
   if (offPending && rl2On && !faultActive && (long)(now - offAt) >= 0) {
