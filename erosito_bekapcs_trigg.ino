@@ -9,12 +9,14 @@
 // Hiba után FAULT_LOCKOUT_MS ideig nincs bekapcsolás (a kérés ilyenkor elvész, nem kerül sorba); utána beragadt gomb = újabb hiba,
 // különben aktív triggerre be (AUTO_ON_AFTER_FAULT)
 // Hardveres hibát (beragadt gomb, hálózat hiánya / KI relénél) az NVS tárolja: reset után az ok megszűnéséig nem kapcsol be magától
-// Hálózat-visszajelzés (MAINS_CHECK): H11AA1M csak az RL1 kimenetén (LOW = van hálózat); az RL2 csak az RL1 visszajelzése után húz be
+// Hálózat-visszajelzés (MAINS_CHECK): CNY17-3 + DB106 híd csak az RL1 kimenetén (az NTC előtt) (LOW = van hálózat); az RL2 csak az RL1 visszajelzése után húz be
 // (az RL2 a toroid lágyindító NTC-jét zárja rövidre, utána külön visszajelzés nem kell)
 // Hálózatkiesés bekapcsolt állapotban (MAINS_LOSS_MS): a relék azonnal elengednek, LED villog; a MIN_OFF_MS után
 // aktív triggerre újra bekapcsol lágyindítással (ha a hálózat nem jön vissza: F_NOMAINS, nincs több próbálkozás);
 // ha a kiesés előtt kikapcsolás volt függőben, nincs újrakapcsolás. Hiba-villogás alatti kiesésnél is azonnal KI
-// Opto: 3 x 22k sorosan a hálózat felé, kimenet 47k felhúzóval a 3V3-ra; az 's' parancs a LOW mintaszámot is kiírja (~28-37 normális)
+// Opto: RL1 kimenet (L) - 3 x 43k / 0,6 W sorosan - DB106 ~ ; DB106 ~ - N; DB106 + -> CNY17-3 anód (1), - -> katód (2)
+// (LED-áram csúcs ~2,5 mA, ellenállásonként ~0,14 W); CNY17-3 kollektor (5) -> D4 + 47k felhúzó 3V3-ra, emitter (4) -> GND,
+// bázis (6) szabadon. A híd miatt 100 Hz: az 's' parancs a LOW mintaszámot is kiírja (~28-37 / ablak normális, határ: 8)
 // Boot alatt a relék KI; aktív triggerre induláskor bekapcsol (TRIGGER_ON_BOOT, fagyás után mindig), a MIN_OFF_MS a boottól számít; watchdog: WDT_MS
 // Áramszünet után (tápfeltöltés / brownout reset) POWERUP_HOLD_MS ideig a gomb és a trigger hatástalan, a LED ritkán felvillan;
 // utána a beállítások szerint. A hátralévő idő RTC memóriában van: a várakozás alatti fagyás / reset nem rövidíti le
@@ -46,7 +48,7 @@ const int PIN_BTN  = 4;   // D2:  gomb -> GND (belső felhúzó)
 const int PIN_TRIG = 5;   // D3:  opto kimenet, LOW = aktív, külső 10k felhúzó 3V3-ra
 const int PIN_RL1  = 10;  // D10: RL1 tranzisztor
 const int PIN_RL2  = 7;   // D5:  RL2 tranzisztor
-const int PIN_FB1  = 6;   // D4:  RL1 kimenet opto, LOW = van hálózat, 47k felhúzó 3V3-ra
+const int PIN_FB1  = 6;   // D4:  RL1 kimenet opto (CNY17-3 + DB106), LOW = van hálózat, 47k felhúzó 3V3-ra
 
 // ---- Beállítások ----
 const unsigned long RL2_DELAY_MS    = 1000;   // RL2 késleltetése (lágyindítás az NTC-n át; 250 VA toroid + 20000 uF: ~100-300 ms töltés, 1 s bőven elég)
@@ -270,7 +272,7 @@ const int F_NONE = 0, F_STUCK = 1, F_CHATTER = 2, F_PRESSES = 3, F_NOMAINS = 4, 
 const int IN_BTN = 0, IN_TRIG = 1, IN_FB1 = 2;
 
 // ---- Hálózati feszültség visszajelzés ----
-// Az AC opto kimenete 100 Hz-es impulzusokban LOW: ablakonként (MAINS_WIN_MS) számoljuk a LOW mintákat
+// Az opto (híd után) kimenete a nullátmeneteknél rövid ideig HIGH, egyébként LOW (100 Hz): ablakonként (MAINS_WIN_MS) számoljuk a LOW mintákat
 // relé-parancs: új, tiszta mérés
 void mainsCmd() {
   if (!MAINS_CHECK) return;
