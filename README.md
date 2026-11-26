@@ -114,7 +114,7 @@ Ki- és bekapcsolható a program elején: `#define HOME_ASSISTANT true` / `false
 - **Beállítások forrása:** a weboldalon mentett beállítás (NVS); ha nincs, a `secrets.h` (nem kötelező, minta: `secrets.example.h`); ha az sincs, azonnal AP mód.
 - **AP mód:** ha 30 s alatt nem sikerül csatlakozni (vagy nincs beállítás), saját WiFi indul:
   - hálózat: `Erosito-XXXX`, jelszó: `erosito123` (vagy a `secrets.h`-ban megadott `AP_PASS`);
-  - weboldal: `http://192.168.4.1` (a telefon általában magától megnyitja).
+  - weboldal: `http://192.168.4.1` (a telefon általában magától megnyitja); AP módban az `erosito.local` név nem működik.
 - Az AP alatt a program 30 s-onként újrapróbálja a routert (ha kliens van az AP-n, 5 percenként), így áramszünet után, amikor a router lassabban indul, magától csatlakozik. Csatlakozás után az AP leáll, amint 1 percig nincs rajta kliens.
 - A beállítások mentése **nem indítja újra** az ESP-t (a relék nem engednek el): a program élőben csatlakozik újra.
 

@@ -54,6 +54,7 @@ final class ErositoClient {
     private(set) var lastError: String?
     private(set) var busy = false
     private var pollTask: Task<Void, Never>?
+    private var failures = 0                    // egymás utáni sikertelen lekérdezések
     private var quietUntil = Date.distantPast   // IP-váltás után az ESP pár másodpercig nem érhető el: ezt nem jelezzük hibaként
 
     private let session: URLSession = {
@@ -75,6 +76,7 @@ final class ErositoClient {
         UserDefaults.standard.set(newHost, forKey: "host")
         Keychain.save(newPassword, account: "web")
         status = nil
+        failures = 0
         Task { await refresh() }
     }
 
@@ -103,8 +105,11 @@ final class ErositoClient {
             guard decoded.power != nil else { throw ClientError.badResponse(200) }   // üres / sérült válasz ne látsszon "Kikapcsolva"-nak
             status = decoded
             lastError = nil
+            failures = 0
         } catch {
             if Date() < quietUntil { return }
+            failures += 1
+            if failures >= 3 { status = nil }   // ne mutasson elavult állapotot (pl. "Bekapcsolva"), ha az eszköz nem érhető el
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }

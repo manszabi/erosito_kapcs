@@ -1368,6 +1368,7 @@ bool cookieOk() {   // weboldal: tartós süti (a kezdőképernyőre tett app is
 
 bool apiAuth() {   // API: süti (weboldal) vagy Basic jelszó (iOS-app, más kliensek)
   if (cookieOk() || web.authenticate("admin", ncfg.webPass)) return true;
+  if (web.hasHeader("Authorization")) vTaskDelay(pdMS_TO_TICKS(1000));   // rossz jelszó: próbálgatás lassítása
   web.send(401, "text/plain", "Bejelentkezes szukseges");
   return false;
 }
@@ -1804,8 +1805,8 @@ void netInit() {   // beállítások betöltése, WiFi indítása, weboldal útv
   if (!webToken[0]) tokenNew();   // a rádió már fut: valódi véletlenszám
   staLastOk = millis();
   staBegin();
-  const char *hdrs[] = {"Cookie"};
-  web.collectHeaders(hdrs, 1);
+  const char *hdrs[] = {"Cookie", "Authorization"};
+  web.collectHeaders(hdrs, 2);
   web.on("/", HTTP_GET, webRoot);
   web.on("/login", HTTP_ANY, webLogin);
   web.on("/logout", HTTP_GET, webLogout);
@@ -1839,8 +1840,9 @@ void netStart() {
 
 void netStatusLine() {
   bool sta = WiFi.status() == WL_CONNECTED;
-  slogc("  Halozat: WiFi %s%s (%d dBm), IP %s, mDNS %s, MQTT %s\n", sta ? "OK" : "nincs", apOn ? " + AP" : "", (int)WiFi.RSSI(),
-        sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"), mdnsName(),
+  slogc("  Halozat: WiFi %s%s (%d dBm), IP %s (%s%s%s), mDNS %s, MQTT %s\n", sta ? "OK" : "nincs", apOn ? " + AP" : "",
+        (int)WiFi.RSSI(), sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"),
+        ipMode == 1 ? "fix" : "DHCP", ipErr ? ", hibas fix IP: " : "", ipErr ? ipErr : "", mdnsName(),
         !ncfg.mqttUri[0] ? "nincs beallitva" : (mqttUp ? "OK" : "nincs"));
 }
 #else
