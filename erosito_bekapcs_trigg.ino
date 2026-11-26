@@ -57,6 +57,7 @@ const UBaseType_t AUX_PRIO = 0;  // a vezérlés (1) alatt: C3-on a hálózat se
 #include <ESPmDNS.h>   // Bonjour: a telefonos app és a http://erosito.local így találja meg
 #define MDNS_ENABLED 1
 #else
+#warning "ESPmDNS nincs ebben a core-ban: erosito.local es a Bonjour kereses nem mukodik (az iOS-app IP-szkennelessel keres)"
 #define MDNS_ENABLED 0
 #endif
 #define NET_ENABLED 1
@@ -885,7 +886,17 @@ volatile bool mqttUp = false;
 volatile bool netNeedDisc = false;
 bool netStarted = false, apOn = false, netReconfig = false;
 unsigned long netLastState = 0, staLastOk = 0, staLastBegin = 0, apIdleSince = 0, mqttLastTry = 0, apLastTry = 0;
-bool mqttTried = false, apTried = false, mdnsStarted = false;
+bool mqttTried = false, apTried = false;
+int mdnsState = 0;               // 0 = még nem indult, 1 = működik, 2 = hiba (újrapróbálja), 3 = nincs a core-ban
+unsigned long mdnsLastTry = 0;
+const char *mdnsName() {
+  return mdnsState == 1 ? "OK (" NET_ID ".local)" : mdnsState == 2 ? "hiba" : mdnsState == 3 ? "nincs a core-ban" : "nem indult";
+}
+
+void wifiMode(wifi_mode_t m) {   // energiatakarékos mód nélkül: megbízható mDNS (multicast) és gyors weboldal
+  WiFi.mode(m);
+  WiFi.setSleep(false);
+}
 char apSsid[24];
 char webToken[33];             // bejelentkezési süti (NVS-ben: áramszünet után is érvényes; jelszócserekor új)
 const char *T_STATE   = NET_ID "/state";
@@ -990,10 +1001,10 @@ void buildState(char *js, size_t len, bool forWeb) {
     jsonEsc(mus, sizeof mus, ncfg.mqttUser);
     bool sta = WiFi.status() == WL_CONNECTED;
     n += snprintf(js + n, len - n,
-                  ",\"wifi\":\"%s\",\"ip\":\"%s\",\"mqtt\":\"%s\",\"uptime_h\":%lu,\"board\":\"" BOARD_NAME "\","
+                  ",\"wifi\":\"%s\",\"ip\":\"%s\",\"mdns\":\"%s\",\"mqtt\":\"%s\",\"uptime_h\":%lu,\"board\":\"" BOARD_NAME "\","
                   "\"cfg_ssid\":\"%s\",\"cfg_mqtt_uri\":\"%s\",\"cfg_mqtt_user\":\"%s\"",
                   sta ? (apOn ? "csatlakozva + AP" : "csatlakozva") : (apOn ? "AP mód" : "nincs"),
-                  sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"),
+                  sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"), mdnsName(),
                   !ncfg.mqttUri[0] ? "nincs beállítva" : (mqttUp ? "OK" : "nincs kapcsolat"),
                   uptimeHours(), ss, mu, mus);
     if (n < 0 || (size_t)n >= len - 1) { strlcpy(js, "{}", len); return; }
@@ -1132,7 +1143,7 @@ void staBegin() {
 void apStart() {
   apTried = true;
   apLastTry = millis();
-  WiFi.mode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
+  wifiMode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
   if (!WiFi.softAP(apSsid, AP_PASS)) {   // később újrapróbálja
     slogc("AP inditas sikertelen, ujraprobalas %lu s mulva\n", STA_RETRY_MS / 1000);
     return;
@@ -1148,7 +1159,7 @@ void apStart() {
 void apStop() {
   dns.stop();
   WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
+  wifiMode(WIFI_STA);
   apOn = false;
   slogc("AP mod vege: csatlakozva, weboldal: http://%s\n", WiFi.localIP().toString().c_str());
 }
@@ -1210,7 +1221,7 @@ let tr=false,cf=false;const $=i=>document.getElementById(i);
 const L={rl2:'NTC áthidalva (RL2)',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
 fault:'Hiba',warning:'Figyelmeztetés',on_hours:'Üzemidő (óra)',on_count:'Bekapcsolások',relay_count:'Relé kapcsolások',
 mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',
-rssi:'WiFi jel (dBm)',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',board:'Alaplap'};
+rssi:'WiFi jel (dBm)',mdns:'mDNS',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',board:'Alaplap'};
 const V=x=>x===true?'igen':x===false?'nem':x==='ON'?'BE':x==='OFF'?'KI':x;
 async function upd(){try{const r=await fetch('/api/status');if(r.status==401){location='/login';return;}const s=await r.json();tr=s.trig_enabled;let h='';
 for(const k in L)if(k in s)h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
@@ -1285,6 +1296,10 @@ void webIcon() {   // bejelentkezés nélkül: a kezdőképernyő ikonja
   web.send_P(200, "image/png", (const char *)ICON_PNG, sizeof ICON_PNG);
 }
 
+void webId() {   // jelszó nélkül: csak azonosít (az iOS-app IP-szkennelése ez alapján találja meg)
+  web.send(200, "application/json", "{\"device\":\"erosito\",\"board\":\"" BOARD_NAME "\"}");
+}
+
 void webManifest() {
   web.send(200, "application/manifest+json; charset=utf-8", MANIFEST);
 }
@@ -1352,14 +1367,22 @@ void webNotFound() {   // AP módban minden ismeretlen cím a weboldalra irány�
 
 // ---- mDNS / Bonjour: "_erosito._tcp" szolgáltatás és erosito.local név (az első csatlakozáskor, utána magától követi) ----
 void mdnsStart() {
-  mdnsStarted = true;
+  mdnsLastTry = millis();
 #if MDNS_ENABLED
-  if (!MDNS.begin(NET_ID)) { slogc("mDNS inditas sikertelen\n"); return; }
+  if (!MDNS.begin(NET_ID)) {
+    mdnsState = 2;
+    slogc("mDNS inditas sikertelen, ujraprobalas 60 s mulva\n");
+    return;
+  }
   MDNS.setInstanceName("Erosito");
   MDNS.addService("http", "tcp", 80);
   MDNS.addService("erosito", "tcp", 80);
   MDNS.addServiceTxt("erosito", "tcp", "board", BOARD_NAME);
-  slogc("mDNS: http://" NET_ID ".local\n");
+  mdnsState = 1;
+  slogc("mDNS: OK, http://" NET_ID ".local\n");
+#else
+  mdnsState = 3;
+  slogc("mDNS: nincs a core-ban (ESPmDNS), erosito.local nem mukodik; elerheto: http://%s\n", WiFi.localIP().toString().c_str());
 #endif
 }
 
@@ -1381,10 +1404,10 @@ void netService() {
     mqttTried = false;
     WiFi.disconnect();
     staLastOk = millis();   // új időkeret a csatlakozásra
-    if (apOn) WiFi.mode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
+    if (apOn) wifiMode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
     staBegin();
   }
-  if (!mdnsStarted && WiFi.status() == WL_CONNECTED) mdnsStart();
+  if (WiFi.status() == WL_CONNECTED && (mdnsState == 0 || (mdnsState == 2 && millis() - mdnsLastTry >= 60000))) mdnsStart();
   if (!netStarted && ncfg.mqttUri[0] && WiFi.status() == WL_CONNECTED && (!mqttTried || millis() - mqttLastTry >= MQTT_RETRY_MS)) {
     mqttTried = true;
     mqttLastTry = millis();
@@ -1401,7 +1424,7 @@ void netInit() {   // beállítások betöltése, WiFi indítása, weboldal útv
   WiFi.persistent(false);   // a WiFi könyvtár ne írja a flash-t
   WiFi.setHostname(NET_ID);
   WiFi.setAutoReconnect(true);
-  WiFi.mode(WIFI_STA);
+  wifiMode(WIFI_STA);
   if (!webToken[0]) tokenNew();   // a rádió már fut: valódi véletlenszám
   staLastOk = millis();
   staBegin();
@@ -1414,6 +1437,7 @@ void netInit() {   // beállítások betöltése, WiFi indítása, weboldal útv
   web.on("/apple-touch-icon-precomposed.png", HTTP_GET, webIcon);
   web.on("/favicon.ico", HTTP_GET, webIcon);
   web.on("/manifest.json", HTTP_GET, webManifest);
+  web.on("/api/id", HTTP_GET, webId);
   web.on("/api/status", HTTP_GET, webStatus);
   web.on("/api/power", HTTP_POST, webPower);
   web.on("/api/trigger", HTTP_POST, webTrigger);
@@ -1438,8 +1462,8 @@ void netStart() {
 
 void netStatusLine() {
   bool sta = WiFi.status() == WL_CONNECTED;
-  slogc("  Halozat: WiFi %s%s (%d dBm), IP %s, MQTT %s\n", sta ? "OK" : "nincs", apOn ? " + AP" : "", (int)WiFi.RSSI(),
-        sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"),
+  slogc("  Halozat: WiFi %s%s (%d dBm), IP %s, mDNS %s, MQTT %s\n", sta ? "OK" : "nincs", apOn ? " + AP" : "", (int)WiFi.RSSI(),
+        sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"), mdnsName(),
         !ncfg.mqttUri[0] ? "nincs beallitva" : (mqttUp ? "OK" : "nincs"));
 }
 #else
