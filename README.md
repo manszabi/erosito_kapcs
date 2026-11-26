@@ -53,7 +53,7 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
 | `RL2_DELAY_MS` | 1 s | Lágyindítás: az RL1 után ennyivel húz be az RL2 |
 | `RL2_MIN_ON_MS` | 2 s | Kikapcsolás előtt az RL2 legalább ennyi ideig be van húzva |
 | `MIN_OFF_MS` | 5 s | Minimális kikapcsolt idő; az ez alatti kérést a program megjegyzi |
-| `POWERUP_HOLD_MS` | 2 perc | Áramszünet után eddig nincs gomb és trigger |
+| `POWERUP_HOLD_MS` | 2 perc | Áramszünet után eddig nincs trigger, a gomb csak egyszer kapcsolhat be |
 | `FAULT_LOCKOUT_MS` | 5 s | Hiba után eddig nincs bekapcsolás |
 | `MAINS_LOSS_MS` | 25 ms | Hálózatkiesés: a relék azonnal elengednek |
 
@@ -66,6 +66,8 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
   A függő kérés alatt a további gombnyomásokat figyelmen kívül hagyja.
 - **Hálózatkiesés:** a relék azonnal elengednek. 5 s múlva, ha a trigger még aktív, a program újra bekapcsol lágyindítással.
 - **Áramszünet után:** 2 perc várakozás, utána aktív triggerre bekapcsol.
+  - A trigger a várakozás alatt hatástalan.
+  - Egy hosszú gombnyomás a várakozás alatt is bekapcsol (a boot utáni első 5 s-ban nyomva az 5 s leteltével), de csak egyszer: a további gombnyomás a várakozás végéig hatástalan, így gombbal addig kikapcsolni sem lehet.
   - A hátralévő időt RTC memóriában tartja, így egy watchdog-reset nem rövidíti le.
 - **Hiba után:** 1 s villogás, a relék kikapcsolnak, majd 5 s tiltás.
   - A tiltás alatti gombnyomás elvész.
