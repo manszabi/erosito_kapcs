@@ -49,6 +49,12 @@ const UBaseType_t AUX_PRIO = 0;  // a vezérlés (1) alatt: C3-on a hálózat se
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <mqtt_client.h>
+#if __has_include(<ESPmDNS.h>)
+#include <ESPmDNS.h>   // Bonjour: a telefonos app és a http://erosito.local így találja meg
+#define MDNS_ENABLED 1
+#else
+#define MDNS_ENABLED 0
+#endif
 #define NET_ENABLED 1
 #else
 #define NET_ENABLED 0
@@ -875,7 +881,7 @@ volatile bool mqttUp = false;
 volatile bool netNeedDisc = false;
 bool netStarted = false, apOn = false, netReconfig = false;
 unsigned long netLastState = 0, staLastOk = 0, staLastBegin = 0, apIdleSince = 0, mqttLastTry = 0, apLastTry = 0;
-bool mqttTried = false, apTried = false;
+bool mqttTried = false, apTried = false, mdnsStarted = false;
 char apSsid[24];
 const char *T_STATE   = NET_ID "/state";
 const char *T_EVENT   = NET_ID "/event";
@@ -1249,6 +1255,19 @@ void webNotFound() {   // AP módban minden ismeretlen cím a weboldalra irány�
   }
 }
 
+// ---- mDNS / Bonjour: "_erosito._tcp" szolgáltatás és erosito.local név (az első csatlakozáskor, utána magától követi) ----
+void mdnsStart() {
+  mdnsStarted = true;
+#if MDNS_ENABLED
+  if (!MDNS.begin(NET_ID)) { slogc("mDNS inditas sikertelen\n"); return; }
+  MDNS.setInstanceName("Erosito");
+  MDNS.addService("http", "tcp", 80);
+  MDNS.addService("erosito", "tcp", 80);
+  MDNS.addServiceTxt("erosito", "tcp", "board", BOARD_NAME);
+  slogc("mDNS: http://" NET_ID ".local\n");
+#endif
+}
+
 // ---- Hálózati task ----
 void netService() {
   wifiService();
@@ -1269,6 +1288,7 @@ void netService() {
     if (apOn) WiFi.mode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
     staBegin();
   }
+  if (!mdnsStarted && WiFi.status() == WL_CONNECTED) mdnsStart();
   if (!netStarted && ncfg.mqttUri[0] && WiFi.status() == WL_CONNECTED && (!mqttTried || millis() - mqttLastTry >= MQTT_RETRY_MS)) {
     mqttTried = true;
     mqttLastTry = millis();
