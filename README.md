@@ -1,4 +1,4 @@
-# Erősítő bekapcsoló (XIAO ESP32-C3)
+# Erősítő bekapcsoló (XIAO ESP32-C3 / ESP32-S3)
 
 Toroidtrafós erősítő be- és kikapcsolása gombbal vagy 12 V-os triggerrel, NTC-s lágyindítással, hálózatfigyeléssel és hibakezeléssel.
 
@@ -7,16 +7,20 @@ Toroidtrafós erősítő be- és kikapcsolása gombbal vagy 12 V-os triggerrel, 
 
 ## Lábkiosztás
 
-| Láb | GPIO | Funkció |
-|---|---|---|
-| D1 | 3 | LED (tranzisztorral, HIGH = világít) |
-| D2 | 4 | Gomb a GND-re (belső felhúzó) |
-| D3 | 5 | Trigger optó, LOW = aktív (10k felhúzó) |
-| D4 | 6 | Hálózatfigyelő optó, LOW = van hálózat (43k felhúzó) |
-| D5 | 7 | RL2 tranzisztor |
-| D10 | 10 | RL1 tranzisztor |
+A program a XIAO D-lábneveit használja, így a bekötés **mindkét lapon azonos**; a GPIO-számot a kiválasztott alaplap határozza meg.
+
+| Láb | C3 GPIO | S3 GPIO | Funkció |
+|---|---|---|---|
+| D1 | 3 | 2 | LED (tranzisztorral, HIGH = világít) |
+| D2 | 4 | 3 | Gomb a GND-re (belső felhúzó) |
+| D3 | 5 | 4 | Trigger optó, LOW = aktív (10k felhúzó) |
+| D4 | 6 | 5 | Hálózatfigyelő optó, LOW = van hálózat (43k felhúzó) |
+| D5 | 7 | 6 | RL2 tranzisztor |
+| D10 | 10 | 9 | RL1 tranzisztor |
 
 A relé-tranzisztorok bázisán legyen lehúzó ellenállás, hogy reset alatt ne kattanjanak be.
+
+**XIAO ESP32-S3:** a WiFi-hez csatlakoztasd a mellékelt külső antennát; a két mag miatt a WiFi és a vezérlés külön magon fut. A WiFi adóteljesítménye C3-on 8,5 dBm, S3-on 15 dBm.
 
 ## Hálózatfigyelő optó
 
@@ -129,7 +133,7 @@ A program hónapokig, évekig megszakítás nélkül futhat:
 
 ## Fordítás
 
-- Arduino-ESP32 core 3.x, alaplap: **XIAO_ESP32C3**
+- Arduino-ESP32 core 3.x, alaplap: **XIAO_ESP32C3** vagy **XIAO_ESP32S3** (más alaplapra a program nem fordul le)
 - Eszközök → **USB CDC On Boot: Enabled**
 - Soros napló 115200 baud. Az `s` parancs a hálózatfigyelő optó LOW mintaszámát is kiírja (bekapcsolt állapotban normálisan kb. 28–37).
 - `MAINS_CHECK = true`: optó nélkül állítsd `false`-ra.

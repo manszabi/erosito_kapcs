@@ -1,4 +1,4 @@
-// XIAO ESP32-C3 erősítő-bekapcsoló: gomb + 12 V trigger, RL1 (NTC lágyindítás) majd RL2 (NTC áthidalás), hálózatfigyelés, hibakezelés
+// XIAO ESP32-C3 / ESP32-S3 erősítő-bekapcsoló: gomb + 12 V trigger, RL1 (NTC lágyindítás) majd RL2 (NTC áthidalás), hálózatfigyelés, hibakezelés
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -35,13 +35,27 @@
 #warning "Allitsd be: Eszkozok > USB CDC On Boot > Enabled (kulonben a soros naplo nem az USB-n jelenik meg)"
 #endif
 
+// ---- Alaplap: XIAO ESP32-C3 vagy XIAO ESP32-S3 (a lábak a D-nevekkel, így a bekötés mindkettőn azonos) ----
+#if CONFIG_IDF_TARGET_ESP32S3
+#define BOARD_NAME "XIAO ESP32-S3"
+#define WIFI_TX_POWER WIFI_POWER_15dBm    // külső antenna: nagyobb teljesítmény is elég stabil
+#elif CONFIG_IDF_TARGET_ESP32C3
+#define BOARD_NAME "XIAO ESP32-C3"
+#define WIFI_TX_POWER WIFI_POWER_8_5dBm   // a XIAO C3-on így stabil, és kisebb az áramcsúcs
+#else
+#error "Csak XIAO ESP32-C3 vagy XIAO ESP32-S3 alaplapra (Eszkozok > Alaplap)"
+#endif
+#if !defined(ARDUINO_XIAO_ESP32C3) && !defined(ARDUINO_XIAO_ESP32S3)
+#warning "Nem XIAO alaplap van kivalasztva: ellenorizd, hogy a D-labak a XIAO kiosztas szerintiek-e"
+#endif
+
 // ---- Lábak ----
-const int PIN_LED  = 3;   // D1:  LED tranzisztor (HIGH = világít)
-const int PIN_BTN  = 4;   // D2:  gomb GND-re, belső felhúzó
-const int PIN_TRIG = 5;   // D3:  trigger opto, LOW = aktív, 10k felhúzó
-const int PIN_RL1  = 10;  // D10: RL1 tranzisztor
-const int PIN_RL2  = 7;   // D5:  RL2 tranzisztor
-const int PIN_FB1  = 6;   // D4:  RL1 kimenet opto (CNY17-3 + DB106 + 3x43k), LOW = van hálózat, 43k felhúzó
+const int PIN_LED  = D1;   // LED tranzisztor (HIGH = világít)                           C3: GPIO3,  S3: GPIO2
+const int PIN_BTN  = D2;   // gomb GND-re, belső felhúzó                                 C3: GPIO4,  S3: GPIO3
+const int PIN_TRIG = D3;   // trigger opto, LOW = aktív, 10k felhúzó                     C3: GPIO5,  S3: GPIO4
+const int PIN_FB1  = D4;   // RL1 kimenet opto (CNY17-3 + DB106 + 3x43k), LOW = hálózat  C3: GPIO6,  S3: GPIO5
+const int PIN_RL2  = D5;   // RL2 tranzisztor                                            C3: GPIO7,  S3: GPIO6
+const int PIN_RL1  = D10;  // RL1 tranzisztor                                            C3: GPIO10, S3: GPIO9
 
 // ---- Relé időzítések ----
 const unsigned long RL2_DELAY_MS     = 1000;   // RL1 után ennyivel húz be az RL2 (NTC lágyindítás)
@@ -805,7 +819,7 @@ void netDisc(const char *comp, const char *obj, const char *name, const char *ex
   snprintf(js, sizeof js,
            "{\"name\":%s,\"uniq_id\":\"" NET_ID "_%s\",\"stat_t\":\"" NET_ID "/state\","
            "\"val_tpl\":\"{{value_json.%s}}\",\"avty_t\":\"" NET_ID "/status\"%s,"
-           "\"dev\":{\"ids\":[\"" NET_ID "\"],\"name\":\"Erősítő\",\"mf\":\"DIY\",\"mdl\":\"XIAO ESP32-C3 bekapcsoló\"}}",
+           "\"dev\":{\"ids\":[\"" NET_ID "\"],\"name\":\"Erősítő\",\"mf\":\"DIY\",\"mdl\":\"" BOARD_NAME " bekapcsoló\"}}",
            name, obj, obj, extra);
   netPub(topic, js, true);
 }
@@ -854,7 +868,7 @@ void netTask(void *) {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);   // kisebb áramcsúcs; a XIAO C3-on így stabilabb is
+  WiFi.setTxPower(WIFI_TX_POWER);
   bool started = false;
   unsigned long lastState = 0;
   for (;;) {
@@ -1020,7 +1034,7 @@ void setup() {
     holdClear();
   }
 
-  slogc("\n=== Erosito bekapcsolo indul (%s) ===\n", resetName(rr));
+  slogc("\n=== Erosito bekapcsolo indul (" BOARD_NAME ", %s) ===\n", resetName(rr));
   slogc("TRIGGER: %s, %s; halozatfigyeles: %s\n", trig.stable == LOW ? "aktiv" : "nincs",
         trigOff ? "TILTVA" : "engedelyezve", MAINS_CHECK ? "BE" : "KI");
   if (!nvsOk) slogc("FIGYELEM: NVS hiba, alapertelmezett beallitasok\n");
