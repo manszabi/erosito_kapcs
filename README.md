@@ -69,6 +69,8 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
 
   A függő kérés alatt a további gombnyomásokat figyelmen kívül hagyja.
 - **Hálózatkiesés:** a relék azonnal elengednek. 5 s múlva, ha a trigger még aktív, a program újra bekapcsol lágyindítással.
+  - **Sorozatos kiesés:** ha 3 kiesés jön úgy, hogy mindegyik az előzőtől számított 10 percen belül van, a program nem kapcsol vissza magától (a LED 3 s-onként kettőt villan). Gomb, weboldal, app és Home Assistant bekapcsol.
+  - 10 perc kiesés nélkül a sorozat nullázódik; ha a trigger aktív, a program bekapcsol.
 - **Áramszünet után:** 2 perc várakozás, utána aktív triggerre bekapcsol.
   - A trigger a várakozás alatt hatástalan.
   - Egy hosszú gombnyomás a várakozás alatt is bekapcsol (a boot utáni első 5 s-ban nyomva az 5 s leteltével), de csak egyszer: a további gombnyomás a várakozás végéig hatástalan, így gombbal addig kikapcsolni sem lehet.
@@ -78,7 +80,7 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
   - A tiltás végén aktív triggerre bekapcsol.
   - A beragadt gombot és az összehegedt relét a program elmenti, és újraindítás után is ellenőrzi.
 - **Ismétlődő hiba** (beragadt gomb, zajos trigger, hibás RL1 kimenet): a tiltás minden újabb hibánál duplázódik (5, 10, 20 … s, legfeljebb 5 perc).
-  - A 3. ismétlődő hibától a trigger nem kapcsol be automatikusan; a gomb és a távoli bekapcsolás működik.
+  - A 3. ismétlődő hibától a trigger nem kapcsol be automatikusan; a gomb és a távoli bekapcsolás működik (a LED 3 s-onként kettőt villan).
   - 10 perc nyugodt bemenet (a trigger zaja kikapcsolt relénél is figyelve) után a sorozat nullázódik; ha a trigger aktív, a program bekapcsol.
   - A szándékos 3 rövid gombnyomás és a hálózatkiesés nem számít a sorozatba.
 - **Flash kímélése:** a statisztikát legfeljebb percenként menti (hálózatkiesésnél legfeljebb 30 s-onként); a halasztott mentést a program magától pótolja.
