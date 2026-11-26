@@ -97,6 +97,9 @@ const unsigned long FAULT_BLINK_MS   = 1000;     // hibavillogás hossza
 const unsigned long FAULT_HALF_MS    = 100;
 const unsigned long FAULT_LOCKOUT_MS = 5000;     // hiba után ennyi ideig nincs bekapcsolás
 const bool          AUTO_ON_AFTER_FAULT = true;  // tiltás végén aktív triggerre bekapcsol
+const unsigned long FAULT_LOCKOUT_MAX_MS = 300000UL; // ismétlődő hibánál a tiltás duplázódik, legfeljebb eddig
+const unsigned long FAULT_STREAK_RESET_MS = 600000UL; // ennyi hibamentes idő után a sorozat nullázódik
+const uint8_t       FAULT_STREAK_PAUSE = 3;      // ennyi ismétlődő hiba után a trigger nem kapcsol be automatikusan
 const unsigned long BTN_STUCK_MS     = 10000;    // ennyi ideig nyomott gomb = beragadt
 const unsigned long WINDOW_MS        = 1000;     // váltásszámláló ablak
 const uint8_t       CHANGE_LIMIT     = 4;        // trigger: max. váltás / ablak
@@ -120,6 +123,7 @@ const uint8_t       OPTO_MIN_AVG     = 15;       // figyelmeztetés: az opto át
 const uint8_t       OPTO_BASE_SESSIONS = 5;      // az első ennyi mérési szakasz átlaga lesz az alapérték
 const uint16_t      OPTO_MIN_WINDOWS = 250;      // egy szakasz csak ennyi ablak (~10 s) felett számít
 const unsigned long STATS_SAVE_MS    = 3600000UL; // bekapcsolva óránként mentés
+const unsigned long STATS_MIN_GAP_MS = 60000;    // két NVS-mentés között legalább ennyi idő (flash kímélése)
 
 // Soros napló, Home Assistant
 const uint8_t       LOG_MAX_PER_SEC  = 5;        // slog() korlát; slogc() korlátlan
@@ -203,6 +207,9 @@ int lastFault = F_NONE;
 int storedFault = F_NONE;       // NVS-ben tárolt hiba
 bool lockoutPending = false;    // hiba utáni tiltás
 unsigned long lockoutStart = 0, lockoutDur = 0;
+bool pauseLogged = false;           // a szünetelés üzenete egyszer
+uint8_t faultStreak = 0;            // egymás utáni hardverhibák (zaj, beragadás, RL1 kimenet)
+unsigned long faultQuietT = 0;      // az utolsó hiba vége (a sorozat nullázásához)
 
 // Bemenetek, gomb
 Input inputs[2] = {
@@ -467,8 +474,9 @@ int mainsFault() {
 }
 
 // ======================================================================= Állapotfigyelés (NVS)
-void statsSave() {
+void statsSave(bool force = false) {   // force nélkül legfeljebb STATS_MIN_GAP_MS-onként; a többit a statsTimer menti
   if (!stDirty) return;
+  if (!force && stLastSave && millis() - stLastSave < STATS_MIN_GAP_MS) return;
   if (!prefs.begin("relay", false)) return;
   if (prefs.putBytes("stats", &st, sizeof st) == sizeof st) stDirty = false;
   prefs.end();
@@ -588,6 +596,8 @@ void updateRl2(unsigned long now) {   // RL2 késleltetve (csak igazolt hálóza
 }
 
 // ======================================================================= Hibák
+bool autoPaused() { return faultStreak >= FAULT_STREAK_PAUSE; }   // ismétlődő hiba: csak gomb / távoli kapcsol be
+
 void saveFault(int f) {   // csak az ellenőrizhető hardverhibát mentjük (beragadt gomb, hálózat KI relénél)
   if (f != F_NONE && f != F_STUCK && f != F_MAINSOFF) return;
   if (f == storedFault) return;
@@ -614,6 +624,11 @@ void startFault(int idx, int f) {
   if (f == F_MAINSLOST) st.mainsLoss++;
   else st.faults++;
   stDirty = true;
+  if (f != F_MAINSLOST && f != F_PRESSES) {   // a szándékos 3 nyomás és a kiesés nem hardverhiba-sorozat
+    if (faultStreak && millis() - faultQuietT >= FAULT_STREAK_RESET_MS) faultStreak = 0;
+    if (faultStreak < 255) faultStreak++;
+    pauseLogged = false;
+  }
   if (idx == IN_FB1) {   // hálózati hiba: relék azonnal KI
     bool retry = on && !offPending;
     setState(false, (f == F_MAINSLOST) ? "halozatkieses" : "halozati hiba");
@@ -622,6 +637,7 @@ void startFault(int idx, int f) {
       onReqSrc = "trigger halozatkieses utan";
     }
   }
+  if (f == F_MAINSLOST && millis() - stLastSave >= 30000) statsSave(true);   // valódi áramszünet: a számláló ne vesszen el (legfeljebb 30 s-onként)
   lastFault = f;
   saveFault(f);
   if (f == F_MAINSLOST) netEvent("mains_loss", "Hálózatkiesés bekapcsolt állapotban%s", onReqTrig ? ", újrakapcsolás aktív triggerre" : "");
@@ -665,7 +681,12 @@ void endFault() {
   lockoutPending = true;
   lockoutStart = millis();
   lockoutDur = FAULT_LOCKOUT_MS;
-  slogc("Hiba vege: relek KI, %lu ms-ig nincs bekapcsolas\n", FAULT_LOCKOUT_MS);
+  if (lastFault != F_PRESSES)   // ismétlődő hiba: 5, 10, 20 ... s, legfeljebb FAULT_LOCKOUT_MAX_MS
+    for (uint8_t i = 1; i < faultStreak && lockoutDur < FAULT_LOCKOUT_MAX_MS; i++) lockoutDur *= 2;
+  if (lockoutDur > FAULT_LOCKOUT_MAX_MS) lockoutDur = FAULT_LOCKOUT_MAX_MS;
+  faultQuietT = millis();
+  slogc("Hiba vege: relek KI, %lu ms-ig nincs bekapcsolas%s\n", lockoutDur,
+        autoPaused() ? " (ismetlodo hiba: a trigger automatika szunetel)" : "");
 }
 
 void endLockout() {   // tiltás vége: ok ellenőrzése, mentett hiba törlése, automata bekapcsolás
@@ -682,7 +703,7 @@ void endLockout() {   // tiltás vége: ok ellenőrzése, mentett hiba törlése
     lastFault = F_NONE;
     saveFault(F_NONE);
     if (was == F_NOMAINS) slog("Nincs automatikus ujrakapcsolas: gomb vagy uj trigger kell\n");
-    else if (AUTO_ON_AFTER_FAULT && !trigOff && trig.stable == LOW) switchOn("aktiv trigger hiba utan", false);
+    else if (AUTO_ON_AFTER_FAULT && !trigOff && trig.stable == LOW && !autoPaused()) switchOn("aktiv trigger hiba utan", false);
   }
 }
 
@@ -756,7 +777,11 @@ void triggerEdge() {   // trigger: aktív élre be, inaktív élre ki
       offPending = false;
       slog("Trigger ujra aktiv: kikapcsolas elmarad\n");
     }
-    switchOn("trigger", false);
+    if (!on && autoPaused()) {
+      if (!pauseLogged) slog("Trigger: ismetlodo hiba miatt nincs automatikus bekapcsolas (gomb / tavoli: igen)\n");
+      pauseLogged = true;
+    }
+    else switchOn("trigger", false);
   } else {
     requestOff("trigger", false);
   }
@@ -1860,7 +1885,8 @@ void printHelp() {
 void printStatus() {
   char lk[48] = "";
   if (powerHold) snprintf(lk, sizeof lk, " [aramszunet utan: %lu s]", timeLeft(holdStart, holdDur) / 1000);
-  else if (lockoutLeft() > 0) snprintf(lk, sizeof lk, " [tiltas: %lu ms]", lockoutLeft());
+  else if (lockoutLeft() > 0) snprintf(lk, sizeof lk, " [tiltas: %lu ms%s]", lockoutLeft(), autoPaused() ? ", ismetlodo" : "");
+  else if (autoPaused()) snprintf(lk, sizeof lk, " [ismetlodo hiba: trigger szunetel]");
   char rq[48] = "";
   if (onReqBtn || onReqTrig) snprintf(rq, sizeof rq, " [bekapcs. %s, %lu ms]", onReqBtn ? "gomb" : "trigger", minOffLeft());
   slogc("ALLAPOT: RL1=%s RL2=%s LED=%s%s%s%s\n", on ? "BE" : "KI", rl2On ? "BE" : "KI",
@@ -1928,14 +1954,14 @@ void handleSerial() {
     st.optoBaseN = 0;
     lastSessMean = 0;
     stDirty = true;
-    statsSave();
+    statsSave(true);
     slogc("Opto alapertek torolve: a kovetkezo %u meresi szakaszbol ujra kepzodik\n", (unsigned)OPTO_BASE_SESSIONS);
   }
   if (relayReq) {   // relécsere után
     relayReq = false;
     st.relayCount = 0;
     stDirty = true;
-    statsSave();
+    statsSave(true);
     slogc("Rele szamlalo nullazva\n");
   }
 }
@@ -2035,7 +2061,7 @@ void setup() {
         trigOff ? "TILTVA" : "engedelyezve", MAINS_CHECK ? "BE" : "KI");
   if (!nvsOk) slogc("FIGYELEM: NVS hiba, alapertelmezett beallitasok\n");
   if (powerHold) slogc("Aramszunet utan: %lu s varakozas\n", holdMs / 1000);
-  if (powerLoss) { st.powerUps++; stDirty = true; statsSave(); }
+  if (powerLoss) { st.powerUps++; stDirty = true; statsSave(true); }
   printHelp();
   netStart();
   netEvent("boot", "Indulás: %s%s", resetName(rr), powerHold ? ", áramszünet utáni várakozás" : "");
@@ -2105,13 +2131,24 @@ void handleNormal(bool btnChanged, bool trigChanged) {
   if (!faultActive && trigChanged && !trigOff) triggerEdge();
   processPendingOn(false);
   if (!faultActive && lockoutPending && lockoutLeft() == 0) endLockout();
+  if (faultStreak && !faultActive) {   // a sorozat csak akkor nullázódik, ha a bemenetek közben is nyugodtak (KI relénél is figyelve)
+    if (checkFault(IN_BTN) != F_NONE || (!trigOff && checkFault(IN_TRIG) != F_NONE)) faultQuietT = millis();
+  }
+  if (faultStreak && !faultActive && !lockoutPending && millis() - faultQuietT >= FAULT_STREAK_RESET_MS) {
+    bool wasPaused = autoPaused();   // FAULT_STREAK_RESET_MS hibamentes idő: a sorozat nullázódik
+    faultStreak = 0;
+    slog("Hibasorozat nullazva (%lu s hibamentes)\n", FAULT_STREAK_RESET_MS / 1000);
+    if (wasPaused && AUTO_ON_AFTER_FAULT && !on && !trigOff && trig.stable == LOW && lastFault != F_NOMAINS)
+      switchOn("aktiv trigger, ismetlodo hiba utan stabil", false);
+  }
 }
 
-void handleStatsTimer(unsigned long now) {   // bekapcsolva óránként mentés
+void handleStatsTimer(unsigned long now) {   // halasztott mentés (STATS_MIN_GAP_MS), bekapcsolva óránként mentés
+  if (stDirty && now - stLastSave >= STATS_MIN_GAP_MS) statsSave();
   if (!on || now - stLastSave < STATS_SAVE_MS) return;
   statsAccount();
   statsFold();
-  statsSave();
+  statsSave(true);
   stLastSave = now;
   checkWarnings();
 }

@@ -58,7 +58,7 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
 | `RL2_MIN_ON_MS` | 2 s | Kikapcsolás előtt az RL2 legalább ennyi ideig be van húzva |
 | `MIN_OFF_MS` | 5 s | Minimális kikapcsolt idő; az ez alatti kérést a program megjegyzi |
 | `POWERUP_HOLD_MS` | 2 perc | Áramszünet után eddig nincs trigger, a gomb csak egyszer kapcsolhat be |
-| `FAULT_LOCKOUT_MS` | 5 s | Hiba után eddig nincs bekapcsolás |
+| `FAULT_LOCKOUT_MS` | 5 s | Hiba után eddig nincs bekapcsolás (ismétlődő hibánál duplázódik, legfeljebb `FAULT_LOCKOUT_MAX_MS` = 5 perc) |
 | `MAINS_LOSS_MS` | 25 ms | Hálózatkiesés: a relék azonnal elengednek |
 
 ## Működés röviden
@@ -77,6 +77,11 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
   - A tiltás alatti gombnyomás elvész.
   - A tiltás végén aktív triggerre bekapcsol.
   - A beragadt gombot és az összehegedt relét a program elmenti, és újraindítás után is ellenőrzi.
+- **Ismétlődő hiba** (beragadt gomb, zajos trigger, hibás RL1 kimenet): a tiltás minden újabb hibánál duplázódik (5, 10, 20 … s, legfeljebb 5 perc).
+  - A 3. ismétlődő hibától a trigger nem kapcsol be automatikusan; a gomb és a távoli bekapcsolás működik.
+  - 10 perc nyugodt bemenet (a trigger zaja kikapcsolt relénél is figyelve) után a sorozat nullázódik; ha a trigger aktív, a program bekapcsol.
+  - A szándékos 3 rövid gombnyomás és a hálózatkiesés nem számít a sorozatba.
+- **Flash kímélése:** a statisztikát legfeljebb percenként menti (hálózatkiesésnél legfeljebb 30 s-onként); a halasztott mentést a program magától pótolja.
 
 ## Állapotfigyelés
 
