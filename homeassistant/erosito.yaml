@@ -1,0 +1,110 @@
+# Erősítő bekapcsoló – Home Assistant csomag (eseménynapló, heti és eseményenkénti AI-elemzés)
+# Telepítés: configuration.yaml -> homeassistant: packages: !include_dir_named packages
+#            majd ezt a fájlt másold a config/packages/ mappába, és indítsd újra a Home Assistantet.
+# Az "agent_id" helyére a saját Anthropic beszélgetési ügynököd azonosítóját írd (Beállítások > Hangasszisztensek).
+
+input_text:
+  erosito_heti_alap:
+    name: Erosito heti alap
+    max: 255
+
+template:
+  # Az ESP eseményei (be, ki, kiesés, hiba, figyelmeztetés, indulás) időbélyeggel, az utolsó 50
+  - triggers:
+      - trigger: mqtt
+        topic: erosito/event
+    sensor:
+      - name: Erosito esemenynaplo
+        unique_id: erosito_esemenynaplo
+        state: "{{ trigger.payload_json.type }}"
+        attributes:
+          esemenyek: >-
+            {% set uj = {'ido': now().strftime('%Y-%m-%d %H:%M'), 'tipus': trigger.payload_json.type, 'leiras': trigger.payload_json.text} %}
+            {{ ((this.attributes.esemenyek | default([])) + [uj])[-50:] }}
+  # Az ESP legutóbbi teljes állapota (számlálók, optó, figyelmeztetés)
+  - triggers:
+      - trigger: mqtt
+        topic: erosito/state
+    sensor:
+      - name: Erosito allapot
+        unique_id: erosito_allapot
+        state: "{{ trigger.payload_json.power }}"
+        attributes:
+          adatok: "{{ trigger.payload_json }}"
+
+automation:
+  - id: erosito_heti_ai
+    alias: Erősítő – heti AI összefoglaló
+    mode: single
+    triggers:
+      - trigger: time
+        at: "18:00:00"
+    conditions:
+      - condition: time
+        weekday: sun
+    actions:
+      - variables:
+          most: "{{ state_attr('sensor.erosito_allapot', 'adatok') }}"
+          alap: "{{ states('input_text.erosito_heti_alap') }}"
+          het: "{{ (now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M') }}"
+          esemenyek: >-
+            {{ (state_attr('sensor.erosito_esemenynaplo', 'esemenyek') or []) | selectattr('ido', '>=', het) | list }}
+      - action: conversation.process
+        data:
+          agent_id: conversation.claude
+          text: >-
+            Egy toroidtrafós erősítő ESP32-es bekapcsolójának heti összefoglalóját kérem, magyarul, legfeljebb 8 mondatban.
+            Működés: RL1 a hálózatot egy 30 ohmos NTC-n át kapcsolja (lágyindítás), RL2 1 s múlva áthidalja az NTC-t.
+            Az optó a hálózatot figyeli az RL1 után: bekapcsolva a LOW mintaszám normálisan 28–37, hibahatár 8,
+            figyelmeztetés 15 alatt vagy ha az átlag 25%-kal az alapérték alá esik. A relé élettartama kb. 100 000 kapcsolás.
+            Jelenlegi állapot (JSON): {{ most | to_json }}.
+            Egy héttel ezelőtti számlálók (JSON, lehet üres az első héten): {{ alap }}.
+            Az elmúlt 7 nap eseményei: {{ esemenyek | to_json }}.
+            Írd le: üzemidő és bekapcsolások a héten, hálózatkiesések és hibák (mikor, van-e mintázat),
+            az optó és a relé állapota, és ha szükséges, mit érdemes tenni. Csak az adatokból következtess.
+        response_variable: valasz
+      - action: persistent_notification.create
+        data:
+          title: Erősítő – heti összefoglaló
+          message: "{{ valasz.response.speech.plain.speech }}"
+      # Telefonos értesítéshez: action: notify.mobile_app_<telefonod>, data: title / message ugyanígy
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.erosito_heti_alap
+        data:
+          value: >-
+            {{ {'on_hours': most.on_hours, 'on_count': most.on_count, 'mains_loss': most.mains_loss,
+                'faults': most.faults, 'power_ups': most.power_ups, 'relay_count': most.relay_count,
+                'opto_avg': most.opto_avg} | to_json }}
+
+  - id: erosito_esemeny_ai
+    alias: Erősítő – AI elemzés hiba, kiesés vagy figyelmeztetés után
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: mqtt
+        topic: erosito/event
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.payload_json.type in ['fault', 'mains_loss', 'warning'] }}"
+    actions:
+      - delay: "00:01:00"   # a gyorsan egymás után jövő események összegyűlnek
+      - variables:
+          most: "{{ state_attr('sensor.erosito_allapot', 'adatok') }}"
+          esemenyek: "{{ (state_attr('sensor.erosito_esemenynaplo', 'esemenyek') or [])[-15:] }}"
+      - action: conversation.process
+        data:
+          agent_id: conversation.claude
+          text: >-
+            Egy toroidtrafós erősítő ESP32-es bekapcsolója ezt jelezte: {{ trigger.payload_json.text }}.
+            Működés: RL1 a hálózatot egy 30 ohmos NTC-n át kapcsolja (lágyindítás), RL2 1 s múlva áthidalja az NTC-t;
+            hálózatkiesésnél a relék azonnal elengednek, 5 s múlva aktív triggerre újra bekapcsol.
+            Az optó LOW mintaszáma normálisan 28–37, hibahatár 8. A relé élettartama kb. 100 000 kapcsolás.
+            Jelenlegi állapot (JSON): {{ most | to_json }}. Utolsó események: {{ esemenyek | to_json }}.
+            Magyarul, legfeljebb 5 mondatban: mi történt, mi lehet az oka, kell-e tenni valamit. Csak az adatokból következtess.
+        response_variable: valasz
+      - action: persistent_notification.create
+        data:
+          title: "Erősítő – {{ trigger.payload_json.text }}"
+          message: "{{ valasz.response.speech.plain.speech }}"
+      - delay: "00:10:00"   # utána 10 percig nincs újabb elemzés (pl. viharban sok kiesés)

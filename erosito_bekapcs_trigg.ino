@@ -12,6 +12,22 @@
 #include <esp_system.h>
 #include <esp_attr.h>
 
+// ---- Home Assistant (WiFi + MQTT): false = a hálózati kód be sem fordul ----
+#define HOME_ASSISTANT true
+#if HOME_ASSISTANT
+#if __has_include("secrets.h")
+#include "secrets.h"   // WIFI_SSID, WIFI_PASS, MQTT_URI, MQTT_USER, MQTT_PASS (minta: secrets.example.h)
+#include <WiFi.h>
+#include <mqtt_client.h>
+#define NET_ENABLED 1
+#else
+#warning "secrets.h nincs a sketch mappaban: Home Assistant kikapcsolva (lasd secrets.example.h)"
+#define NET_ENABLED 0
+#endif
+#else
+#define NET_ENABLED 0
+#endif
+
 #if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
 #error "Arduino-ESP32 core 3.x kell (Boards Manager: esp32 by Espressif Systems)"
 #endif
@@ -74,6 +90,10 @@ const uint8_t       OPTO_BASE_SESSIONS = 5;    // az első ennyi bekapcsolás á
 const uint16_t      OPTO_MIN_WINDOWS = 250;    // egy bekapcsolás csak ennyi ablak (~10 s) felett számít
 const unsigned long STATS_SAVE_MS    = 3600000UL; // bekapcsolva óránként mentés
 
+// ---- Home Assistant ----
+#define NET_ID   "erosito"                     // MQTT témák és eszközazonosító
+const unsigned long NET_STATE_MS     = 60000;  // állapot küldése ennyi időnként (és minden változáskor)
+
 static_assert(OPTO_MIN_AVG > MAINS_MIN_LOW, "OPTO_MIN_AVG > MAINS_MIN_LOW kell");
 static_assert(MAINS_LOSS_MS >= 20, "MAINS_LOSS_MS >= 20 ms kell (2 felperiodus)");
 static_assert(MAINS_GAP_MS < MAINS_LOSS_MS, "MAINS_GAP_MS < MAINS_LOSS_MS kell");
@@ -114,6 +134,10 @@ volatile bool healthReq = false;    // 'h': állapotfigyelés kiírása
 volatile bool baseReq = false;      // 'B': új opto alapérték (optocsere után)
 volatile bool relayReq = false;     // 'R': relé számláló nullázása (relécsere után)
 volatile bool helpReq = false;      // bármely más karakter: parancslista
+volatile bool remoteOnReq = false;  // Home Assistant: bekapcsolás (mint a gomb)
+volatile bool remoteOffReq = false; // Home Assistant: kikapcsolás
+volatile bool netStateDirty = true; // a Home Assistant felé küldendő állapot változott
+void netEvent(const char *type, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 // Állapotfigyelés: NVS-ben (blob), bekapcsoláskor, kikapcsoláskor és óránként mentve
 const uint32_t STATS_VER = 1;
@@ -394,6 +418,14 @@ int statsWarnings(char *buf, size_t len) {
   return n;
 }
 
+int lastWarnCount = -1;   // új figyelmeztetésnél esemény a Home Assistant felé
+void checkWarnings() {
+  char w[120];
+  int n = statsWarnings(w, sizeof w);
+  if (lastWarnCount >= 0 && n > lastWarnCount) netEvent("warning", "Öregedés:%s", w);
+  lastWarnCount = n;
+}
+
 void printHealth() {
   statsAccount();
   unsigned long h10 = st.onSeconds / 360;   // óra x10
@@ -433,6 +465,7 @@ void setState(bool s, const char *src) {
     ledBase = true;
     mainsCmd();
     slog("RL1 BE (%s), RL2 %lu ms mulva\n", src, RL2_DELAY_MS);
+    netEvent("on", "Bekapcsolás (%s)", src);
     st.onCount++;
     st.relayCount++;
     stAcctT = onTime;
@@ -452,10 +485,12 @@ void setState(bool s, const char *src) {
     ledFlashes = 0;
     mainsCmd();
     slog("RL1+RL2 KI (%s)\n", src);
+    netEvent("off", "Kikapcsolás (%s)", src);
     statsAccount();
     stCounting = false;
     statsFold();
     statsSave();
+    checkWarnings();
   }
 }
 
@@ -529,6 +564,18 @@ void saveFault(int f) {   // csak az ellenőrizhető hardverhibát mentjük (ber
   prefs.end();
 }
 
+const char *faultName(int f) {
+  switch (f) {
+    case F_STUCK:     return "beragadt gomb / zárlat";
+    case F_CHATTER:   return "túl gyakori váltás (zaj, kontakthiba)";
+    case F_PRESSES:   return "3 vagy több rövid gombnyomás";
+    case F_NOMAINS:   return "nincs hálózat az RL1 után";
+    case F_MAINSOFF:  return "hálózat van kikapcsolt relénél (összehegedt érintkező?)";
+    case F_MAINSLOST: return "hálózatkiesés";
+    default:          return "nincs";
+  }
+}
+
 void startFault(int idx, int f) {
   onReqBtn = false;
   onReqTrig = false;
@@ -545,6 +592,8 @@ void startFault(int idx, int f) {
   }
   lastFault = f;
   saveFault(f);
+  if (f == F_MAINSLOST) netEvent("mains_loss", "Hálózatkiesés bekapcsolt állapotban%s", onReqTrig ? ", újrakapcsolás aktív triggerre" : "");
+  else netEvent("fault", "%s: %s", idx == IN_FB1 ? "RL1 kimenet" : inputs[idx].name, faultName(f));
   faultActive = true;
   faultStart = millis();
   ledFaultBlink = true;
@@ -574,6 +623,7 @@ void endFault() {
   ledBase = false;
   ledFlashes = 0;
   faultActive = false;
+  netStateDirty = true;
   resyncInputs();
   if (lastFault == F_MAINSLOST) {   // kiesés: nincs tiltás, csak a minimális kikapcsolt idő
     lastFault = F_NONE;
@@ -655,6 +705,7 @@ void toggleTrigOff() {
     saved = prefs.putBool("trigOff", trigOff) > 0;
     prefs.end();
   }
+  netStateDirty = true;
   ledFlash(trigOff ? 2 : 4);   // tiltva: 2, engedélyezve: 4 villanás
   slogc("TRIGGER %s%s\n", trigOff ? "TILTVA" : "ENGEDELYEZVE", saved ? "" : " (FIGYELEM: NVS mentes sikertelen)");
 }
@@ -703,6 +754,167 @@ void buttonLogic(bool changed) {
   if (burstTaint && shortCount == 0 && btn.stable == HIGH && now - lastShortRel > DOUBLE_GAP_MS) burstTaint = false;   // új sorozat
 }
 
+// ---- Home Assistant: WiFi + MQTT külön taskban; a vezérlés csak nem blokkoló sorba ír ----
+#if NET_ENABLED
+struct NetEvt { char type[12]; char text[100]; };
+QueueHandle_t netQ = nullptr;
+esp_mqtt_client_handle_t mqtt = nullptr;
+volatile bool mqttUp = false;
+volatile bool netNeedDisc = false;
+const char *T_STATE  = NET_ID "/state";
+const char *T_EVENT  = NET_ID "/event";
+const char *T_CMD    = NET_ID "/power/set";
+const char *T_STATUS = NET_ID "/status";
+
+void netEvent(const char *type, const char *fmt, ...) {
+  netStateDirty = true;
+  if (!netQ) return;
+  NetEvt e;
+  strncpy(e.type, type, sizeof e.type - 1);
+  e.type[sizeof e.type - 1] = 0;
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(e.text, sizeof e.text, fmt, ap);
+  va_end(ap);
+  xQueueSend(netQ, &e, 0);   // tele sornál elvész, nem vár
+}
+
+void netPub(const char *topic, const char *payload, bool retain) {
+  if (mqtt && mqttUp) esp_mqtt_client_enqueue(mqtt, topic, payload, 0, 1, retain ? 1 : 0, true);
+}
+
+void mqttHandler(void *, esp_event_base_t, int32_t id, void *data) {
+  esp_mqtt_event_handle_t e = (esp_mqtt_event_handle_t)data;
+  if (id == MQTT_EVENT_CONNECTED) {
+    mqttUp = true;
+    netNeedDisc = true;
+    esp_mqtt_client_subscribe_single(mqtt, T_CMD, 1);
+  } else if (id == MQTT_EVENT_DISCONNECTED) {
+    mqttUp = false;
+  } else if (id == MQTT_EVENT_DATA && !e->retain && e->topic_len == (int)strlen(T_CMD) &&
+             strncmp(e->topic, T_CMD, e->topic_len) == 0) {
+    if (e->data_len == 2 && strncmp(e->data, "ON", 2) == 0) remoteOnReq = true;
+    else if (e->data_len == 3 && strncmp(e->data, "OFF", 3) == 0) remoteOffReq = true;
+  }
+}
+
+// Home Assistant MQTT discovery: egy entitás
+void netDisc(const char *comp, const char *obj, const char *name, const char *extra) {
+  char topic[80], js[512];
+  snprintf(topic, sizeof topic, "homeassistant/%s/" NET_ID "/%s/config", comp, obj);
+  snprintf(js, sizeof js,
+           "{\"name\":%s,\"uniq_id\":\"" NET_ID "_%s\",\"stat_t\":\"" NET_ID "/state\","
+           "\"val_tpl\":\"{{value_json.%s}}\",\"avty_t\":\"" NET_ID "/status\"%s,"
+           "\"dev\":{\"ids\":[\"" NET_ID "\"],\"name\":\"Erősítő\",\"mf\":\"DIY\",\"mdl\":\"XIAO ESP32-C3 bekapcsoló\"}}",
+           name, obj, obj, extra);
+  netPub(topic, js, true);
+}
+
+void netDiscovery() {
+  netDisc("switch", "power", "null", ",\"cmd_t\":\"" NET_ID "/power/set\",\"ic\":\"mdi:amplifier\"");
+  netDisc("binary_sensor", "rl2", "\"NTC áthidalva (RL2)\"", ",\"ent_cat\":\"diagnostic\"");
+  netDisc("binary_sensor", "trigger", "\"Trigger\"", "");
+  netDisc("binary_sensor", "problem", "\"Probléma\"", ",\"dev_cla\":\"problem\"");
+  netDisc("sensor", "fault", "\"Hiba\"", "");
+  netDisc("sensor", "warning", "\"Figyelmeztetés\"", "");
+  netDisc("sensor", "on_hours", "\"Üzemidő\"", ",\"unit_of_meas\":\"h\",\"dev_cla\":\"duration\",\"stat_cla\":\"total_increasing\"");
+  netDisc("sensor", "on_count", "\"Bekapcsolások\"", ",\"stat_cla\":\"total_increasing\"");
+  netDisc("sensor", "relay_count", "\"Relé kapcsolások\"", ",\"stat_cla\":\"total\",\"ent_cat\":\"diagnostic\"");
+  netDisc("sensor", "mains_loss", "\"Hálózatkiesések\"", ",\"stat_cla\":\"total_increasing\"");
+  netDisc("sensor", "faults", "\"Hibák\"", ",\"stat_cla\":\"total_increasing\"");
+  netDisc("sensor", "power_ups", "\"Áramszünet utáni indulások\"", ",\"stat_cla\":\"total_increasing\",\"ent_cat\":\"diagnostic\"");
+  netDisc("sensor", "opto_now", "\"Optó minta\"", ",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\"");
+  netDisc("sensor", "opto_avg", "\"Optó átlag\"", ",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\"");
+  netDisc("sensor", "opto_base", "\"Optó alapérték\"", ",\"ent_cat\":\"diagnostic\"");
+  netDisc("sensor", "rssi", "\"WiFi jel\"", ",\"unit_of_meas\":\"dBm\",\"dev_cla\":\"signal_strength\",\"ent_cat\":\"diagnostic\"");
+}
+
+void netState() {
+  char w[120], js[640];
+  statsWarnings(w, sizeof w);
+  unsigned long h10 = st.onSeconds / 360;
+  unsigned a = (unsigned)(st.optoAvg * 10 + 0.5f), b = (unsigned)(st.optoBase * 10 + 0.5f);
+  bool flt = faultActive || lockoutPending;
+  snprintf(js, sizeof js,
+           "{\"power\":\"%s\",\"rl2\":\"%s\",\"trigger\":\"%s\",\"trig_enabled\":%s,\"hold\":%s,"
+           "\"fault\":\"%s\",\"warning\":\"%s\",\"problem\":\"%s\",\"on_hours\":%lu.%lu,\"on_count\":%lu,"
+           "\"relay_count\":%lu,\"mains_loss\":%lu,\"faults\":%lu,\"power_ups\":%lu,\"opto_now\":%u,"
+           "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d}",
+           on ? "ON" : "OFF", rl2On ? "ON" : "OFF", trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
+           powerHold ? "true" : "false", flt ? faultName(lastFault) : "nincs", w[0] ? w + 1 : "nincs",
+           (flt || w[0]) ? "ON" : "OFF", h10 / 10, h10 % 10, (unsigned long)st.onCount, (unsigned long)st.relayCount,
+           (unsigned long)st.mainsLoss, (unsigned long)st.faults, (unsigned long)st.powerUps, (unsigned)fbCount,
+           a / 10, a % 10, b / 10, b % 10, (int)WiFi.RSSI());
+  netPub(T_STATE, js, true);
+}
+
+void netTask(void *) {
+  WiFi.persistent(false);   // ne írja minden induláskor a flash-be
+  WiFi.setHostname(NET_ID);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);   // kisebb áramcsúcs; a XIAO C3-on így stabilabb is
+  bool started = false;
+  unsigned long lastState = 0;
+  for (;;) {
+    if (!started && WiFi.status() == WL_CONNECTED) {
+      esp_mqtt_client_config_t cfg = {};
+      cfg.broker.address.uri = MQTT_URI;
+      cfg.credentials.username = MQTT_USER;
+      cfg.credentials.authentication.password = MQTT_PASS;
+      cfg.credentials.client_id = NET_ID;
+      cfg.session.last_will.topic = T_STATUS;
+      cfg.session.last_will.msg = "offline";
+      cfg.session.last_will.qos = 1;
+      cfg.session.last_will.retain = 1;
+      cfg.session.keepalive = 30;
+      cfg.network.reconnect_timeout_ms = 10000;
+      mqtt = esp_mqtt_client_init(&cfg);
+      if (mqtt) {
+        esp_mqtt_client_register_event(mqtt, MQTT_EVENT_ANY, mqttHandler, nullptr);
+        esp_mqtt_client_start(mqtt);
+        started = true;
+      }
+    }
+    if (mqttUp) {
+      if (netNeedDisc) {
+        netNeedDisc = false;
+        netPub(T_STATUS, "online", true);
+        netDiscovery();
+        netStateDirty = true;
+      }
+      NetEvt e;
+      while (xQueueReceive(netQ, &e, 0) == pdTRUE) {
+        char js[160];
+        snprintf(js, sizeof js, "{\"type\":\"%s\",\"text\":\"%s\"}", e.type, e.text);
+        netPub(T_EVENT, js, false);
+      }
+      if (netStateDirty || millis() - lastState >= NET_STATE_MS) {
+        netStateDirty = false;
+        lastState = millis();
+        netState();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void netStart() {
+  netQ = xQueueCreate(16, sizeof(NetEvt));
+  if (netQ) xTaskCreate(netTask, "net", 6144, nullptr, 1, nullptr);
+}
+
+void netStatusLine() {
+  slogc("  Home Assistant: WiFi %s (%d dBm), MQTT %s\n", WiFi.status() == WL_CONNECTED ? "OK" : "nincs",
+        (int)WiFi.RSSI(), mqttUp ? "OK" : "nincs");
+}
+#else
+void netEvent(const char *, const char *, ...) {}
+void netStart() {}
+void netStatusLine() {}
+#endif
+
 void printHelp() {
   slogc("Parancsok: s = allapot, h = allapotfigyeles, B = opto alapertek torles (optocsere), R = rele szamlalo nullazas (relecsere)\n");
 }
@@ -726,6 +938,7 @@ void printStatus() {
           fbBad ? " (ELTERES)" : "", (unsigned)fbCount, (unsigned)MAINS_MIN_LOW);
   char w[120];
   if (statsWarnings(w, sizeof w)) slogc("  FIGYELMEZTETES:%s ('h' = reszletek)\n", w);
+  netStatusLine();
 }
 
 const char *resetName(esp_reset_reason_t r) {
@@ -814,6 +1027,10 @@ void setup() {
   if (powerHold) slogc("Aramszunet utan: %lu s varakozas\n", holdMs / 1000);
   if (powerLoss) { st.powerUps++; stDirty = true; statsSave(); }
   printHelp();
+  netStart();
+  netEvent("boot", "Indulás: %s%s", resetName(rr), powerHold ? ", áramszünet utáni várakozás" : "");
+  checkWarnings();
+  if (lastWarnCount > 0) netEvent("warning", "Öregedési figyelmeztetés induláskor");
   {
     char w[120];
     if (statsWarnings(w, sizeof w)) slogc("FIGYELMEZTETES:%s ('h' = reszletek)\n", w);
@@ -849,6 +1066,7 @@ void loop() {
       slogc("!!! HALOZATKIESES hiba alatt: relek AZONNAL KI\n");
     }
     if (btnChanged) lastShortRel = now;
+    remoteOnReq = remoteOffReq = false;   // hiba alatt a távoli parancs elvész
     if (now - faultStart >= FAULT_BLINK_MS) endFault();
   } else if (powerHold) {   // áramszünet utáni várakozás: trigger hatástalan, a gomb egyszer bekapcsolhat
     if (timeLeft(holdStart, holdDur) > 0) {
@@ -870,12 +1088,25 @@ void loop() {
           if (on || onReqBtn) slogc("Gomb a varakozas alatt elfogadva: tovabbi gombnyomas a varakozas vegeig hatastalan\n");
         }
       }
+      if (remoteOnReq) {   // távoli bekapcsolás: mint a gomb, a várakozás alatt is egyszer
+        remoteOnReq = false;
+        if (!faultActive && !on && !holdBtnUsed) {
+          holdBtnUsed = true;
+          switchOn("tavoli aramszunet utan", true);
+        }
+      }
+      if (remoteOffReq) {   // távoli kikapcsolás mindig engedett
+        remoteOffReq = false;
+        onReqBtn = false;
+        requestOff("tavoli", true);
+      }
       if (!faultActive && !on && onReqBtn && minOffLeft() == 0) {
         onReqBtn = false;
         switchOn("gomb aramszunet utan", true);
       }
     } else {
       powerHold = false;
+      netStateDirty = true;
       holdClear();
       resyncInputs();
       slogc("Aramszunet utani varakozas vege\n");
@@ -895,6 +1126,16 @@ void loop() {
       }
     }
     if (!faultActive) buttonLogic(btnChanged);
+    if (remoteOnReq) {   // távoli bekapcsolás: mint a gomb
+      remoteOnReq = false;
+      if (!faultActive && !on && !btnBusy()) switchOn("tavoli", true);
+    }
+    if (remoteOffReq) {   // távoli kikapcsolás: a függő bekapcsolást is törli
+      remoteOffReq = false;
+      if (on) requestOff("tavoli", true);
+      else if (onReqBtn || onReqTrig) { onReqBtn = onReqTrig = false; slog("Fuggo bekapcsolas torolve (tavoli)\n"); }
+    }
+    if (trigChanged) netStateDirty = true;
     if (!faultActive && trigChanged && !trigOff) {   // trigger: aktív élre be, inaktív élre ki
       if (trig.stable == LOW) {
         if (offPending && !offByBtn) {
@@ -917,6 +1158,7 @@ void loop() {
     }
     if (!faultActive && lockoutPending && lockoutLeft() == 0) {   // tiltás vége
       lockoutPending = false;
+      netStateDirty = true;
       bool offMains = MAINS_CHECK && fbValid && fbPresent;
       if (btn.stable == LOW || btn.raw == LOW) {
         slog("Tiltas vege: a gomb meg nyomva\n");
@@ -942,6 +1184,7 @@ void loop() {
     rl2Settled = false;
     st.rl2Count++;
     stDirty = true;
+    netStateDirty = true;
     slog("RL2 BE\n");
   }
   if (offPending && rl2Settled && !faultActive) setState(false, "fuggo kikapcsolas");
@@ -982,6 +1225,7 @@ void loop() {
     statsFold();
     statsSave();
     stLastSave = now;
+    checkWarnings();
   }
   logWindow();
   delay(1);

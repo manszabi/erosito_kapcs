@@ -100,12 +100,31 @@ A program az NVS-be menti (bekapcsoláskor, kikapcsoláskor és bekapcsolva ór�
 
 A soros kiírás külön taskban, nem blokkoló sorral működik: ha nincs csatlakoztatva gép, vagy a kimenet beragad, az üzenetek elvesznek, de a vezérlés nem áll meg, és nem okoz újraindulást.
 
+## Home Assistant (WiFi + MQTT, AI-elemzés)
+
+Ki- és bekapcsolható a program elején: `#define HOME_ASSISTANT true` / `false`. `false` esetén a WiFi- és MQTT-kód be sem fordul.
+
+- **Beállítás:** másold le a `secrets.example.h`-t `secrets.h` néven a sketch mappájába, és töltsd ki (WiFi, MQTT bróker címe, felhasználó, jelszó). A `secrets.h` nem kerül a gitbe; ha hiányzik, a program Home Assistant nélkül fordul.
+- **Automatikus felismerés:** az eszköz „Erősítő” néven jelenik meg a Home Assistantben: kapcsoló, trigger, probléma, üzemidő, számlálók, optó-értékek, WiFi jel.
+- **Események** az `erosito/event` témán: indulás, be, ki, hálózatkiesés, hiba, öregedési figyelmeztetés.
+- **Távoli parancs** (`erosito/power/set`, `ON` / `OFF`):
+  - `ON` úgy működik, mint a hosszú gombnyomás: minimális kikapcsolt idő, hibatiltás; a 2 perces várakozás alatt egyszer (a gombbal közösen).
+  - `OFF` mindig kikapcsol (az RL2 2 s-os minimumával), és törli a függő bekapcsolást.
+- **Hangvezérlés:** a Beállítások > Hangasszisztensek > Entitások megosztása menüben oszd meg a `switch.erosito` kapcsolót; utána: „Kapcsold be az erősítőt”.
+- **AI-elemzés:** a `homeassistant/erosito.yaml` csomag eseménynaplót vezet, és az Anthropic (Claude) integrációval
+  - minden vasárnap 18:00-kor heti összefoglalót,
+  - hiba, hálózatkiesés vagy figyelmeztetés után rövid elemzést küld értesítésként (legfeljebb 10 percenként egyet).
+
+  Az API-kulcs csak a Home Assistantben van. A csomagban az `agent_id` értékét a saját Claude-ügynököd azonosítójára kell írni; ennek az ügynöknek ne adj Home Assistant-vezérlési jogot.
+- **Biztonság:** a WiFi és az MQTT külön taskban fut, a vezérlés nem vár rájuk; hálózat vagy szerver nélkül az erősítő ugyanúgy működik.
+- **Táp:** a WiFi adáskor ~300 mA-es áramcsúcsokat okoz. A segédtáp legalább 500 mA-es legyen, a 3,3 V-ra kerüljön 220–470 µF kondenzátor, különben az ESP újraindulhat (és áramszünetnek veszi). Az adóteljesítmény csökkentve van (8,5 dBm).
+
 ## Hosszú üzem
 
 A program hónapokig, évekig megszakítás nélkül futhat:
 
 - minden időzítés kezdőidő + időtartam alapú, így a `millis()` 49,7 naponkénti túlcsordulása nem okoz hibát;
-- futás közben nincs dinamikus memóriafoglalás, így a memória nem töredezik;
+- a vezérlés futás közben nem foglal dinamikus memóriát (a WiFi- és MQTT-könyvtár a saját taskjában igen, a vezérléstől függetlenül);
 - az NVS-be csak eseménykor és bekapcsolva óránként ír, ami a flash élettartamához képest elhanyagolható.
 
 ## Fordítás
