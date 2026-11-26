@@ -19,7 +19,8 @@ template:
         state: "{{ trigger.payload_json.type }}"
         attributes:
           esemenyek: >-
-            {% set uj = {'ido': now().strftime('%Y-%m-%d %H:%M'), 'tipus': trigger.payload_json.type, 'leiras': trigger.payload_json.text} %}
+            {% set ido = now() - timedelta(seconds=trigger.payload_json.ago_s | default(0) | int) %}
+            {% set uj = {'ido': ido.strftime('%Y-%m-%d %H:%M'), 'tipus': trigger.payload_json.type, 'leiras': trigger.payload_json.text} %}
             {{ ((this.attributes.esemenyek | default([])) + [uj])[-50:] }}
   # Az ESP legutóbbi teljes állapota (számlálók, optó, figyelmeztetés)
   - triggers:
@@ -86,7 +87,9 @@ automation:
         topic: erosito/event
     conditions:
       - condition: template
-        value_template: "{{ trigger.payload_json.type in ['fault', 'mains_loss', 'warning'] }}"
+        value_template: >-
+          {{ trigger.payload_json.type in ['fault', 'mains_loss', 'warning']
+             and (trigger.payload_json.ago_s | default(0) | int) < 600 }}
     actions:
       - delay: "00:01:00"   # a gyorsan egymás után jövő események összegyűlnek
       - variables:

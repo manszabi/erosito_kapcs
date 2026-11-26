@@ -13,6 +13,7 @@
 #include <esp_task_wdt.h>
 #include <esp_system.h>
 #include <esp_attr.h>
+#include <esp_timer.h>
 
 // ======================================================================= Platform
 #if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
@@ -35,6 +36,7 @@
 #warning "Nem XIAO alaplap van kivalasztva: ellenorizd, hogy a D-labak a XIAO kiosztas szerintiek-e"
 #endif
 const BaseType_t AUX_CORE = 0;   // napló és hálózat: C3-on az egyetlen mag, S3-on a vezérléstől (1. mag) külön
+const UBaseType_t AUX_PRIO = 0;  // a vezérlés (1) alatt: C3-on a hálózat sem tudja kiéheztetni a vezérlést
 
 #if HOME_ASSISTANT
 #if !__has_include(<mqtt_client.h>)
@@ -116,6 +118,10 @@ const unsigned long NET_STATE_MS     = 60000;    // MQTT állapot küldése enny
 const unsigned long STA_TIMEOUT_MS   = 30000;    // ennyi sikertelen csatlakozás után AP mód
 const unsigned long STA_RETRY_MS     = 30000;    // AP mód alatt ennyi időnként újrapróbálja a routert
 const unsigned long AP_LINGER_MS     = 60000;    // csatlakozás után az AP ennyi idő múlva leáll (ha nincs rajta kliens)
+const unsigned long STA_RETRY_BUSY_MS = 300000;  // AP-n lévő kliens mellett ritkábban próbálja a routert (pl. megjegyzett AP a telefonon)
+const unsigned long MQTT_RETRY_MS    = 10000;    // sikertelen MQTT-kliens indítás után ennyi múlva újra
+const unsigned long EVENT_MAX_AGE_S  = 600;      // a Home Assistant csomag ennél régebbi eseményt nem elemez
+const uint32_t      HEAP_WARN_BYTES  = 20000;    // figyelmeztetés, ha a legkisebb szabad memória ez alá esett
 
 static_assert(OPTO_MIN_AVG > MAINS_MIN_LOW, "OPTO_MIN_AVG > MAINS_MIN_LOW kell");
 static_assert(MAINS_LOSS_MS >= 20, "MAINS_LOSS_MS >= 20 ms kell (2 felperiodus)");
@@ -243,6 +249,8 @@ unsigned long timeLeft(unsigned long start, unsigned long dur) {   // túlcsordu
   unsigned long el = millis() - start;
   return (el >= dur) ? 0 : (dur - el);
 }
+unsigned long uptimeHours() { return (unsigned long)(esp_timer_get_time() / 3600000000LL); }   // 64 bites óra: nem csordul túl
+
 unsigned long minOffLeft() { return (on || !minOffActive) ? 0 : timeLeft(offTime, MIN_OFF_MS); }
 unsigned long lockoutLeft() { return lockoutPending ? timeLeft(lockoutStart, lockoutDur) : 0; }
 
@@ -495,6 +503,11 @@ int statsWarnings(char *buf, size_t len) {   // figyelmeztetések szövege (üre
       snprintf(buf + strlen(buf), len - strlen(buf), " opto oregszik (%u%%-kal az alapertek alatt);",
                (unsigned)(100 - st.optoAvg * 100 / st.optoBase + 0.5f));
     }
+  }
+  if (esp_get_minimum_free_heap_size() < HEAP_WARN_BYTES) {   // hónapokig tartó futásnál: memóriafogyás jele
+    n++;
+    snprintf(buf + strlen(buf), len - strlen(buf), " keves szabad memoria (min. %lu bajt);",
+             (unsigned long)esp_get_minimum_free_heap_size());
   }
   return n;
 }
@@ -848,11 +861,12 @@ void holdButton(unsigned long now, bool changed) {   // áramszünet utáni vár
 #ifndef AP_PASS
 #define AP_PASS "erosito123"   // AP jelszó és a weboldal alapjelszava (legalább 8 karakter)
 #endif
+static_assert(sizeof(AP_PASS) - 1 >= 8 && sizeof(AP_PASS) - 1 <= 32, "AP_PASS: 8-32 karakter kell (WPA2)");
 
 struct NetCfg { char ssid[33], pass[65], mqttUri[96], mqttUser[33], mqttPass[65], webPass[33]; };
 NetCfg ncfg;
 Preferences netPrefs;           // külön példány: a hálózati task használja
-struct NetEvt { char type[12]; char text[100]; };
+struct NetEvt { char type[12]; char text[100]; int64_t t; };   // t: 64 bites óra (µs)
 QueueHandle_t netQ = nullptr;
 WebServer web(80);
 DNSServer dns;
@@ -860,7 +874,8 @@ esp_mqtt_client_handle_t mqtt = nullptr;
 volatile bool mqttUp = false;
 volatile bool netNeedDisc = false;
 bool netStarted = false, apOn = false, netReconfig = false;
-unsigned long netLastState = 0, staLastOk = 0, staLastBegin = 0, apIdleSince = 0;
+unsigned long netLastState = 0, staLastOk = 0, staLastBegin = 0, apIdleSince = 0, mqttLastTry = 0, apLastTry = 0;
+bool mqttTried = false, apTried = false;
 char apSsid[24];
 const char *T_STATE   = NET_ID "/state";
 const char *T_EVENT   = NET_ID "/event";
@@ -891,11 +906,11 @@ void netCfgLoad() {
 bool netCfgSave() {
   if (!netPrefs.begin("net", false)) return false;
   bool ok = netPrefs.putString("ssid", ncfg.ssid) == strlen(ncfg.ssid);
-  netPrefs.putString("pass", ncfg.pass);
-  netPrefs.putString("mqttUri", ncfg.mqttUri);
-  netPrefs.putString("mqttUser", ncfg.mqttUser);
-  netPrefs.putString("mqttPass", ncfg.mqttPass);
-  netPrefs.putString("webPass", ncfg.webPass);
+  ok &= netPrefs.putString("pass", ncfg.pass) == strlen(ncfg.pass);
+  ok &= netPrefs.putString("mqttUri", ncfg.mqttUri) == strlen(ncfg.mqttUri);
+  ok &= netPrefs.putString("mqttUser", ncfg.mqttUser) == strlen(ncfg.mqttUser);
+  ok &= netPrefs.putString("mqttPass", ncfg.mqttPass) == strlen(ncfg.mqttPass);
+  ok &= netPrefs.putString("webPass", ncfg.webPass) == strlen(ncfg.webPass);
   netPrefs.end();
   return ok;
 }
@@ -914,6 +929,7 @@ void netEvent(const char *type, const char *fmt, ...) {
   va_start(ap, fmt);
   vsnprintf(e.text, sizeof e.text, fmt, ap);
   va_end(ap);
+  e.t = esp_timer_get_time();
   xQueueSend(netQ, &e, 0);   // tele sornál elvész, nem vár
 }
 
@@ -937,12 +953,13 @@ void buildState(char *js, size_t len, bool forWeb) {
            "{\"power\":\"%s\",\"rl2\":\"%s\",\"trigger\":\"%s\",\"trig_enabled\":%s,\"trig_en\":\"%s\",\"hold\":%s,"
            "\"fault\":\"%s\",\"warning\":\"%s\",\"problem\":\"%s\",\"on_hours\":%lu.%lu,\"on_count\":%lu,"
            "\"relay_count\":%lu,\"mains_loss\":%lu,\"faults\":%lu,\"power_ups\":%lu,\"opto_now\":%u,"
-           "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d",
+           "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d,\"heap_free\":%lu,\"heap_min\":%lu",
            on ? "ON" : "OFF", rl2On ? "ON" : "OFF", trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
            trigOff ? "OFF" : "ON", powerHold ? "true" : "false", flt ? faultName(lastFault) : "nincs", w[0] ? w + 1 : "nincs",
            (flt || w[0]) ? "ON" : "OFF", h10 / 10, h10 % 10, (unsigned long)st.onCount, (unsigned long)st.relayCount,
            (unsigned long)st.mainsLoss, (unsigned long)st.faults, (unsigned long)st.powerUps, (unsigned)fbCount,
-           a / 10, a % 10, b / 10, b % 10, (int)WiFi.RSSI());
+           a / 10, a % 10, b / 10, b % 10, (int)WiFi.RSSI(), (unsigned long)esp_get_free_heap_size(),
+           (unsigned long)esp_get_minimum_free_heap_size());
   if (n < 0 || (size_t)n >= len) { strlcpy(js, "{}", len); return; }
   if (forWeb) {
     char ss[70], mu[200], mus[70];
@@ -956,7 +973,7 @@ void buildState(char *js, size_t len, bool forWeb) {
                   sta ? (apOn ? "csatlakozva + AP" : "csatlakozva") : (apOn ? "AP mód" : "nincs"),
                   sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"),
                   !ncfg.mqttUri[0] ? "nincs beállítva" : (mqttUp ? "OK" : "nincs kapcsolat"),
-                  millis() / 3600000UL, ss, mu, mus);
+                  uptimeHours(), ss, mu, mus);
     if (n < 0 || (size_t)n >= len - 1) { strlcpy(js, "{}", len); return; }
   }
   strlcat(js, "}", len);
@@ -1024,6 +1041,7 @@ void netDiscovery() {
   netDisc("sensor", "opto_avg", "\"Optó átlag\"", ",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\"");
   netDisc("sensor", "opto_base", "\"Optó alapérték\"", ",\"ent_cat\":\"diagnostic\"");
   netDisc("sensor", "rssi", "\"WiFi jel\"", ",\"unit_of_meas\":\"dBm\",\"dev_cla\":\"signal_strength\",\"ent_cat\":\"diagnostic\"");
+  netDisc("sensor", "heap_min", "\"Legkisebb szabad memória\"", ",\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\"");
 }
 
 void mqttStart() {
@@ -1057,6 +1075,7 @@ void mqttStop() {
 }
 
 void mqttService() {   // discovery, események, állapot
+  if (!ncfg.mqttUri[0]) { xQueueReset(netQ); return; }   // nincs MQTT: az események nem gyűlnek
   if (!mqttUp) return;
   if (netNeedDisc) {
     netNeedDisc = false;
@@ -1068,7 +1087,7 @@ void mqttService() {   // discovery, események, állapot
   while (xQueueReceive(netQ, &e, 0) == pdTRUE) {
     char tx[200], js[260];
     jsonEsc(tx, sizeof tx, e.text);
-    snprintf(js, sizeof js, "{\"type\":\"%s\",\"text\":\"%s\"}", e.type, tx);
+    snprintf(js, sizeof js, "{\"type\":\"%s\",\"text\":\"%s\",\"ago_s\":%lu}", e.type, tx, (unsigned long)((esp_timer_get_time() - e.t) / 1000000LL));
     netPub(T_EVENT, js, false);
   }
   if (netStateDirty || millis() - netLastState >= NET_STATE_MS) {
@@ -1089,8 +1108,13 @@ void staBegin() {
 }
 
 void apStart() {
+  apTried = true;
+  apLastTry = millis();
   WiFi.mode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
-  WiFi.softAP(apSsid, AP_PASS);
+  if (!WiFi.softAP(apSsid, AP_PASS)) {   // később újrapróbálja
+    slogc("AP inditas sikertelen, ujraprobalas %lu s mulva\n", STA_RETRY_MS / 1000);
+    return;
+  }
   WiFi.setTxPower(WIFI_TX_POWER);
   dns.start(53, "*", WiFi.softAPIP());   // captive portal: minden név a weboldalra mutat
   apOn = true;
@@ -1111,12 +1135,13 @@ void wifiService() {
   unsigned long now = millis();
   bool sta = WiFi.status() == WL_CONNECTED;
   if (sta) staLastOk = now;
-  if (!apOn && !sta && (!ncfg.ssid[0] || now - staLastOk >= STA_TIMEOUT_MS)) apStart();
+  if (!apOn && !sta && (!ncfg.ssid[0] || now - staLastOk >= STA_TIMEOUT_MS) && (!apTried || now - apLastTry >= STA_RETRY_MS))
+    apStart();
   if (apOn) {
     bool clients = WiFi.softAPgetStationNum() > 0;
     if (clients || !sta) apIdleSince = now;
     if (sta && now - apIdleSince >= AP_LINGER_MS) apStop();
-    else if (!sta && !clients && ncfg.ssid[0] && now - staLastBegin >= STA_RETRY_MS) {   // kliens nélkül újrapróbálja a routert
+    else if (!sta && ncfg.ssid[0] && now - staLastBegin >= (clients ? STA_RETRY_BUSY_MS : STA_RETRY_MS)) {   // a routert újrapróbálja
       WiFi.disconnect();
       staBegin();
     }
@@ -1152,7 +1177,7 @@ let tr=false,cf=false;const $=i=>document.getElementById(i);
 const L={power:'Erősítő',rl2:'NTC áthidalva (RL2)',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
 fault:'Hiba',warning:'Figyelmeztetés',on_hours:'Üzemidő (óra)',on_count:'Bekapcsolások',relay_count:'Relé kapcsolások',
 mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',
-rssi:'WiFi jel (dBm)',mqtt:'MQTT',uptime_h:'Futásidő (óra)',board:'Alaplap'};
+rssi:'WiFi jel (dBm)',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',board:'Alaplap'};
 const V=x=>x===true?'igen':x===false?'nem':x==='ON'?'BE':x==='OFF'?'KI':x;
 async function upd(){try{const s=await(await fetch('/api/status')).json();tr=s.trig_enabled;let h='';
 for(const k in L)if(k in s)h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
@@ -1238,12 +1263,17 @@ void netService() {
   if (netReconfig) {   // új beállítások: MQTT és WiFi újraindítása (a relék nem érintettek)
     netReconfig = false;
     mqttStop();
+    mqttTried = false;
     WiFi.disconnect();
     staLastOk = millis();   // új időkeret a csatlakozásra
     if (apOn) WiFi.mode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
     staBegin();
   }
-  if (!netStarted && ncfg.mqttUri[0] && WiFi.status() == WL_CONNECTED) mqttStart();
+  if (!netStarted && ncfg.mqttUri[0] && WiFi.status() == WL_CONNECTED && (!mqttTried || millis() - mqttLastTry >= MQTT_RETRY_MS)) {
+    mqttTried = true;
+    mqttLastTry = millis();
+    mqttStart();
+  }
   mqttService();
 }
 
@@ -1278,7 +1308,7 @@ void netTask(void *) {
 
 void netStart() {
   netQ = xQueueCreate(16, sizeof(NetEvt));
-  if (netQ) xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, nullptr, AUX_CORE);
+  if (netQ) xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, AUX_PRIO, nullptr, AUX_CORE);
 }
 
 void netStatusLine() {
@@ -1328,6 +1358,8 @@ void printHealth() {
         (unsigned long)((uint64_t)st.relayCount * 100 / RELAY_LIFE));
   slogc("  Halozatkieses: %lu, hiba: %lu, aramszunet utani indulas: %lu\n", (unsigned long)st.mainsLoss,
         (unsigned long)st.faults, (unsigned long)st.powerUps);
+  slogc("  Futasido: %lu ora, szabad memoria: %lu bajt (legkisebb: %lu)\n", uptimeHours(),
+        (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
   if (MAINS_CHECK) {
     unsigned a = (unsigned)(st.optoAvg * 10 + 0.5f), b = (unsigned)(st.optoBase * 10 + 0.5f),
              l = (unsigned)(lastSessMean * 10 + 0.5f);
@@ -1450,7 +1482,7 @@ void setup() {
   initOutputs();
   Serial.begin(115200);
   logQ = xQueueCreate(24, sizeof(LogMsg));   // tele sornál az üzenet elvész, a vezérlés nem áll meg
-  if (logQ) xTaskCreatePinnedToCore(logTask, "slog", 4096, nullptr, 1, nullptr, AUX_CORE);
+  if (logQ) xTaskCreatePinnedToCore(logTask, "slog", 4096, nullptr, AUX_PRIO, nullptr, AUX_CORE);
   bool nvsOk = loadSettings();
   initInputs();
   initWatchdog();
