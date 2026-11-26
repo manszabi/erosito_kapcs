@@ -30,7 +30,7 @@ const int PIN_FB1  = 6;   // D4:  RL1 kimenet opto (CNY17-3 + DB106 + 3x43k), LO
 const unsigned long RL2_DELAY_MS     = 1000;   // RL1 után ennyivel húz be az RL2 (NTC lágyindítás)
 const unsigned long RL2_MIN_ON_MS    = 2000;   // kikapcsolás előtt az RL2 legalább ennyit legyen behúzva
 const unsigned long MIN_OFF_MS       = 5000;   // minimális kikapcsolt idő (a boottól is számít)
-const unsigned long POWERUP_HOLD_MS  = 120000UL; // áramszünet után ennyi ideig nincs gomb / trigger
+const unsigned long POWERUP_HOLD_MS  = 120000UL; // áramszünet után ennyi ideig nincs trigger (a gomb egyszer bekapcsolhat)
 const bool          TRIGGER_ON_BOOT  = true;   // induláskor aktív triggerre bekapcsol
 const bool          BROWNOUT_IS_POWERLOSS = true; // brownout reset = áramszünet (különben fagyás)
 
@@ -79,6 +79,7 @@ unsigned long onTime = 0;
 unsigned long rl2Time = 0;
 unsigned long offTime = 0;      // utolsó kikapcsolás (0 = boot)
 bool powerHold = false;         // áramszünet utáni várakozás
+bool holdBtnUsed = false;       // a várakozás alatt egy hosszú gombnyomás bekapcsolhat (csak egyszer)
 unsigned long powerHoldUntil = 0;
 bool trigOff = false;           // trigger tiltva (NVS)
 bool faultActive = false;       // hibavillogás
@@ -226,7 +227,7 @@ void ledUpdate() {
       if (ledFlashes > 0) { ledFlashOn = true; ledT = now; }
     }
     level = (ledFlashes > 0) ? ledFlashOn : ledBase;
-  } else if (powerHold) {
+  } else if (powerHold && !on) {
     level = (now % HOLD_FLASH_PERIOD_MS) < HOLD_FLASH_MS;
   }
   digitalWrite(PIN_LED, level ? HIGH : LOW);
@@ -499,7 +500,7 @@ void toggleTrigOff() {
     saved = prefs.putBool("trigOff", trigOff) > 0;
     prefs.end();
   }
-  ledFlash(trigOff ? 2 : 3);
+  ledFlash(trigOff ? 2 : 4);   // tiltva: 2, engedélyezve: 4 villanás
   slogc("TRIGGER %s%s\n", trigOff ? "TILTVA" : "ENGEDELYEZVE", saved ? "" : " (FIGYELEM: NVS mentes sikertelen)");
 }
 
@@ -667,11 +668,36 @@ void loop() {
   bool trigChanged = updateInput(IN_TRIG);
   mainsUpdate();
 
-  if (powerHold) {   // áramszünet utáni várakozás: gomb és trigger hatástalan
+  if (faultActive) {   // hibavillogás
+    if (mainsLost()) {   // bemenet-hiba alatt (relék még BE) is azonnal KI
+      setState(false, "halozatkieses hiba alatt");
+      slogc("!!! HALOZATKIESES hiba alatt: relek AZONNAL KI\n");
+    }
+    if (btnChanged) lastShortRel = now;
+    if (now - faultStart >= FAULT_BLINK_MS) endFault();
+  } else if (powerHold) {   // áramszünet utáni várakozás: trigger hatástalan, a gomb egyszer bekapcsolhat
     if ((long)(now - powerHoldUntil) < 0) {
       if (now - lastHoldSave >= 1000) {
         lastHoldSave = now;
         holdSave(powerHoldUntil - now);
+      }
+      int mf = mainsFault();
+      if (on && mf != F_NONE) startFault(IN_FB1, mf);
+      if (!faultActive && !holdBtnUsed) {
+        if (btnChanged && btn.stable == LOW) {
+          pressStart = btn.t;
+          pressConsumed = false;
+        }
+        if (btn.stable == LOW && !pressConsumed && (now - pressStart) >= LONG_PRESS_MS) {
+          pressConsumed = true;
+          holdBtnUsed = true;
+          switchOn("gomb aramszunet utan", true);
+          if (on || onReqBtn) slogc("Gomb a varakozas alatt elfogadva: tovabbi gombnyomas a varakozas vegeig hatastalan\n");
+        }
+      }
+      if (!faultActive && !on && onReqBtn && minOffLeft() == 0) {
+        onReqBtn = false;
+        switchOn("gomb aramszunet utan", true);
       }
     } else {
       powerHold = false;
@@ -681,13 +707,6 @@ void loop() {
       if (!lockoutPending && TRIGGER_ON_BOOT && !trigOff && trig.stable == LOW)
         switchOn("aktiv trigger aramszunet utan", false);
     }
-  } else if (faultActive) {   // hibavillogás
-    if (mainsLost()) {   // bemenet-hiba alatt (relék még BE) is azonnal KI
-      setState(false, "halozatkieses hiba alatt");
-      slogc("!!! HALOZATKIESES hiba alatt: relek AZONNAL KI\n");
-    }
-    if (btnChanged) lastShortRel = now;
-    if (now - faultStart >= FAULT_BLINK_MS) endFault();
   } else {
     int mf = mainsFault();
     if (mf != F_NONE && (on || !faultHold)) startFault(IN_FB1, mf);
