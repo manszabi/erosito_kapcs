@@ -110,6 +110,7 @@ volatile bool statusReq = false;
 volatile bool healthReq = false;    // 'h': állapotfigyelés kiírása
 volatile bool baseReq = false;      // 'B': új opto alapérték (optocsere után)
 volatile bool relayReq = false;     // 'R': relé számláló nullázása (relécsere után)
+volatile bool helpReq = false;      // bármely más karakter: parancslista
 
 // Állapotfigyelés: NVS-ben (blob), bekapcsoláskor, kikapcsoláskor és óránként mentve
 const uint32_t STATS_VER = 1;
@@ -245,6 +246,7 @@ void logTask(void *) {
       else if (c == 'h' || c == 'H') healthReq = true;
       else if (c == 'B') baseReq = true;
       else if (c == 'R') relayReq = true;
+      else if (c > ' ') helpReq = true;
     }
   }
 }
@@ -686,6 +688,10 @@ void buttonLogic(bool changed) {
   }
 }
 
+void printHelp() {
+  slogc("Parancsok: s = allapot, h = allapotfigyeles, B = opto alapertek torles (optocsere), R = rele szamlalo nullazas (relecsere)\n");
+}
+
 void printStatus() {
   char lk[48] = "";
   if (powerHold && (long)(powerHoldUntil - millis()) > 0)
@@ -733,7 +739,7 @@ void setup() {
   digitalWrite(PIN_LED, LOW);
 
   Serial.begin(115200);
-  logQ = xQueueCreate(16, sizeof(LogMsg));
+  logQ = xQueueCreate(24, sizeof(LogMsg));   // boot üzenetekhez is elég; tele sornál az üzenet elvész, a vezérlés nem áll meg
   if (logQ) xTaskCreate(logTask, "slog", 4096, nullptr, 1, nullptr);
 
   bool nvsOk = prefs.begin("relay", false);
@@ -791,6 +797,7 @@ void setup() {
   if (!nvsOk) slogc("FIGYELEM: NVS hiba, alapertelmezett beallitasok\n");
   if (powerHold) slogc("Aramszunet utan: %lu s varakozas\n", holdMs / 1000);
   if (powerLoss) { st.powerUps++; stDirty = true; statsSave(); }
+  printHelp();
   {
     char w[120];
     if (statsWarnings(w, sizeof w)) slogc("FIGYELMEZTETES:%s ('h' = reszletek)\n", w);
@@ -925,6 +932,10 @@ void loop() {
   if (statusReq) {
     statusReq = false;
     if (millis() - lastStatus >= STATUS_MIN_MS) { lastStatus = millis(); printStatus(); }
+  }
+  if (helpReq) {
+    helpReq = false;
+    if (millis() - lastStatus >= STATUS_MIN_MS) { lastStatus = millis(); printHelp(); }
   }
   if (healthReq) {
     healthReq = false;

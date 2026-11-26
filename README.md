@@ -89,7 +89,7 @@ A program az NVS-be menti (bekapcsoláskor, kikapcsoláskor és bekapcsolva ór�
 - **optó öregszik:** az átlag 25%-kal az alapérték alá esik;
 - **optó jele gyenge:** az átlag 15 alá esik (a hibahatár 8).
 
-**Soros parancsok:**
+**Soros parancsok** (indításkor a program kiírja őket, és bármely más karakterre is):
 
 | Parancs | Hatás |
 |---|---|
@@ -97,6 +97,8 @@ A program az NVS-be menti (bekapcsoláskor, kikapcsoláskor és bekapcsolva ór�
 | `h` | Állapotfigyelés részletesen |
 | `B` | Optócsere után: új alapérték a következő 5 bekapcsolásból |
 | `R` | Relécsere után: a relé-számláló nullázása |
+
+A soros kiírás külön taskban, nem blokkoló sorral működik: ha nincs csatlakoztatva gép, vagy a kimenet beragad, az üzenetek elvesznek, de a vezérlés nem áll meg, és nem okoz újraindulást.
 
 ## Fordítás
 
