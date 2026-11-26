@@ -1,4 +1,4 @@
-# Erősítő bekapcsoló (XIAO ESP32-C3)
+# Erősítő bekapcsoló (XIAO ESP32-C3 / ESP32-S3)
 
 Toroidtrafós erősítő be- és kikapcsolása gombbal vagy 12 V-os triggerrel, NTC-s lágyindítással, hálózatfigyeléssel és hibakezeléssel.
 
@@ -7,16 +7,20 @@ Toroidtrafós erősítő be- és kikapcsolása gombbal vagy 12 V-os triggerrel, 
 
 ## Lábkiosztás
 
-| Láb | GPIO | Funkció |
-|---|---|---|
-| D1 | 3 | LED (tranzisztorral, HIGH = világít) |
-| D2 | 4 | Gomb a GND-re (belső felhúzó) |
-| D3 | 5 | Trigger optó, LOW = aktív (10k felhúzó) |
-| D4 | 6 | Hálózatfigyelő optó, LOW = van hálózat (43k felhúzó) |
-| D5 | 7 | RL2 tranzisztor |
-| D10 | 10 | RL1 tranzisztor |
+A program a XIAO D-lábneveit használja, így a bekötés **mindkét lapon azonos**; a GPIO-számot a kiválasztott alaplap határozza meg.
+
+| Láb | C3 GPIO | S3 GPIO | Funkció |
+|---|---|---|---|
+| D1 | 3 | 2 | LED (tranzisztorral, HIGH = világít) |
+| D2 | 4 | 3 | Gomb a GND-re (belső felhúzó) |
+| D3 | 5 | 4 | Trigger optó, LOW = aktív (10k felhúzó) |
+| D4 | 6 | 5 | Hálózatfigyelő optó, LOW = van hálózat (43k felhúzó) |
+| D5 | 7 | 6 | RL2 tranzisztor |
+| D10 | 10 | 9 | RL1 tranzisztor |
 
 A relé-tranzisztorok bázisán legyen lehúzó ellenállás, hogy reset alatt ne kattanjanak be.
+
+**XIAO ESP32-S3:** a WiFi-hez csatlakoztasd a mellékelt külső antennát; a két mag miatt a WiFi és a vezérlés külön magon fut. A WiFi adóteljesítménye C3-on 8,5 dBm, S3-on 15 dBm.
 
 ## Hálózatfigyelő optó
 
@@ -100,17 +104,36 @@ A program az NVS-be menti (bekapcsoláskor, kikapcsoláskor és bekapcsolva ór�
 
 A soros kiírás külön taskban, nem blokkoló sorral működik: ha nincs csatlakoztatva gép, vagy a kimenet beragad, az üzenetek elvesznek, de a vezérlés nem áll meg, és nem okoz újraindulást.
 
+## Home Assistant (WiFi + MQTT, AI-elemzés)
+
+Ki- és bekapcsolható a program elején: `#define HOME_ASSISTANT true` / `false`. `false` esetén a WiFi- és MQTT-kód be sem fordul.
+
+- **Beállítás:** másold le a `secrets.example.h`-t `secrets.h` néven a sketch mappájába, és töltsd ki (WiFi, MQTT bróker címe, felhasználó, jelszó). A `secrets.h` nem kerül a gitbe; ha hiányzik, a program Home Assistant nélkül fordul.
+- **Automatikus felismerés:** az eszköz „Erősítő” néven jelenik meg a Home Assistantben: kapcsoló, trigger, probléma, üzemidő, számlálók, optó-értékek, WiFi jel.
+- **Események** az `erosito/event` témán: indulás, be, ki, hálózatkiesés, hiba, öregedési figyelmeztetés.
+- **Távoli parancs** (`erosito/power/set`, `ON` / `OFF`):
+  - `ON` úgy működik, mint a hosszú gombnyomás: minimális kikapcsolt idő, hibatiltás; a 2 perces várakozás alatt egyszer (a gombbal közösen).
+  - `OFF` mindig kikapcsol (az RL2 2 s-os minimumával), és törli a függő bekapcsolást.
+- **Hangvezérlés:** a Beállítások > Hangasszisztensek > Entitások megosztása menüben oszd meg a `switch.erosito` kapcsolót; utána: „Kapcsold be az erősítőt”.
+- **AI-elemzés:** a `homeassistant/erosito.yaml` csomag eseménynaplót vezet, és az Anthropic (Claude) integrációval
+  - minden vasárnap 18:00-kor heti összefoglalót,
+  - hiba, hálózatkiesés vagy figyelmeztetés után rövid elemzést küld értesítésként (legfeljebb 10 percenként egyet).
+
+  Az API-kulcs csak a Home Assistantben van. A csomagban az `agent_id` értékét a saját Claude-ügynököd azonosítójára kell írni; ennek az ügynöknek ne adj Home Assistant-vezérlési jogot.
+- **Biztonság:** a WiFi és az MQTT külön taskban fut, a vezérlés nem vár rájuk; hálózat vagy szerver nélkül az erősítő ugyanúgy működik.
+- **Táp:** a WiFi adáskor ~300 mA-es áramcsúcsokat okoz. A segédtáp legalább 500 mA-es legyen, a 3,3 V-ra kerüljön 220–470 µF kondenzátor, különben az ESP újraindulhat (és áramszünetnek veszi). Az adóteljesítmény csökkentve van (8,5 dBm).
+
 ## Hosszú üzem
 
 A program hónapokig, évekig megszakítás nélkül futhat:
 
 - minden időzítés kezdőidő + időtartam alapú, így a `millis()` 49,7 naponkénti túlcsordulása nem okoz hibát;
-- futás közben nincs dinamikus memóriafoglalás, így a memória nem töredezik;
+- a vezérlés futás közben nem foglal dinamikus memóriát (a WiFi- és MQTT-könyvtár a saját taskjában igen, a vezérléstől függetlenül);
 - az NVS-be csak eseménykor és bekapcsolva óránként ír, ami a flash élettartamához képest elhanyagolható.
 
 ## Fordítás
 
-- Arduino-ESP32 core 3.x, alaplap: **XIAO_ESP32C3**
+- Arduino-ESP32 core 3.x vagy újabb (fejlesztve: **4.0.0 / ESP-IDF 6.1**), alaplap: **XIAO_ESP32C3** vagy **XIAO_ESP32S3** (más alaplapra a program nem fordul le)
 - Eszközök → **USB CDC On Boot: Enabled**
 - Soros napló 115200 baud. Az `s` parancs a hálózatfigyelő optó LOW mintaszámát is kiírja (bekapcsolt állapotban normálisan kb. 28–37).
 - `MAINS_CHECK = true`: optó nélkül állítsd `false`-ra.
