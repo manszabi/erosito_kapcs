@@ -101,27 +101,52 @@ A program az NVS-be menti (bekapcsoláskor, kikapcsoláskor és bekapcsolva ór�
 | `h` | Állapotfigyelés részletesen |
 | `B` | Optócsere után: új alapérték a következő 5 bekapcsolásból |
 | `R` | Relécsere után: a relé-számláló nullázása |
+| `W` | Mentett hálózati beállítások törlése (vissza a `secrets.h` / AP módhoz) |
 
 A soros kiírás külön taskban, nem blokkoló sorral működik: ha nincs csatlakoztatva gép, vagy a kimenet beragad, az üzenetek elvesznek, de a vezérlés nem áll meg, és nem okoz újraindulást.
 
-## Home Assistant (WiFi + MQTT, AI-elemzés)
+## Hálózat: WiFi, weboldal, Home Assistant
 
-Ki- és bekapcsolható a program elején: `#define HOME_ASSISTANT true` / `false`. `false` esetén a WiFi- és MQTT-kód be sem fordul.
+Ki- és bekapcsolható a program elején: `#define HOME_ASSISTANT true` / `false`. `false` esetén a WiFi, a weboldal és az MQTT be sem fordul.
 
-- **Beállítás:** másold le a `secrets.example.h`-t `secrets.h` néven a sketch mappájába, és töltsd ki (WiFi, MQTT bróker címe, felhasználó, jelszó). A `secrets.h` nem kerül a gitbe; ha hiányzik, a program Home Assistant nélkül fordul.
-- **Automatikus felismerés:** az eszköz „Erősítő” néven jelenik meg a Home Assistantben: kapcsoló, trigger, probléma, üzemidő, számlálók, optó-értékek, WiFi jel.
+### WiFi és AP mód
+
+- **Beállítások forrása:** a weboldalon mentett beállítás (NVS); ha nincs, a `secrets.h` (nem kötelező, minta: `secrets.example.h`); ha az sincs, azonnal AP mód.
+- **AP mód:** ha 30 s alatt nem sikerül csatlakozni (vagy nincs beállítás), saját WiFi indul:
+  - hálózat: `Erosito-XXXX`, jelszó: `erosito123` (vagy a `secrets.h`-ban megadott `AP_PASS`);
+  - weboldal: `http://192.168.4.1` (a telefon általában magától megnyitja).
+- Az AP alatt a program 30 s-onként újrapróbálja a routert (ha épp nincs kliens az AP-n), így áramszünet után, amikor a router lassabban indul, magától csatlakozik. Csatlakozás után az AP 1 perccel később leáll.
+- A beállítások mentése **nem indítja újra** az ESP-t (a relék nem engednek el): a program élőben csatlakozik újra.
+
+### Weboldal
+
+Normál üzemben az ESP IP-címén érhető el (a soros `s` parancs kiírja). Felhasználó: `admin`, jelszó: alapból az AP jelszava, a weboldalon módosítható (legalább 8 karakter).
+
+- **Állapot** (2 s-onként frissül): be / ki, RL2, trigger, várakozás, hiba, figyelmeztetés, számlálók, optó, WiFi, IP, MQTT.
+- **Vezérlés:** Bekapcsolás / Kikapcsolás (ugyanazok a szabályok, mint a gombnál), Trigger figyelés be / ki (mentve, mint a két rövid gombnyomás).
+- **Beállítások:** WiFi név és jelszó, MQTT cím, felhasználó és jelszó, weboldal jelszó. Az üresen hagyott jelszómezők nem változnak; üres MQTT cím = nincs MQTT.
+- **Elfelejtett jelszó:** a soros `W` parancs törli a mentett hálózati beállításokat (vissza a `secrets.h` / AP módhoz).
+
+A weboldal sima HTTP-n, Basic jelszóval működik: csak a helyi hálózaton használd.
+
+### Home Assistant (MQTT, AI-elemzés)
+
+- **Automatikus felismerés:** az eszköz „Erősítő” néven jelenik meg: be/ki kapcsoló, trigger figyelés kapcsoló, trigger, probléma, üzemidő, számlálók, optó-értékek, WiFi jel.
 - **Események** az `erosito/event` témán: indulás, be, ki, hálózatkiesés, hiba, öregedési figyelmeztetés.
-- **Távoli parancs** (`erosito/power/set`, `ON` / `OFF`):
-  - `ON` úgy működik, mint a hosszú gombnyomás: minimális kikapcsolt idő, hibatiltás; a 2 perces várakozás alatt egyszer (a gombbal közösen).
-  - `OFF` mindig kikapcsol (az RL2 2 s-os minimumával), és törli a függő bekapcsolást.
+- **Távoli parancsok:**
+  - `erosito/power/set` `ON`: mint a hosszú gombnyomás (minimális kikapcsolt idő, hibatiltás; a 2 perces várakozás alatt egyszer, a gombbal és a weboldallal közösen); `OFF`: mindig kikapcsol (az RL2 2 s-os minimumával), és törli a függő bekapcsolást.
+  - `erosito/trigger/set` `ON` / `OFF`: trigger figyelés be / ki (mentve).
 - **Hangvezérlés:** a Beállítások > Hangasszisztensek > Entitások megosztása menüben oszd meg a `switch.erosito` kapcsolót; utána: „Kapcsold be az erősítőt”.
 - **AI-elemzés:** a `homeassistant/erosito.yaml` csomag eseménynaplót vezet, és az Anthropic (Claude) integrációval
   - minden vasárnap 18:00-kor heti összefoglalót,
   - hiba, hálózatkiesés vagy figyelmeztetés után rövid elemzést küld értesítésként (legfeljebb 10 percenként egyet).
 
   Az API-kulcs csak a Home Assistantben van. A csomagban az `agent_id` értékét a saját Claude-ügynököd azonosítójára kell írni; ennek az ügynöknek ne adj Home Assistant-vezérlési jogot.
-- **Biztonság:** a WiFi és az MQTT külön taskban fut, a vezérlés nem vár rájuk; hálózat vagy szerver nélkül az erősítő ugyanúgy működik.
-- **Táp:** a WiFi adáskor ~300 mA-es áramcsúcsokat okoz. A segédtáp legalább 500 mA-es legyen, a 3,3 V-ra kerüljön 220–470 µF kondenzátor, különben az ESP újraindulhat (és áramszünetnek veszi). Az adóteljesítmény csökkentve van (8,5 dBm).
+
+### Biztonság és táp
+
+- A WiFi, a weboldal és az MQTT külön taskban fut, a vezérlés nem vár rájuk; hálózat vagy szerver nélkül az erősítő ugyanúgy működik.
+- A WiFi adáskor ~300 mA-es áramcsúcsokat okoz. A segédtáp legalább 500 mA-es legyen, a 3,3 V-ra kerüljön 220–470 µF kondenzátor, különben az ESP újraindulhat (és áramszünetnek veszi).
 
 ## Hosszú üzem
 

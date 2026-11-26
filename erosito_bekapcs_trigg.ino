@@ -1,6 +1,6 @@
-// XIAO ESP32-C3 / ESP32-S3 erősítő-bekapcsoló: gomb + 12 V trigger, RL1 (NTC lágyindítás) majd RL2 (NTC áthidalás), hálózatfigyelés, hibakezelés, Home Assistant
+// XIAO ESP32-C3 / ESP32-S3 erősítő-bekapcsoló: gomb + 12 V trigger, RL1 (NTC lágyindítás) majd RL2 (NTC áthidalás), hálózatfigyelés, hibakezelés, weboldal, Home Assistant
 
-#define HOME_ASSISTANT true   // false: a WiFi- és MQTT-kód be sem fordul
+#define HOME_ASSISTANT true   // false: a WiFi, a weboldal és az MQTT be sem fordul
 
 #include <Arduino.h>
 #include <Preferences.h>
@@ -36,18 +36,19 @@
 #endif
 const BaseType_t AUX_CORE = 0;   // napló és hálózat: C3-on az egyetlen mag, S3-on a vezérléstől (1. mag) külön
 
-#if HOME_ASSISTANT && __has_include("secrets.h")
+#if HOME_ASSISTANT
 #if !__has_include(<mqtt_client.h>)
 #error "Az ESP-MQTT (mqtt_client.h) nincs ebben a core-ban: allitsd a HOME_ASSISTANT-ot false-ra"
 #endif
-#include "secrets.h"   // WIFI_SSID, WIFI_PASS, MQTT_URI, MQTT_USER, MQTT_PASS (minta: secrets.example.h)
+#if __has_include("secrets.h")
+#include "secrets.h"   // alapértékek (minta: secrets.example.h); a weboldalon mentett beállítás felülírja
+#endif
 #include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #include <mqtt_client.h>
 #define NET_ENABLED 1
 #else
-#if HOME_ASSISTANT
-#warning "secrets.h nincs a sketch mappaban: Home Assistant kikapcsolva (lasd secrets.example.h)"
-#endif
 #define NET_ENABLED 0
 #endif
 
@@ -110,8 +111,11 @@ const unsigned long STATS_SAVE_MS    = 3600000UL; // bekapcsolva óránként men
 // Soros napló, Home Assistant
 const uint8_t       LOG_MAX_PER_SEC  = 5;        // slog() korlát; slogc() korlátlan
 const unsigned long STATUS_MIN_MS    = 1000;     // soros parancsok legfeljebb ennyi időnként
-#define NET_ID "erosito"                         // MQTT témák és eszközazonosító
-const unsigned long NET_STATE_MS     = 60000;    // állapot küldése ennyi időnként (és minden változáskor)
+#define NET_ID "erosito"                         // MQTT témák, hostnév, AP név eleje
+const unsigned long NET_STATE_MS     = 60000;    // MQTT állapot küldése ennyi időnként (és minden változáskor)
+const unsigned long STA_TIMEOUT_MS   = 30000;    // ennyi sikertelen csatlakozás után AP mód
+const unsigned long STA_RETRY_MS     = 30000;    // AP mód alatt ennyi időnként újrapróbálja a routert
+const unsigned long AP_LINGER_MS     = 60000;    // csatlakozás után az AP ennyi idő múlva leáll (ha nincs rajta kliens)
 
 static_assert(OPTO_MIN_AVG > MAINS_MIN_LOW, "OPTO_MIN_AVG > MAINS_MIN_LOW kell");
 static_assert(MAINS_LOSS_MS >= 20, "MAINS_LOSS_MS >= 20 ms kell (2 felperiodus)");
@@ -223,6 +227,8 @@ volatile bool statusReq = false, healthReq = false, helpReq = false;
 volatile bool baseReq = false;      // 'B': új opto alapérték (optocsere után)
 volatile bool relayReq = false;     // 'R': relé számláló nullázása (relécsere után)
 volatile bool remoteOnReq = false, remoteOffReq = false;
+volatile int8_t remoteTrigReq = -1;   // weboldal / Home Assistant: trigger figyelés 1 = be, 0 = ki
+volatile bool netResetReq = false;    // 'W': hálózati beállítások törlése
 volatile bool netStateDirty = true;
 void netEvent(const char *type, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void switchOn(const char *src, bool manual);   // előre deklarálva: a hibakezelés is hívja
@@ -312,6 +318,7 @@ void logTask(void *) {   // kiírás + soros parancsok fogadása
       else if (c == 'h' || c == 'H') healthReq = true;
       else if (c == 'B') baseReq = true;
       else if (c == 'R') relayReq = true;
+      else if (c == 'W') netResetReq = true;
       else if (c > ' ') helpReq = true;
     }
   }
@@ -821,26 +828,88 @@ void holdButton(unsigned long now, bool changed) {   // áramszünet utáni vár
   }
 }
 
-// ======================================================================= Home Assistant: WiFi + MQTT külön taskban; a vezérlés csak nem blokkoló sorba ír
+// ======================================================================= Hálózat: WiFi (STA / AP), weboldal, MQTT – külön taskban; a vezérlés csak jelzőket és nem blokkoló sort használ
 #if NET_ENABLED
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS ""
+#endif
+#ifndef MQTT_URI
+#define MQTT_URI ""
+#endif
+#ifndef MQTT_USER
+#define MQTT_USER ""
+#endif
+#ifndef MQTT_PASS
+#define MQTT_PASS ""
+#endif
+#ifndef AP_PASS
+#define AP_PASS "erosito123"   // AP jelszó és a weboldal alapjelszava (legalább 8 karakter)
+#endif
+
+struct NetCfg { char ssid[33], pass[65], mqttUri[96], mqttUser[33], mqttPass[65], webPass[33]; };
+NetCfg ncfg;
+Preferences netPrefs;           // külön példány: a hálózati task használja
 struct NetEvt { char type[12]; char text[100]; };
 QueueHandle_t netQ = nullptr;
+WebServer web(80);
+DNSServer dns;
 esp_mqtt_client_handle_t mqtt = nullptr;
 volatile bool mqttUp = false;
 volatile bool netNeedDisc = false;
-bool netStarted = false;
-unsigned long netLastState = 0;
-const char *T_STATE  = NET_ID "/state";
-const char *T_EVENT  = NET_ID "/event";
-const char *T_CMD    = NET_ID "/power/set";
-const char *T_STATUS = NET_ID "/status";
+bool netStarted = false, apOn = false, netReconfig = false;
+unsigned long netLastState = 0, staLastOk = 0, staLastBegin = 0, apIdleSince = 0;
+char apSsid[24];
+const char *T_STATE   = NET_ID "/state";
+const char *T_EVENT   = NET_ID "/event";
+const char *T_CMD     = NET_ID "/power/set";
+const char *T_TRIGCMD = NET_ID "/trigger/set";
+const char *T_STATUS  = NET_ID "/status";
 
+// ---- Beállítások: NVS ("net"), ennek hiányában a secrets.h ----
+void netCfgLoad() {
+  strlcpy(ncfg.ssid, WIFI_SSID, sizeof ncfg.ssid);
+  strlcpy(ncfg.pass, WIFI_PASS, sizeof ncfg.pass);
+  strlcpy(ncfg.mqttUri, MQTT_URI, sizeof ncfg.mqttUri);
+  strlcpy(ncfg.mqttUser, MQTT_USER, sizeof ncfg.mqttUser);
+  strlcpy(ncfg.mqttPass, MQTT_PASS, sizeof ncfg.mqttPass);
+  strlcpy(ncfg.webPass, AP_PASS, sizeof ncfg.webPass);
+  if (!netPrefs.begin("net", true)) return;   // nincs mentett beállítás
+  if (netPrefs.isKey("ssid")) {
+    netPrefs.getString("ssid", ncfg.ssid, sizeof ncfg.ssid);
+    netPrefs.getString("pass", ncfg.pass, sizeof ncfg.pass);
+    netPrefs.getString("mqttUri", ncfg.mqttUri, sizeof ncfg.mqttUri);
+    netPrefs.getString("mqttUser", ncfg.mqttUser, sizeof ncfg.mqttUser);
+    netPrefs.getString("mqttPass", ncfg.mqttPass, sizeof ncfg.mqttPass);
+    netPrefs.getString("webPass", ncfg.webPass, sizeof ncfg.webPass);
+  }
+  netPrefs.end();
+}
+
+bool netCfgSave() {
+  if (!netPrefs.begin("net", false)) return false;
+  bool ok = netPrefs.putString("ssid", ncfg.ssid) == strlen(ncfg.ssid);
+  netPrefs.putString("pass", ncfg.pass);
+  netPrefs.putString("mqttUri", ncfg.mqttUri);
+  netPrefs.putString("mqttUser", ncfg.mqttUser);
+  netPrefs.putString("mqttPass", ncfg.mqttPass);
+  netPrefs.putString("webPass", ncfg.webPass);
+  netPrefs.end();
+  return ok;
+}
+
+void netCfgClear() {
+  if (netPrefs.begin("net", false)) { netPrefs.clear(); netPrefs.end(); }
+}
+
+// ---- Események a vezérlésből (nem blokkoló) ----
 void netEvent(const char *type, const char *fmt, ...) {
   netStateDirty = true;
   if (!netQ) return;
   NetEvt e;
-  strncpy(e.type, type, sizeof e.type - 1);
-  e.type[sizeof e.type - 1] = 0;
+  strlcpy(e.type, type, sizeof e.type);
   va_list ap;
   va_start(ap, fmt);
   vsnprintf(e.text, sizeof e.text, fmt, ap);
@@ -848,8 +917,62 @@ void netEvent(const char *type, const char *fmt, ...) {
   xQueueSend(netQ, &e, 0);   // tele sornál elvész, nem vár
 }
 
+// ---- Állapot JSON (MQTT és weboldal közös) ----
+void jsonEsc(char *dst, size_t len, const char *src) {   // idézőjel, backslash, vezérlőkarakter kiszűrése
+  size_t j = 0;
+  for (; *src && j + 2 < len; src++) {
+    if (*src == '"' || *src == '\\') { dst[j++] = '\\'; dst[j++] = *src; }
+    else if ((unsigned char)*src >= 0x20) dst[j++] = *src;
+  }
+  dst[j] = 0;
+}
+
+void buildState(char *js, size_t len, bool forWeb) {
+  char w[120];
+  statsWarnings(w, sizeof w);
+  unsigned long h10 = st.onSeconds / 360;
+  unsigned a = (unsigned)(st.optoAvg * 10 + 0.5f), b = (unsigned)(st.optoBase * 10 + 0.5f);
+  bool flt = faultActive || lockoutPending;
+  int n = snprintf(js, len,
+           "{\"power\":\"%s\",\"rl2\":\"%s\",\"trigger\":\"%s\",\"trig_enabled\":%s,\"trig_en\":\"%s\",\"hold\":%s,"
+           "\"fault\":\"%s\",\"warning\":\"%s\",\"problem\":\"%s\",\"on_hours\":%lu.%lu,\"on_count\":%lu,"
+           "\"relay_count\":%lu,\"mains_loss\":%lu,\"faults\":%lu,\"power_ups\":%lu,\"opto_now\":%u,"
+           "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d",
+           on ? "ON" : "OFF", rl2On ? "ON" : "OFF", trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
+           trigOff ? "OFF" : "ON", powerHold ? "true" : "false", flt ? faultName(lastFault) : "nincs", w[0] ? w + 1 : "nincs",
+           (flt || w[0]) ? "ON" : "OFF", h10 / 10, h10 % 10, (unsigned long)st.onCount, (unsigned long)st.relayCount,
+           (unsigned long)st.mainsLoss, (unsigned long)st.faults, (unsigned long)st.powerUps, (unsigned)fbCount,
+           a / 10, a % 10, b / 10, b % 10, (int)WiFi.RSSI());
+  if (n < 0 || (size_t)n >= len) { strlcpy(js, "{}", len); return; }
+  if (forWeb) {
+    char ss[70], mu[200], mus[70];
+    jsonEsc(ss, sizeof ss, ncfg.ssid);
+    jsonEsc(mu, sizeof mu, ncfg.mqttUri);
+    jsonEsc(mus, sizeof mus, ncfg.mqttUser);
+    bool sta = WiFi.status() == WL_CONNECTED;
+    n += snprintf(js + n, len - n,
+                  ",\"wifi\":\"%s\",\"ip\":\"%s\",\"mqtt\":\"%s\",\"uptime_h\":%lu,\"board\":\"" BOARD_NAME "\","
+                  "\"cfg_ssid\":\"%s\",\"cfg_mqtt_uri\":\"%s\",\"cfg_mqtt_user\":\"%s\"",
+                  sta ? (apOn ? "csatlakozva + AP" : "csatlakozva") : (apOn ? "AP mód" : "nincs"),
+                  sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"),
+                  !ncfg.mqttUri[0] ? "nincs beállítva" : (mqttUp ? "OK" : "nincs kapcsolat"),
+                  millis() / 3600000UL, ss, mu, mus);
+    if (n < 0 || (size_t)n >= len - 1) { strlcpy(js, "{}", len); return; }
+  }
+  strlcat(js, "}", len);
+}
+
+// ---- MQTT ----
 void netPub(const char *topic, const char *payload, bool retain) {
   if (mqtt && mqttUp) esp_mqtt_client_enqueue(mqtt, topic, payload, 0, 1, retain ? 1 : 0, true);
+}
+
+bool topicIs(esp_mqtt_event_handle_t e, const char *t) {
+  return e->topic_len == (int)strlen(t) && strncmp(e->topic, t, e->topic_len) == 0;
+}
+
+bool dataIs(esp_mqtt_event_handle_t e, const char *d) {
+  return e->data_len == (int)strlen(d) && strncmp(e->data, d, e->data_len) == 0;
 }
 
 void mqttHandler(void *, esp_event_base_t, int32_t id, void *data) {
@@ -858,12 +981,17 @@ void mqttHandler(void *, esp_event_base_t, int32_t id, void *data) {
     mqttUp = true;
     netNeedDisc = true;
     esp_mqtt_client_subscribe_single(mqtt, T_CMD, 1);
+    esp_mqtt_client_subscribe_single(mqtt, T_TRIGCMD, 1);
   } else if (id == MQTT_EVENT_DISCONNECTED) {
     mqttUp = false;
-  } else if (id == MQTT_EVENT_DATA && !e->retain && e->topic_len == (int)strlen(T_CMD) &&
-             strncmp(e->topic, T_CMD, e->topic_len) == 0) {
-    if (e->data_len == 2 && strncmp(e->data, "ON", 2) == 0) remoteOnReq = true;
-    else if (e->data_len == 3 && strncmp(e->data, "OFF", 3) == 0) remoteOffReq = true;
+  } else if (id == MQTT_EVENT_DATA && !e->retain) {
+    if (topicIs(e, T_CMD)) {
+      if (dataIs(e, "ON")) remoteOnReq = true;
+      else if (dataIs(e, "OFF")) remoteOffReq = true;
+    } else if (topicIs(e, T_TRIGCMD)) {
+      if (dataIs(e, "ON")) remoteTrigReq = 1;
+      else if (dataIs(e, "OFF")) remoteTrigReq = 0;
+    }
   }
 }
 
@@ -880,6 +1008,7 @@ void netDisc(const char *comp, const char *obj, const char *name, const char *ex
 
 void netDiscovery() {
   netDisc("switch", "power", "null", ",\"cmd_t\":\"" NET_ID "/power/set\",\"ic\":\"mdi:amplifier\"");
+  netDisc("switch", "trig_en", "\"Trigger figyelés\"", ",\"cmd_t\":\"" NET_ID "/trigger/set\",\"ic\":\"mdi:import\"");
   netDisc("binary_sensor", "rl2", "\"NTC áthidalva (RL2)\"", ",\"ent_cat\":\"diagnostic\"");
   netDisc("binary_sensor", "trigger", "\"Trigger\"", "");
   netDisc("binary_sensor", "problem", "\"Probléma\"", ",\"dev_cla\":\"problem\"");
@@ -897,45 +1026,37 @@ void netDiscovery() {
   netDisc("sensor", "rssi", "\"WiFi jel\"", ",\"unit_of_meas\":\"dBm\",\"dev_cla\":\"signal_strength\",\"ent_cat\":\"diagnostic\"");
 }
 
-void netState() {
-  char w[120], js[640];
-  statsWarnings(w, sizeof w);
-  unsigned long h10 = st.onSeconds / 360;
-  unsigned a = (unsigned)(st.optoAvg * 10 + 0.5f), b = (unsigned)(st.optoBase * 10 + 0.5f);
-  bool flt = faultActive || lockoutPending;
-  snprintf(js, sizeof js,
-           "{\"power\":\"%s\",\"rl2\":\"%s\",\"trigger\":\"%s\",\"trig_enabled\":%s,\"hold\":%s,"
-           "\"fault\":\"%s\",\"warning\":\"%s\",\"problem\":\"%s\",\"on_hours\":%lu.%lu,\"on_count\":%lu,"
-           "\"relay_count\":%lu,\"mains_loss\":%lu,\"faults\":%lu,\"power_ups\":%lu,\"opto_now\":%u,"
-           "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d}",
-           on ? "ON" : "OFF", rl2On ? "ON" : "OFF", trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
-           powerHold ? "true" : "false", flt ? faultName(lastFault) : "nincs", w[0] ? w + 1 : "nincs",
-           (flt || w[0]) ? "ON" : "OFF", h10 / 10, h10 % 10, (unsigned long)st.onCount, (unsigned long)st.relayCount,
-           (unsigned long)st.mainsLoss, (unsigned long)st.faults, (unsigned long)st.powerUps, (unsigned)fbCount,
-           a / 10, a % 10, b / 10, b % 10, (int)WiFi.RSSI());
-  netPub(T_STATE, js, true);
+void mqttStart() {
+  esp_mqtt_client_config_t cfg = {};
+  cfg.broker.address.uri = ncfg.mqttUri;
+  cfg.credentials.username = ncfg.mqttUser;
+  cfg.credentials.authentication.password = ncfg.mqttPass;
+  cfg.credentials.client_id = NET_ID;
+  cfg.session.last_will.topic = T_STATUS;
+  cfg.session.last_will.msg = "offline";
+  cfg.session.last_will.qos = 1;
+  cfg.session.last_will.retain = 1;
+  cfg.session.keepalive = 30;
+  cfg.network.reconnect_timeout_ms = 10000;
+  cfg.buffer.size = 2048;   // az állapot JSON kényelmesen elfér
+  mqtt = esp_mqtt_client_init(&cfg);
+  if (!mqtt) return;
+  esp_mqtt_client_register_event(mqtt, MQTT_EVENT_ANY, mqttHandler, nullptr);
+  esp_mqtt_client_start(mqtt);
+  netStarted = true;
 }
 
-void netService() {   // a hálózati task egy köre: MQTT indítása, discovery, események, állapot
-  if (!netStarted && WiFi.status() == WL_CONNECTED) {
-    esp_mqtt_client_config_t cfg = {};
-    cfg.broker.address.uri = MQTT_URI;
-    cfg.credentials.username = MQTT_USER;
-    cfg.credentials.authentication.password = MQTT_PASS;
-    cfg.credentials.client_id = NET_ID;
-    cfg.session.last_will.topic = T_STATUS;
-    cfg.session.last_will.msg = "offline";
-    cfg.session.last_will.qos = 1;
-    cfg.session.last_will.retain = 1;
-    cfg.session.keepalive = 30;
-    cfg.network.reconnect_timeout_ms = 10000;
-    mqtt = esp_mqtt_client_init(&cfg);
-    if (mqtt) {
-      esp_mqtt_client_register_event(mqtt, MQTT_EVENT_ANY, mqttHandler, nullptr);
-      esp_mqtt_client_start(mqtt);
-      netStarted = true;
-    }
+void mqttStop() {
+  if (mqtt) {
+    esp_mqtt_client_stop(mqtt);
+    esp_mqtt_client_destroy(mqtt);
+    mqtt = nullptr;
   }
+  mqttUp = false;
+  netStarted = false;
+}
+
+void mqttService() {   // discovery, események, állapot
   if (!mqttUp) return;
   if (netNeedDisc) {
     netNeedDisc = false;
@@ -945,38 +1066,226 @@ void netService() {   // a hálózati task egy köre: MQTT indítása, discovery
   }
   NetEvt e;
   while (xQueueReceive(netQ, &e, 0) == pdTRUE) {
-    char js[160];
-    snprintf(js, sizeof js, "{\"type\":\"%s\",\"text\":\"%s\"}", e.type, e.text);
+    char tx[200], js[260];
+    jsonEsc(tx, sizeof tx, e.text);
+    snprintf(js, sizeof js, "{\"type\":\"%s\",\"text\":\"%s\"}", e.type, tx);
     netPub(T_EVENT, js, false);
   }
   if (netStateDirty || millis() - netLastState >= NET_STATE_MS) {
+    char js[900];
     netStateDirty = false;
     netLastState = millis();
-    netState();
+    buildState(js, sizeof js, false);
+    netPub(T_STATE, js, true);
   }
 }
 
-void netTask(void *) {
-  WiFi.persistent(false);   // ne írja minden induláskor a flash-be
-  WiFi.setHostname(NET_ID);
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+// ---- WiFi: STA a beállítások szerint; sikertelenség esetén AP mód (közben újrapróbál) ----
+void staBegin() {
+  if (!ncfg.ssid[0]) return;
+  WiFi.begin(ncfg.ssid, ncfg.pass);
   WiFi.setTxPower(WIFI_TX_POWER);
+  staLastBegin = millis();
+}
+
+void apStart() {
+  WiFi.mode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
+  WiFi.softAP(apSsid, AP_PASS);
+  WiFi.setTxPower(WIFI_TX_POWER);
+  dns.start(53, "*", WiFi.softAPIP());   // captive portal: minden név a weboldalra mutat
+  apOn = true;
+  apIdleSince = millis();
+  slogc("AP mod: WiFi \"%s\", jelszo \"%s\", weboldal: http://%s (admin)\n", apSsid, AP_PASS,
+        WiFi.softAPIP().toString().c_str());
+}
+
+void apStop() {
+  dns.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  apOn = false;
+  slogc("AP mod vege: csatlakozva, weboldal: http://%s\n", WiFi.localIP().toString().c_str());
+}
+
+void wifiService() {
+  unsigned long now = millis();
+  bool sta = WiFi.status() == WL_CONNECTED;
+  if (sta) staLastOk = now;
+  if (!apOn && !sta && (!ncfg.ssid[0] || now - staLastOk >= STA_TIMEOUT_MS)) apStart();
+  if (apOn) {
+    bool clients = WiFi.softAPgetStationNum() > 0;
+    if (clients || !sta) apIdleSince = now;
+    if (sta && now - apIdleSince >= AP_LINGER_MS) apStop();
+    else if (!sta && !clients && ncfg.ssid[0] && now - staLastBegin >= STA_RETRY_MS) {   // kliens nélkül újrapróbálja a routert
+      WiFi.disconnect();
+      staBegin();
+    }
+    if (apOn) dns.processNextRequest();
+  }
+}
+
+// ---- Weboldal (jelszóval: admin / webPass) ----
+const char PAGE[] = R"HTML(<!DOCTYPE html><html lang="hu"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Erősítő</title><style>
+body{font-family:sans-serif;max-width:560px;margin:auto;padding:12px;background:#f2f2f2;color:#222}
+section{background:#fff;border-radius:8px;padding:12px;margin:10px 0}h1{font-size:1.3em}h2{font-size:1.05em;margin:0 0 8px}
+table{width:100%;border-collapse:collapse}td{padding:4px 0;border-bottom:1px solid #eee}td+td{text-align:right;font-weight:bold}
+button{padding:10px 14px;margin:4px 4px 4px 0;border:0;border-radius:6px;font-size:1em;color:#fff;background:#455a64}
+.on{background:#2e7d32}.off{background:#c62828}.warn{color:#c62828}
+label{display:block;margin-top:8px;font-size:.9em}input{width:100%;padding:7px;box-sizing:border-box;margin-top:2px}
+</style></head><body><h1>Erősítő bekapcsoló</h1>
+<section><h2>Állapot</h2><table id="t"><tr><td>Betöltés…</td></tr></table></section>
+<section><h2>Vezérlés</h2>
+<button class="on" onclick="post('/api/power','state=on')">Bekapcsolás</button>
+<button class="off" onclick="post('/api/power','state=off')">Kikapcsolás</button><br>
+<button id="tb" onclick="post('/api/trigger','enabled='+(tr?0:1))">Trigger figyelés</button></section>
+<section><h2>Beállítások</h2><form method="post" action="/api/config">
+<label>WiFi hálózat neve<input name="ssid" id="ssid" maxlength="32"></label>
+<label>WiFi jelszó (üresen hagyva nem változik)<input name="pass" type="password" maxlength="64"></label>
+<label>MQTT cím (pl. mqtt://192.168.1.10:1883; üresen: nincs MQTT)<input name="mqtt_uri" id="mu" maxlength="95"></label>
+<label>MQTT felhasználó<input name="mqtt_user" id="mus" maxlength="32"></label>
+<label>MQTT jelszó (üresen hagyva nem változik)<input name="mqtt_pass" type="password" maxlength="64"></label>
+<label>Weboldal jelszó (legalább 8 karakter; üresen hagyva nem változik)<input name="web_pass" type="password" maxlength="32"></label>
+<button type="submit">Mentés</button></form></section>
+<script>
+let tr=false,cf=false;const $=i=>document.getElementById(i);
+const L={power:'Erősítő',rl2:'NTC áthidalva (RL2)',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
+fault:'Hiba',warning:'Figyelmeztetés',on_hours:'Üzemidő (óra)',on_count:'Bekapcsolások',relay_count:'Relé kapcsolások',
+mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',
+rssi:'WiFi jel (dBm)',mqtt:'MQTT',uptime_h:'Futásidő (óra)',board:'Alaplap'};
+const V=x=>x===true?'igen':x===false?'nem':x==='ON'?'BE':x==='OFF'?'KI':x;
+async function upd(){try{const s=await(await fetch('/api/status')).json();tr=s.trig_enabled;let h='';
+for(const k in L)if(k in s)h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
+$('t').innerHTML=h;$('tb').textContent='Trigger figyelés: '+(tr?'BE – kikapcsolás':'KI – bekapcsolás');
+if(!cf){cf=true;$('ssid').value=s.cfg_ssid;$('mu').value=s.cfg_mqtt_uri;$('mus').value=s.cfg_mqtt_user;}}catch(e){}}
+async function post(u,b){await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});setTimeout(upd,300);}
+upd();setInterval(upd,2000);
+</script></body></html>)HTML";
+
+bool webAuth() {
+  if (web.authenticate("admin", ncfg.webPass)) return true;
+  web.requestAuthentication(BASIC_AUTH, "Erosito");
+  return false;
+}
+
+void webRoot() {
+  if (webAuth()) web.send(200, "text/html; charset=utf-8", PAGE);
+}
+
+void webStatus() {
+  if (!webAuth()) return;
+  char js[1200];
+  buildState(js, sizeof js, true);
+  web.send(200, "application/json; charset=utf-8", js);
+}
+
+void webPower() {   // mint a gomb / Home Assistant: ugyanazok a szabályok
+  if (!webAuth()) return;
+  if (web.arg("state") == "on") remoteOnReq = true;
+  else if (web.arg("state") == "off") remoteOffReq = true;
+  web.send(200, "text/plain", "OK");
+}
+
+void webTrigger() {
+  if (!webAuth()) return;
+  remoteTrigReq = (web.arg("enabled") == "1") ? 1 : 0;
+  web.send(200, "text/plain", "OK");
+}
+
+void webConfig() {   // mentés NVS-be, majd élő újracsatlakozás (nincs újraindítás: a relék nem engednek el)
+  if (!webAuth()) return;
+  NetCfg n = ncfg;
+  strlcpy(n.ssid, web.arg("ssid").c_str(), sizeof n.ssid);
+  strlcpy(n.mqttUri, web.arg("mqtt_uri").c_str(), sizeof n.mqttUri);
+  strlcpy(n.mqttUser, web.arg("mqtt_user").c_str(), sizeof n.mqttUser);
+  if (web.arg("pass").length()) strlcpy(n.pass, web.arg("pass").c_str(), sizeof n.pass);
+  if (web.arg("mqtt_pass").length()) strlcpy(n.mqttPass, web.arg("mqtt_pass").c_str(), sizeof n.mqttPass);
+  bool pwOk = web.arg("web_pass").length() == 0 || web.arg("web_pass").length() >= 8;
+  if (pwOk && web.arg("web_pass").length()) strlcpy(n.webPass, web.arg("web_pass").c_str(), sizeof n.webPass);
+  ncfg = n;
+  bool ok = netCfgSave();
+  netReconfig = true;
+  slogc("Halozati beallitasok %s (weboldal): WiFi \"%s\", MQTT \"%s\"\n", ok ? "mentve" : "NEM mentve", ncfg.ssid, ncfg.mqttUri);
+  char html[400];
+  snprintf(html, sizeof html,
+           "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"8;url=/\"></head>"
+           "<body style=\"font-family:sans-serif\"><p>%s</p>%s<p><a href=\"/\">Vissza</a></p></body></html>",
+           ok ? "Mentve. Újracsatlakozás…" : "HIBA: a mentés nem sikerült.",
+           pwOk ? "" : "<p>A weboldal jelszó túl rövid (legalább 8 karakter), nem változott.</p>");
+  web.send(200, "text/html; charset=utf-8", html);
+}
+
+void webNotFound() {   // AP módban minden ismeretlen cím a weboldalra irányít (captive portal)
+  if (apOn) {
+    web.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/");
+    web.send(302, "text/plain", "");
+  } else {
+    web.send(404, "text/plain", "Nincs ilyen oldal");
+  }
+}
+
+// ---- Hálózati task ----
+void netService() {
+  wifiService();
+  web.handleClient();
+  if (netResetReq) {   // 'W': mentett beállítások törlése, vissza a secrets.h / AP módhoz
+    netResetReq = false;
+    netCfgClear();
+    netCfgLoad();
+    netReconfig = true;
+    slogc("Halozati beallitasok torolve\n");
+  }
+  if (netReconfig) {   // új beállítások: MQTT és WiFi újraindítása (a relék nem érintettek)
+    netReconfig = false;
+    mqttStop();
+    WiFi.disconnect();
+    staLastOk = millis();   // új időkeret a csatlakozásra
+    if (apOn) WiFi.mode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
+    staBegin();
+  }
+  if (!netStarted && ncfg.mqttUri[0] && WiFi.status() == WL_CONNECTED) mqttStart();
+  mqttService();
+}
+
+void netInit() {   // beállítások betöltése, WiFi indítása, weboldal útvonalai
+  netCfgLoad();
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  snprintf(apSsid, sizeof apSsid, "Erosito-%02X%02X", mac[4], mac[5]);
+  WiFi.persistent(false);   // a WiFi könyvtár ne írja a flash-t
+  WiFi.setHostname(NET_ID);
+  WiFi.setAutoReconnect(true);
+  WiFi.mode(WIFI_STA);
+  staLastOk = millis();
+  staBegin();
+  web.on("/", HTTP_GET, webRoot);
+  web.on("/api/status", HTTP_GET, webStatus);
+  web.on("/api/power", HTTP_POST, webPower);
+  web.on("/api/trigger", HTTP_POST, webTrigger);
+  web.on("/api/config", HTTP_POST, webConfig);
+  web.onNotFound(webNotFound);
+  web.begin();
+  slogc("Halozat: %s\n", ncfg.ssid[0] ? "csatlakozas a mentett / secrets.h WiFi-hez" : "nincs WiFi beallitas, AP mod");
+}
+
+void netTask(void *) {
+  netInit();
   for (;;) {
     netService();
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 void netStart() {
   netQ = xQueueCreate(16, sizeof(NetEvt));
-  if (netQ) xTaskCreatePinnedToCore(netTask, "net", 6144, nullptr, 1, nullptr, AUX_CORE);
+  if (netQ) xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, nullptr, AUX_CORE);
 }
 
 void netStatusLine() {
-  slogc("  Home Assistant: WiFi %s (%d dBm), MQTT %s\n", WiFi.status() == WL_CONNECTED ? "OK" : "nincs",
-        (int)WiFi.RSSI(), mqttUp ? "OK" : "nincs");
+  bool sta = WiFi.status() == WL_CONNECTED;
+  slogc("  Halozat: WiFi %s%s (%d dBm), IP %s, MQTT %s\n", sta ? "OK" : "nincs", apOn ? " + AP" : "", (int)WiFi.RSSI(),
+        sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"),
+        !ncfg.mqttUri[0] ? "nincs beallitva" : (mqttUp ? "OK" : "nincs"));
 }
 #else
 void netEvent(const char *, const char *, ...) {}
@@ -986,7 +1295,8 @@ void netStatusLine() {}
 
 // ======================================================================= Soros parancsok, kiírások
 void printHelp() {
-  slogc("Parancsok: s = allapot, h = allapotfigyeles, B = opto alapertek torles (optocsere), R = rele szamlalo nullazas (relecsere)\n");
+  slogc("Parancsok: s = allapot, h = allapotfigyeles, B = opto alapertek torles (optocsere), R = rele szamlalo nullazas (relecsere)%s\n",
+        NET_ENABLED ? ", W = halozati beallitasok torlese" : "");
 }
 
 void printStatus() {
@@ -1038,6 +1348,13 @@ bool statusAllowed() {   // a soros kiírások legfeljebb STATUS_MIN_MS időnké
   if (millis() - lastStatus < STATUS_MIN_MS) return false;
   lastStatus = millis();
   return true;
+}
+
+void handleRemoteTrigger() {   // weboldal / Home Assistant: trigger figyelés be / ki (mentve, mint a két rövid nyomás)
+  int8_t r = remoteTrigReq;
+  if (r < 0) return;
+  remoteTrigReq = -1;
+  if ((r == 0) != trigOff) toggleTrigOff();
 }
 
 void handleSerial() {
@@ -1256,6 +1573,7 @@ void loop() {
 
   updateRl2(now);
   ledUpdate();
+  handleRemoteTrigger();
   handleSerial();
   handleStatsTimer(now);
   logWindow();
