@@ -97,6 +97,7 @@ struct SettingsView: View {
     @State private var espMask = ""
     @State private var espDns = ""
     @State private var ipMessage: String?
+    @State private var ipLoaded = false   // az IP-mezők csak akkor töltődnek, ha már megjött az állapot (különben üresen DHCP-t mentene)
 
     var body: some View {
         NavigationStack {
@@ -148,7 +149,10 @@ struct SettingsView: View {
                             host = client.host
                         }
                     }
-                    .disabled(client.status == nil || client.busy)
+                    .disabled(!ipLoaded || client.busy)
+                    if let error = client.status?.ipError, !error.isEmpty {
+                        Text("IP-hiba: \(error) – az erősítő DHCP-t használ.").font(.callout).foregroundStyle(.red)
+                    }
                     if let ipMessage { Text(ipMessage).font(.callout).foregroundStyle(.secondary) }
                 } header: {
                     Text("Az erősítő IP-címe")
@@ -172,11 +176,15 @@ struct SettingsView: View {
             .onAppear {
                 host = client.host
                 password = client.password
-                espIp = client.status?.cfgIp ?? ""
-                espGw = client.status?.cfgGw ?? ""
-                espMask = client.status?.cfgMask ?? ""
-                espDns = client.status?.cfgDns ?? ""
                 discovery.start()
+            }
+            .onChange(of: client.status?.power, initial: true) { _, _ in
+                guard !ipLoaded, let s = client.status else { return }
+                espIp = s.cfgIp ?? ""
+                espGw = s.cfgGw ?? ""
+                espMask = s.cfgMask ?? ""
+                espDns = s.cfgDns ?? ""
+                ipLoaded = true
             }
             .onDisappear { discovery.stop() }
         }

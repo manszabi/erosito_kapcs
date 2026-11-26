@@ -896,7 +896,20 @@ DNSServer dns;
 esp_mqtt_client_handle_t mqtt = nullptr;
 volatile bool mqttUp = false;
 volatile bool netNeedDisc = false;
-bool netStarted = false, apOn = false, netReconfig = false;
+bool netStarted = false, apOn = false;
+bool reconfWifi = false, reconfMqtt = false;   // függő újrakonfigurálás (a HTTP-válasz kiküldése után)
+unsigned long reconfAt = 0;
+const unsigned long RECONF_DELAY_MS = 1500;   // ennyi idő marad a válasz kiküldésére a WiFi bontása előtt
+
+void requestReconfig(bool wifiChanged, bool mqttChanged) {
+  reconfWifi |= wifiChanged;
+  reconfMqtt |= mqttChanged;
+  reconfAt = millis();
+}
+
+bool ipCfgDiffers(const NetCfg &x, const NetCfg &y) {
+  return strcmp(x.ip, y.ip) || strcmp(x.gw, y.gw) || strcmp(x.mask, y.mask) || strcmp(x.dns, y.dns);
+}
 unsigned long netLastState = 0, staLastOk = 0, staLastBegin = 0, apIdleSince = 0, mqttLastTry = 0, apLastTry = 0;
 bool mqttTried = false, apTried = false;
 int mdnsState = 0;               // 0 = még nem indult, 1 = működik, 2 = hiba (újrapróbálja)
@@ -1415,7 +1428,7 @@ void webRoot() {
 
 void webStatus() {
   if (!apiAuth()) return;
-  char js[1200];
+  char js[1600];   // leghosszabb beállításokkal is elfér
   buildState(js, sizeof js, true);
   web.send(200, "application/json; charset=utf-8", js);
 }
@@ -1424,12 +1437,15 @@ void webPower() {   // mint a gomb / Home Assistant: ugyanazok a szabályok
   if (!apiAuth()) return;
   if (web.arg("state") == "on") remoteOnReq = true;
   else if (web.arg("state") == "off") remoteOffReq = true;
+  else { web.send(400, "text/plain", "state=on vagy state=off kell"); return; }
   web.send(200, "text/plain", "OK");
 }
 
-void webTrigger() {
+void webTrigger() {   // csak egyértelmű kérésre változtat
   if (!apiAuth()) return;
-  remoteTrigReq = (web.arg("enabled") == "1") ? 1 : 0;
+  if (web.arg("enabled") == "1") remoteTrigReq = 1;
+  else if (web.arg("enabled") == "0") remoteTrigReq = 0;
+  else { web.send(400, "text/plain", "enabled=1 vagy enabled=0 kell"); return; }
   web.send(200, "text/plain", "OK");
 }
 
@@ -1455,9 +1471,10 @@ void webNetIp() {   // iOS-app: fix IP vagy DHCP (JSON válasz); hibás beállí
   if (!apiAuth()) return;
   NetCfg n = ncfg;
   const char *err = ipFromArgs(n);
+  bool wifiChanged = ipCfgDiffers(n, ncfg);
   ncfg = n;
   bool ok = netCfgSave();
-  netReconfig = true;
+  requestReconfig(wifiChanged, false);
   slogc("IP beallitas (app): %s%s%s\n", ncfg.ip[0] ? ncfg.ip : "DHCP", err ? ", hiba: " : "", err ? err : "");
   char js[200];
   snprintf(js, sizeof js, "{\"ok\":%s,\"mode\":\"%s\",\"ip\":\"%s\",\"error\":\"%s\"}", (ok && !err) ? "true" : "false",
@@ -1477,13 +1494,15 @@ void webConfig() {   // mentés NVS-be, majd élő újracsatlakozás (nincs újr
   bool pwChanged = pwOk && web.arg("web_pass").length() && strcmp(web.arg("web_pass").c_str(), ncfg.webPass) != 0;
   if (pwChanged) strlcpy(n.webPass, web.arg("web_pass").c_str(), sizeof n.webPass);
   const char *ipError = ipFromArgs(n);
+  bool wifiChanged = strcmp(n.ssid, ncfg.ssid) || strcmp(n.pass, ncfg.pass) || ipCfgDiffers(n, ncfg);
+  bool mqttChanged = strcmp(n.mqttUri, ncfg.mqttUri) || strcmp(n.mqttUser, ncfg.mqttUser) || strcmp(n.mqttPass, ncfg.mqttPass);
   ncfg = n;
   bool ok = netCfgSave();
   if (pwChanged) {   // jelszócsere: a többi bejelentkezés érvénytelen, ez a böngésző új sütit kap
     tokenNew();
     setAuthCookie();
   }
-  netReconfig = true;
+  requestReconfig(wifiChanged, mqttChanged);
   slogc("Halozati beallitasok %s (weboldal): WiFi \"%s\", MQTT \"%s\", IP %s\n", ok ? "mentve" : "NEM mentve", ncfg.ssid,
         ncfg.mqttUri, ncfg.ip[0] ? ncfg.ip : "DHCP");
   char back[48], ipMsg[160];
@@ -1497,7 +1516,7 @@ void webConfig() {   // mentés NVS-be, majd élő újracsatlakozás (nincs újr
            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
            "<meta http-equiv=\"refresh\" content=\"10;url=%s\"></head>"
            "<body style=\"font-family:sans-serif;padding:16px\"><p>%s</p>%s%s<p><a href=\"%s\">Vissza</a></p></body></html>",
-           back, ok ? "Mentve. Újracsatlakozás…" : "HIBA: a mentés nem sikerült.", ipMsg,
+           back, !ok ? "HIBA: a mentés nem sikerült." : (wifiChanged ? "Mentve. Újracsatlakozás…" : "Mentve."), ipMsg,
            pwOk ? "" : "<p>A weboldal jelszó túl rövid (legalább 8 karakter), nem változott.</p>", back);
   web.send(200, "text/html; charset=utf-8", html);
 }
@@ -1749,17 +1768,20 @@ void netService() {
     netCfgClear();
     netCfgLoad();
     tokenNew();
-    netReconfig = true;
+    requestReconfig(true, true);
+    reconfAt = millis() - RECONF_DELAY_MS;   // nincs HTTP-válasz: azonnal
     slogc("Halozati beallitasok torolve\n");
   }
-  if (netReconfig) {   // új beállítások: MQTT és WiFi újraindítása (a relék nem érintettek)
-    netReconfig = false;
-    mqttStop();
+  if ((reconfWifi || reconfMqtt) && millis() - reconfAt >= RECONF_DELAY_MS) {   // csak ami változott; a relék nem érintettek
+    mqttStop();   // WiFi-váltásnál is: új kapcsolat kell
     mqttTried = false;
-    WiFi.disconnect();
-    staLastOk = millis();   // új időkeret a csatlakozásra
-    if (apOn) wifiMode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
-    staBegin();
+    if (reconfWifi) {
+      WiFi.disconnect();
+      staLastOk = millis();   // új időkeret a csatlakozásra
+      if (apOn) wifiMode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
+      staBegin();
+    }
+    reconfWifi = reconfMqtt = false;
   }
   mdnsService();
   if (!netStarted && ncfg.mqttUri[0] && WiFi.status() == WL_CONNECTED && (!mqttTried || millis() - mqttLastTry >= MQTT_RETRY_MS)) {

@@ -39,7 +39,7 @@ enum ClientError: LocalizedError {
         switch self {
         case .noHost: "Nincs kiválasztott eszköz (fogaskerék ikon)."
         case .unauthorized: "Hibás jelszó."
-        case .badResponse(let code): "Váratlan válasz az eszköztől (HTTP \(code))."
+        case .badResponse(let code): code == 200 ? "Hibás állapotválasz az eszköztől." : "Váratlan válasz az eszköztől (HTTP \(code))."
         case .unreachable(let host): "Az eszköz nem érhető el: \(host)"
         }
     }
@@ -54,6 +54,7 @@ final class ErositoClient {
     private(set) var lastError: String?
     private(set) var busy = false
     private var pollTask: Task<Void, Never>?
+    private var quietUntil = Date.distantPast   // IP-váltás után az ESP pár másodpercig nem érhető el: ezt nem jelezzük hibaként
 
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
@@ -98,9 +99,12 @@ final class ErositoClient {
             let data = try await request("/api/status", body: nil)
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
-            status = try decoder.decode(AmpStatus.self, from: data)
+            let decoded = try decoder.decode(AmpStatus.self, from: data)
+            guard decoded.power != nil else { throw ClientError.badResponse(200) }   // üres / sérült válasz ne látsszon "Kikapcsolva"-nak
+            status = decoded
             lastError = nil
         } catch {
+            if Date() < quietUntil { return }
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
@@ -127,8 +131,9 @@ final class ErositoClient {
             let data = try await request("/api/netip", body: form.percentEncodedQuery ?? "")
             struct Reply: Decodable { let ok: Bool; let mode: String; let ip: String; let error: String }
             let reply = try JSONDecoder().decode(Reply.self, from: data)
+            quietUntil = Date().addingTimeInterval(15)   // az ESP ~1,5 s múlva bont, majd újracsatlakozik
             if reply.mode == "fix", !reply.ip.isEmpty {
-                configure(host: reply.ip, password: password)   // az ESP pár másodperc múlva az új címen érhető el
+                configure(host: reply.ip, password: password)
                 return "Mentve: fix IP \(reply.ip). Az app erre a címre váltott."
             }
             if !reply.error.isEmpty { return "Hibás beállítás (\(reply.error)): az erősítő DHCP-t használ. Keresd meg újra." }
