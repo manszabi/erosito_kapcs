@@ -115,7 +115,7 @@ Ki- és bekapcsolható a program elején: `#define HOME_ASSISTANT true` / `false
 - **AP mód:** ha 30 s alatt nem sikerül csatlakozni (vagy nincs beállítás), saját WiFi indul:
   - hálózat: `Erosito-XXXX`, jelszó: `erosito123` (vagy a `secrets.h`-ban megadott `AP_PASS`);
   - weboldal: `http://192.168.4.1` (a telefon általában magától megnyitja).
-- Az AP alatt a program 30 s-onként újrapróbálja a routert (ha épp nincs kliens az AP-n), így áramszünet után, amikor a router lassabban indul, magától csatlakozik. Csatlakozás után az AP 1 perccel később leáll.
+- Az AP alatt a program 30 s-onként újrapróbálja a routert (ha kliens van az AP-n, 5 percenként), így áramszünet után, amikor a router lassabban indul, magától csatlakozik. Csatlakozás után az AP leáll, amint 1 percig nincs rajta kliens.
 - A beállítások mentése **nem indítja újra** az ESP-t (a relék nem engednek el): a program élőben csatlakozik újra.
 
 ### Weboldal
@@ -154,7 +154,9 @@ A program hónapokig, évekig megszakítás nélkül futhat:
 
 - minden időzítés kezdőidő + időtartam alapú, így a `millis()` 49,7 naponkénti túlcsordulása nem okoz hibát;
 - a vezérlés futás közben nem foglal dinamikus memóriát (a WiFi- és MQTT-könyvtár a saját taskjában igen, a vezérléstől függetlenül);
-- az NVS-be csak eseménykor és bekapcsolva óránként ír, ami a flash élettartamához képest elhanyagolható.
+- az NVS-be csak eseménykor és bekapcsolva óránként ír, ami a flash élettartamához képest elhanyagolható;
+- a szabad és a valaha mért legkisebb szabad memória látszik a `h` parancsnál, a weboldalon és a Home Assistantben; 20 kB alatt figyelmeztetés jön;
+- a futásidő és az események életkora 64 bites órával számol; a Home Assistant csomag a 10 percnél régebbi eseményt (pl. hosszú MQTT-kimaradás után) nem elemzi.
 
 ## Fordítás
 
