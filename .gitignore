@@ -1,1 +1,6 @@
 secrets.h
+ios/Erosito.xcodeproj/
+ios/Info.plist
+ios/build/
+ios/Payload/
+ios/*.ipa
