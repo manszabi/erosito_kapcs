@@ -6,3 +6,8 @@
 #define MQTT_USER "mqtt_felhasznalo"
 #define MQTT_PASS "mqtt_jelszo"
 #define AP_PASS   "erosito123"                 // AP jelszó és a weboldal alapjelszava (legalább 8 karakter)
+// Fix IP (nem kötelező; ha nincs megadva vagy hibás: DHCP). A weboldalon / iOS-appban mentett érték felülírja.
+// #define STATIC_IP   "192.168.1.50"
+// #define STATIC_GW   "192.168.1.1"
+// #define STATIC_MASK "255.255.255.0"   // üres: 255.255.255.0
+// #define STATIC_DNS  ""                // üres: az átjáró

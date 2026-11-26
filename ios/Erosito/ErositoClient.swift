@@ -21,6 +21,12 @@ struct AmpStatus: Decodable, Sendable {
     var ip: String?
     var mqtt: String?
     var board: String?
+    var ipMode: String?
+    var ipError: String?
+    var cfgIp: String?
+    var cfgGw: String?
+    var cfgMask: String?
+    var cfgDns: String?
 
     var isOn: Bool { power == "ON" }
     var triggerEnabled: Bool { trigEnabled ?? false }
@@ -107,6 +113,29 @@ final class ErositoClient {
     /// Trigger figyelés be / ki (az ESP elmenti)
     func setTrigger(_ enabled: Bool) async {
         await send("/api/trigger", body: enabled ? "enabled=1" : "enabled=0")
+    }
+
+    /// Az erősítő IP-címe: fix (ip + átjáró, maszk és DNS opcionális) vagy üres IP-vel DHCP.
+    /// Hibás beállításnál az ESP DHCP-t használ. Siker esetén az app az új címre vált.
+    func setNetworkIP(ip: String, gateway: String, mask: String, dns: String) async -> String {
+        var form = URLComponents()
+        form.queryItems = [URLQueryItem(name: "ip", value: ip), URLQueryItem(name: "gw", value: gateway),
+                           URLQueryItem(name: "mask", value: mask), URLQueryItem(name: "dns", value: dns)]
+        busy = true
+        defer { busy = false }
+        do {
+            let data = try await request("/api/netip", body: form.percentEncodedQuery ?? "")
+            struct Reply: Decodable { let ok: Bool; let mode: String; let ip: String; let error: String }
+            let reply = try JSONDecoder().decode(Reply.self, from: data)
+            if reply.mode == "fix", !reply.ip.isEmpty {
+                configure(host: reply.ip, password: password)   // az ESP pár másodperc múlva az új címen érhető el
+                return "Mentve: fix IP \(reply.ip). Az app erre a címre váltott."
+            }
+            if !reply.error.isEmpty { return "Hibás beállítás (\(reply.error)): az erősítő DHCP-t használ. Keresd meg újra." }
+            return "Mentve: DHCP. Az új címet a keresés találja meg."
+        } catch {
+            return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
     }
 
     private func send(_ path: String, body: String) async {

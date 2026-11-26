@@ -873,8 +873,20 @@ void holdButton(unsigned long now, bool changed) {   // áramszünet utáni vár
 #define AP_PASS "erosito123"   // AP jelszó és a weboldal alapjelszava (legalább 8 karakter)
 #endif
 static_assert(sizeof(AP_PASS) - 1 >= 8 && sizeof(AP_PASS) - 1 <= 32, "AP_PASS: 8-32 karakter kell (WPA2)");
+#ifndef STATIC_IP
+#define STATIC_IP ""   // üres: DHCP
+#endif
+#ifndef STATIC_GW
+#define STATIC_GW ""
+#endif
+#ifndef STATIC_MASK
+#define STATIC_MASK ""   // üres: 255.255.255.0
+#endif
+#ifndef STATIC_DNS
+#define STATIC_DNS ""    // üres: az átjáró
+#endif
 
-struct NetCfg { char ssid[33], pass[65], mqttUri[96], mqttUser[33], mqttPass[65], webPass[33]; };
+struct NetCfg { char ssid[33], pass[65], mqttUri[96], mqttUser[33], mqttPass[65], webPass[33], ip[16], gw[16], mask[16], dns[16]; };
 NetCfg ncfg;
 Preferences netPrefs;           // külön példány: a hálózati task használja
 struct NetEvt { char type[12]; char text[100]; int64_t t; };   // t: 64 bites óra (µs)
@@ -905,6 +917,75 @@ const char *T_CMD     = NET_ID "/power/set";
 const char *T_TRIGCMD = NET_ID "/trigger/set";
 const char *T_STATUS  = NET_ID "/status";
 
+// ---- Fix IP: ellenőrzés (hibás vagy üres beállításnál DHCP) ----
+// IPCFG_PURE_BEGIN
+bool ipParse(const char *s, uint32_t *out) {   // "a.b.c.d" -> 32 bites szám; üres vagy hibás: false
+  uint32_t v = 0;
+  for (int part = 0; part < 4; part++) {
+    if (*s < '0' || *s > '9') return false;
+    uint32_t x = 0;
+    int digits = 0;
+    while (*s >= '0' && *s <= '9') {
+      x = x * 10 + (uint32_t)(*s - '0');
+      if (++digits > 3 || x > 255) return false;
+      s++;
+    }
+    v = (v << 8) | x;
+    if (part < 3) {
+      if (*s != '.') return false;
+      s++;
+    }
+  }
+  if (*s) return false;
+  *out = v;
+  return true;
+}
+
+// nullptr = rendben (o[0..3]: IP, átjáró, maszk, DNS), egyébként a hiba oka
+const char *ipCheck(const char *ip, const char *gw, const char *mask, const char *dnsIp, uint32_t o[4]) {
+  uint32_t a, g, m, d;
+  if (!ipParse(ip, &a)) return "hibás IP-cím";
+  if (!ipParse(mask[0] ? mask : "255.255.255.0", &m)) return "hibás maszk";
+  uint32_t host = ~m;
+  if (m == 0 || (host & (host + 1)) != 0) return "a maszk nem összefüggő";
+  if (host < 3) return "túl kicsi alhálózat";
+  if ((a >> 24) == 0 || (a >> 24) == 127 || (a >> 24) >= 224) return "nem használható IP-cím";
+  if ((a & host) == 0 || (a & host) == host) return "az IP-cím hálózati vagy szórási cím";
+  if (!gw[0]) return "hiányzik az átjáró";
+  if (!ipParse(gw, &g)) return "hibás átjáró";
+  if ((g & m) != (a & m)) return "az átjáró nincs az IP-cím alhálózatában";
+  if (g == a) return "az átjáró nem lehet maga az eszköz";
+  if (dnsIp[0]) {
+    if (!ipParse(dnsIp, &d)) return "hibás DNS";
+  } else {
+    d = g;
+  }
+  o[0] = a; o[1] = g; o[2] = m; o[3] = d;
+  return nullptr;
+}
+// IPCFG_PURE_END
+
+int ipMode = 0;                  // 0 = DHCP, 1 = fix IP, 2 = hibás fix IP, ezért DHCP
+const char *ipErr = nullptr;
+
+IPAddress ipAddr(uint32_t v) { return IPAddress((v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF); }
+
+void ipApply() {   // WiFi.begin előtt: fix IP, vagy DHCP (üres / hibás beállításnál)
+  uint32_t o[4];
+  ipErr = ncfg.ip[0] ? ipCheck(ncfg.ip, ncfg.gw, ncfg.mask, ncfg.dns, o) : nullptr;
+  ipMode = !ncfg.ip[0] ? 0 : (ipErr ? 2 : 1);
+  if (ipMode == 1) {
+    WiFi.config(ipAddr(o[0]), ipAddr(o[1]), ipAddr(o[2]), ipAddr(o[3]));
+  } else {
+    WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));   // DHCP
+    if (ipMode == 2) slogc("Fix IP hibas (%s): DHCP\n", ipErr);
+  }
+}
+
+const char *ipModeName() {
+  return ipMode == 1 ? "fix" : ipMode == 2 ? "hibás fix IP, DHCP" : "DHCP";
+}
+
 // ---- Beállítások: NVS ("net"), ennek hiányában a secrets.h ----
 void netCfgLoad() {
   strlcpy(ncfg.ssid, WIFI_SSID, sizeof ncfg.ssid);
@@ -913,6 +994,10 @@ void netCfgLoad() {
   strlcpy(ncfg.mqttUser, MQTT_USER, sizeof ncfg.mqttUser);
   strlcpy(ncfg.mqttPass, MQTT_PASS, sizeof ncfg.mqttPass);
   strlcpy(ncfg.webPass, AP_PASS, sizeof ncfg.webPass);
+  strlcpy(ncfg.ip, STATIC_IP, sizeof ncfg.ip);
+  strlcpy(ncfg.gw, STATIC_GW, sizeof ncfg.gw);
+  strlcpy(ncfg.mask, STATIC_MASK, sizeof ncfg.mask);
+  strlcpy(ncfg.dns, STATIC_DNS, sizeof ncfg.dns);
   webToken[0] = 0;
   if (!netPrefs.begin("net", true)) return;   // nincs mentett beállítás
   if (netPrefs.isKey("token")) netPrefs.getString("token", webToken, sizeof webToken);
@@ -923,6 +1008,12 @@ void netCfgLoad() {
     netPrefs.getString("mqttUser", ncfg.mqttUser, sizeof ncfg.mqttUser);
     netPrefs.getString("mqttPass", ncfg.mqttPass, sizeof ncfg.mqttPass);
     netPrefs.getString("webPass", ncfg.webPass, sizeof ncfg.webPass);
+  }
+  if (netPrefs.isKey("ip")) {   // a fix IP külön is menthető (iOS-app)
+    netPrefs.getString("ip", ncfg.ip, sizeof ncfg.ip);
+    netPrefs.getString("gw", ncfg.gw, sizeof ncfg.gw);
+    netPrefs.getString("mask", ncfg.mask, sizeof ncfg.mask);
+    netPrefs.getString("dns", ncfg.dns, sizeof ncfg.dns);
   }
   netPrefs.end();
 }
@@ -935,6 +1026,10 @@ bool netCfgSave() {
   ok &= netPrefs.putString("mqttUser", ncfg.mqttUser) == strlen(ncfg.mqttUser);
   ok &= netPrefs.putString("mqttPass", ncfg.mqttPass) == strlen(ncfg.mqttPass);
   ok &= netPrefs.putString("webPass", ncfg.webPass) == strlen(ncfg.webPass);
+  ok &= netPrefs.putString("ip", ncfg.ip) == strlen(ncfg.ip);
+  ok &= netPrefs.putString("gw", ncfg.gw) == strlen(ncfg.gw);
+  ok &= netPrefs.putString("mask", ncfg.mask) == strlen(ncfg.mask);
+  ok &= netPrefs.putString("dns", ncfg.dns) == strlen(ncfg.dns);
   netPrefs.end();
   return ok;
 }
@@ -995,18 +1090,23 @@ void buildState(char *js, size_t len, bool forWeb) {
            (unsigned long)esp_get_minimum_free_heap_size());
   if (n < 0 || (size_t)n >= len) { strlcpy(js, "{}", len); return; }
   if (forWeb) {
-    char ss[70], mu[200], mus[70];
+    char ss[70], mu[200], mus[70], ci[34], cg[34], cm[34], cd[34];
+    jsonEsc(ci, sizeof ci, ncfg.ip);
+    jsonEsc(cg, sizeof cg, ncfg.gw);
+    jsonEsc(cm, sizeof cm, ncfg.mask);
+    jsonEsc(cd, sizeof cd, ncfg.dns);
     jsonEsc(ss, sizeof ss, ncfg.ssid);
     jsonEsc(mu, sizeof mu, ncfg.mqttUri);
     jsonEsc(mus, sizeof mus, ncfg.mqttUser);
     bool sta = WiFi.status() == WL_CONNECTED;
     n += snprintf(js + n, len - n,
                   ",\"wifi\":\"%s\",\"ip\":\"%s\",\"mdns\":\"%s\",\"mqtt\":\"%s\",\"uptime_h\":%lu,\"board\":\"" BOARD_NAME "\","
-                  "\"cfg_ssid\":\"%s\",\"cfg_mqtt_uri\":\"%s\",\"cfg_mqtt_user\":\"%s\"",
+                  "\"cfg_ssid\":\"%s\",\"cfg_mqtt_uri\":\"%s\",\"cfg_mqtt_user\":\"%s\",\"ip_mode\":\"%s\",\"ip_error\":\"%s\","
+                  "\"cfg_ip\":\"%s\",\"cfg_gw\":\"%s\",\"cfg_mask\":\"%s\",\"cfg_dns\":\"%s\"",
                   sta ? (apOn ? "csatlakozva + AP" : "csatlakozva") : (apOn ? "AP mód" : "nincs"),
                   sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"), mdnsName(),
                   !ncfg.mqttUri[0] ? "nincs beállítva" : (mqttUp ? "OK" : "nincs kapcsolat"),
-                  uptimeHours(), ss, mu, mus);
+                  uptimeHours(), ss, mu, mus, ipModeName(), ipErr ? ipErr : "", ci, cg, cm, cd);
     if (n < 0 || (size_t)n >= len - 1) { strlcpy(js, "{}", len); return; }
   }
   strlcat(js, "}", len);
@@ -1135,6 +1235,7 @@ void mqttService() {   // discovery, események, állapot
 // ---- WiFi: STA a beállítások szerint; sikertelenség esetén AP mód (közben újrapróbál) ----
 void staBegin() {
   if (!ncfg.ssid[0]) return;
+  ipApply();
   WiFi.begin(ncfg.ssid, ncfg.pass);
   WiFi.setTxPower(WIFI_TX_POWER);
   staLastBegin = millis();
@@ -1215,18 +1316,22 @@ label{display:block;margin-top:8px;font-size:.9em}input{width:100%;padding:7px;b
 <label>MQTT felhasználó<input name="mqtt_user" id="mus" maxlength="32"></label>
 <label>MQTT jelszó (üresen hagyva nem változik)<input name="mqtt_pass" type="password" maxlength="64"></label>
 <label>Weboldal jelszó (legalább 8 karakter; üresen hagyva nem változik)<input name="web_pass" type="password" maxlength="32"></label>
+<label>Fix IP-cím (üresen: DHCP, a router adja)<input name="ip" id="ip" maxlength="15" inputmode="decimal" placeholder="pl. 192.168.1.50"></label>
+<label>Átjáró (router címe)<input name="gw" id="gw" maxlength="15" inputmode="decimal" placeholder="pl. 192.168.1.1"></label>
+<label>Maszk (üresen: 255.255.255.0)<input name="mask" id="mask" maxlength="15" inputmode="decimal"></label>
+<label>DNS (üresen: az átjáró)<input name="dns" id="dns" maxlength="15" inputmode="decimal"></label>
 <button type="submit">Mentés</button></form></details></section><p><a href="/logout">Kijelentkezés</a></p>
 <script>
 let tr=false,cf=false;const $=i=>document.getElementById(i);
 const L={rl2:'NTC áthidalva (RL2)',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
 fault:'Hiba',warning:'Figyelmeztetés',on_hours:'Üzemidő (óra)',on_count:'Bekapcsolások',relay_count:'Relé kapcsolások',
-mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',
+mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',ip_mode:'IP mód',ip_error:'IP-hiba',
 rssi:'WiFi jel (dBm)',mdns:'mDNS',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',board:'Alaplap'};
 const V=x=>x===true?'igen':x===false?'nem':x==='ON'?'BE':x==='OFF'?'KI':x;
 async function upd(){try{const r=await fetch('/api/status');if(r.status==401){location='/login';return;}const s=await r.json();tr=s.trig_enabled;let h='';
-for(const k in L)if(k in s)h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
+for(const k in L)if(k in s&&s[k]!=='')h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
 $('t').innerHTML=h;const st=$('st');st.textContent=s.power=='ON'?'Bekapcsolva':'Kikapcsolva';st.className='st'+(s.power=='ON'?' on1':'');$('tb').textContent='Trigger figyelés: '+(tr?'BE – kikapcsolás':'KI – bekapcsolás');
-if(!cf){cf=true;$('ssid').value=s.cfg_ssid;$('mu').value=s.cfg_mqtt_uri;$('mus').value=s.cfg_mqtt_user;}}catch(e){}}
+if(!cf){cf=true;$('ssid').value=s.cfg_ssid;$('mu').value=s.cfg_mqtt_uri;$('mus').value=s.cfg_mqtt_user;$('ip').value=s.cfg_ip;$('gw').value=s.cfg_gw;$('mask').value=s.cfg_mask;$('dns').value=s.cfg_dns;}}catch(e){}}
 async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});if(r.status==401){location='/login';return;}setTimeout(upd,300);}
 upd();setInterval(upd,2000);
 </script></body></html>)HTML";
@@ -1328,6 +1433,38 @@ void webTrigger() {
   web.send(200, "text/plain", "OK");
 }
 
+// fix IP a kérés mezőiből (ip, gw, mask, dns): üres IP vagy hiba -> DHCP; nullptr = rendben, egyébként a hiba oka
+const char *ipFromArgs(NetCfg &n) {
+  uint32_t o[4];
+  String ip = web.arg("ip"), gw = web.arg("gw"), mask = web.arg("mask"), dnsIp = web.arg("dns");
+  ip.trim(); gw.trim(); mask.trim(); dnsIp.trim();
+  const char *err = ip.length() ? ipCheck(ip.c_str(), gw.c_str(), mask.c_str(), dnsIp.c_str(), o) : nullptr;
+  if (!ip.length() || err) {
+    n.ip[0] = n.gw[0] = n.mask[0] = n.dns[0] = 0;
+    return err;
+  }
+  char *dst[4] = {n.ip, n.gw, n.mask, n.dns};   // egységes alak (pl. 192.168.01.5 -> 192.168.1.5)
+  for (int i = 0; i < 4; i++)
+    snprintf(dst[i], sizeof n.ip, "%lu.%lu.%lu.%lu", (unsigned long)(o[i] >> 24), (unsigned long)((o[i] >> 16) & 0xFF),
+             (unsigned long)((o[i] >> 8) & 0xFF), (unsigned long)(o[i] & 0xFF));
+  if (!dnsIp.length()) n.dns[0] = 0;   // üres DNS: marad az átjáró (később is követi)
+  return nullptr;
+}
+
+void webNetIp() {   // iOS-app: fix IP vagy DHCP (JSON válasz); hibás beállításnál DHCP
+  if (!apiAuth()) return;
+  NetCfg n = ncfg;
+  const char *err = ipFromArgs(n);
+  ncfg = n;
+  bool ok = netCfgSave();
+  netReconfig = true;
+  slogc("IP beallitas (app): %s%s%s\n", ncfg.ip[0] ? ncfg.ip : "DHCP", err ? ", hiba: " : "", err ? err : "");
+  char js[200];
+  snprintf(js, sizeof js, "{\"ok\":%s,\"mode\":\"%s\",\"ip\":\"%s\",\"error\":\"%s\"}", (ok && !err) ? "true" : "false",
+           ncfg.ip[0] ? "fix" : "dhcp", ncfg.ip, err ? err : (ok ? "" : "a mentés nem sikerült"));
+  web.send(200, "application/json; charset=utf-8", js);
+}
+
 void webConfig() {   // mentés NVS-be, majd élő újracsatlakozás (nincs újraindítás: a relék nem engednek el)
   if (!pageAuth()) return;
   NetCfg n = ncfg;
@@ -1339,6 +1476,7 @@ void webConfig() {   // mentés NVS-be, majd élő újracsatlakozás (nincs újr
   bool pwOk = web.arg("web_pass").length() == 0 || web.arg("web_pass").length() >= 8;
   bool pwChanged = pwOk && web.arg("web_pass").length() && strcmp(web.arg("web_pass").c_str(), ncfg.webPass) != 0;
   if (pwChanged) strlcpy(n.webPass, web.arg("web_pass").c_str(), sizeof n.webPass);
+  const char *ipError = ipFromArgs(n);
   ncfg = n;
   bool ok = netCfgSave();
   if (pwChanged) {   // jelszócsere: a többi bejelentkezés érvénytelen, ez a böngésző új sütit kap
@@ -1346,13 +1484,21 @@ void webConfig() {   // mentés NVS-be, majd élő újracsatlakozás (nincs újr
     setAuthCookie();
   }
   netReconfig = true;
-  slogc("Halozati beallitasok %s (weboldal): WiFi \"%s\", MQTT \"%s\"\n", ok ? "mentve" : "NEM mentve", ncfg.ssid, ncfg.mqttUri);
-  char html[400];
+  slogc("Halozati beallitasok %s (weboldal): WiFi \"%s\", MQTT \"%s\", IP %s\n", ok ? "mentve" : "NEM mentve", ncfg.ssid,
+        ncfg.mqttUri, ncfg.ip[0] ? ncfg.ip : "DHCP");
+  char back[48], ipMsg[160];
+  if (ncfg.ip[0]) snprintf(back, sizeof back, "http://%s/", ncfg.ip);   // fix IP: az új címre irányít
+  else strlcpy(back, "/", sizeof back);
+  if (ipError) snprintf(ipMsg, sizeof ipMsg, "<p>Hibás fix IP-beállítás (%s): DHCP-t használ.</p>", ipError);
+  else if (ncfg.ip[0]) snprintf(ipMsg, sizeof ipMsg, "<p>Fix IP: <a href=\"%s\">%s</a></p>", back, ncfg.ip);
+  else strlcpy(ipMsg, "<p>IP-cím: DHCP (a router adja; elérhető: http://" NET_ID ".local)</p>", sizeof ipMsg);
+  char html[900];
   snprintf(html, sizeof html,
-           "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"8;url=/\"></head>"
-           "<body style=\"font-family:sans-serif\"><p>%s</p>%s<p><a href=\"/\">Vissza</a></p></body></html>",
-           ok ? "Mentve. Újracsatlakozás…" : "HIBA: a mentés nem sikerült.",
-           pwOk ? "" : "<p>A weboldal jelszó túl rövid (legalább 8 karakter), nem változott.</p>");
+           "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+           "<meta http-equiv=\"refresh\" content=\"10;url=%s\"></head>"
+           "<body style=\"font-family:sans-serif;padding:16px\"><p>%s</p>%s%s<p><a href=\"%s\">Vissza</a></p></body></html>",
+           back, ok ? "Mentve. Újracsatlakozás…" : "HIBA: a mentés nem sikerült.", ipMsg,
+           pwOk ? "" : "<p>A weboldal jelszó túl rövid (legalább 8 karakter), nem változott.</p>", back);
   web.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -1650,6 +1796,7 @@ void netInit() {   // beállítások betöltése, WiFi indítása, weboldal útv
   web.on("/api/power", HTTP_POST, webPower);
   web.on("/api/trigger", HTTP_POST, webTrigger);
   web.on("/api/config", HTTP_POST, webConfig);
+  web.on("/api/netip", HTTP_POST, webNetIp);
   web.onNotFound(webNotFound);
   web.begin();
   slogc("Halozat: %s\n", ncfg.ssid[0] ? "csatlakozas a mentett / secrets.h WiFi-hez" : "nincs WiFi beallitas, AP mod");

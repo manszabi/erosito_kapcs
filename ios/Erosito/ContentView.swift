@@ -79,12 +79,24 @@ struct ContentView: View {
     }
 }
 
+private func ipField(_ title: String, _ text: Binding<String>) -> some View {
+    TextField(title, text: text)
+        .keyboardType(.numbersAndPunctuation)
+        .textInputAutocapitalization(.never)
+        .autocorrectionDisabled()
+}
+
 struct SettingsView: View {
     @Environment(ErositoClient.self) private var client
     @Environment(Discovery.self) private var discovery
     @Environment(\.dismiss) private var dismiss
     @State private var host = ""
     @State private var password = ""
+    @State private var espIp = ""
+    @State private var espGw = ""
+    @State private var espMask = ""
+    @State private var espDns = ""
+    @State private var ipMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -125,6 +137,24 @@ struct SettingsView: View {
                 } footer: {
                     Text("Felhasználó: admin. Ugyanaz a jelszó, mint az erősítő weboldalán.")
                 }
+                Section {
+                    ipField("Fix IP-cím (üresen: DHCP)", $espIp)
+                    ipField("Átjáró (router)", $espGw)
+                    ipField("Maszk (üresen: 255.255.255.0)", $espMask)
+                    ipField("DNS (üresen: az átjáró)", $espDns)
+                    Button("Mentés az erősítőn") {
+                        Task {
+                            ipMessage = await client.setNetworkIP(ip: espIp, gateway: espGw, mask: espMask, dns: espDns)
+                            host = client.host
+                        }
+                    }
+                    .disabled(client.status == nil || client.busy)
+                    if let ipMessage { Text(ipMessage).font(.callout).foregroundStyle(.secondary) }
+                } header: {
+                    Text("Az erősítő IP-címe")
+                } footer: {
+                    Text("Jelenleg: \(client.status?.ipMode ?? "-"). Hibás beállításnál az erősítő DHCP-t használ. Az erősítő a mentés után pár másodpercre lecsatlakozik; a relék nem kapcsolnak.")
+                }
             }
             .navigationTitle("Eszköz")
             .toolbar {
@@ -142,6 +172,10 @@ struct SettingsView: View {
             .onAppear {
                 host = client.host
                 password = client.password
+                espIp = client.status?.cfgIp ?? ""
+                espGw = client.status?.cfgGw ?? ""
+                espMask = client.status?.cfgMask ?? ""
+                espDns = client.status?.cfgDns ?? ""
                 discovery.start()
             }
             .onDisappear { discovery.stop() }

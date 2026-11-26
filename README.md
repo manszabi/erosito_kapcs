@@ -118,6 +118,14 @@ Ki- és bekapcsolható a program elején: `#define HOME_ASSISTANT true` / `false
 - Az AP alatt a program 30 s-onként újrapróbálja a routert (ha kliens van az AP-n, 5 percenként), így áramszünet után, amikor a router lassabban indul, magától csatlakozik. Csatlakozás után az AP leáll, amint 1 percig nincs rajta kliens.
 - A beállítások mentése **nem indítja újra** az ESP-t (a relék nem engednek el): a program élőben csatlakozik újra.
 
+### Fix IP-cím
+
+- Megadható a `secrets.h`-ban (`STATIC_IP`, `STATIC_GW`, `STATIC_MASK`, `STATIC_DNS`), a weboldalon (AP módban is) és az iOS-appban; a mentett érték felülírja a `secrets.h`-t.
+- **Üres IP-cím: DHCP.** Hibás beállításnál (rossz formátum, az átjáró nincs az alhálózatban, hálózati / szórási cím, nem összefüggő maszk) is DHCP; az ok a soros naplóban és a weboldal „IP-hiba” sorában látszik.
+- Maszk üresen: 255.255.255.0; DNS üresen: az átjáró.
+- Mentés után az ESP újraindulás nélkül csatlakozik újra (a relék nem engednek el); a weboldal és az iOS-app az új címre vált.
+- A fix címet a router DHCP-tartományán kívül válaszd, hogy ne ütközzön más eszközzel.
+
 ### Weboldal
 
 Normál üzemben az ESP IP-címén vagy a `http://erosito.local` címen érhető el (a soros `s` parancs kiírja az IP-t és az mDNS állapotát). Ha a core-ban nincs `ESPmDNS` (pl. 4.0.0 / ESP-IDF 6), a program beépített mDNS-válaszolót használ. Felhasználó: `admin`, jelszó: alapból az AP jelszava, a weboldalon módosítható (legalább 8 karakter).
