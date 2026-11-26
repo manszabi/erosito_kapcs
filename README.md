@@ -133,7 +133,7 @@ A program hónapokig, évekig megszakítás nélkül futhat:
 
 ## Fordítás
 
-- Arduino-ESP32 core 3.x, alaplap: **XIAO_ESP32C3** vagy **XIAO_ESP32S3** (más alaplapra a program nem fordul le)
+- Arduino-ESP32 core 3.x vagy újabb (fejlesztve: **4.0.0 / ESP-IDF 6.1**), alaplap: **XIAO_ESP32C3** vagy **XIAO_ESP32S3** (más alaplapra a program nem fordul le)
 - Eszközök → **USB CDC On Boot: Enabled**
 - Soros napló 115200 baud. Az `s` parancs a hálózatfigyelő optó LOW mintaszámát is kiírja (bekapcsolt állapotban normálisan kb. 28–37).
 - `MAINS_CHECK = true`: optó nélkül állítsd `false`-ra.
