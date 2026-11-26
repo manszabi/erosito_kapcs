@@ -120,7 +120,7 @@ Ki- és bekapcsolható a program elején: `#define HOME_ASSISTANT true` / `false
 
 ### Weboldal
 
-Normál üzemben az ESP IP-címén vagy a `http://erosito.local` címen érhető el (a soros `s` parancs kiírja az IP-t). Felhasználó: `admin`, jelszó: alapból az AP jelszava, a weboldalon módosítható (legalább 8 karakter).
+Normál üzemben az ESP IP-címén vagy a `http://erosito.local` címen érhető el (a soros `s` parancs kiírja az IP-t és az mDNS állapotát). Ha a core-ban nincs `ESPmDNS` (pl. 4.0.0 / ESP-IDF 6), a program beépített mDNS-válaszolót használ. Felhasználó: `admin`, jelszó: alapból az AP jelszava, a weboldalon módosítható (legalább 8 karakter).
 
 - **Állapot** (2 s-onként frissül): be / ki, RL2, trigger, várakozás, hiba, figyelmeztetés, számlálók, optó, WiFi, IP, MQTT.
 - **Vezérlés:** Bekapcsolás / Kikapcsolás (ugyanazok a szabályok, mint a gombnál), Trigger figyelés be / ki (mentve, mint a két rövid gombnyomás).

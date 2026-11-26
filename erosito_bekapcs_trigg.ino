@@ -57,7 +57,7 @@ const UBaseType_t AUX_PRIO = 0;  // a vezérlés (1) alatt: C3-on a hálózat se
 #include <ESPmDNS.h>   // Bonjour: a telefonos app és a http://erosito.local így találja meg
 #define MDNS_ENABLED 1
 #else
-#warning "ESPmDNS nincs ebben a core-ban: erosito.local es a Bonjour kereses nem mukodik (az iOS-app IP-szkennelessel keres)"
+#include <lwip/sockets.h>   // ESPmDNS nélkül (pl. core 4.0 / IDF 6): beépített mDNS válaszoló
 #define MDNS_ENABLED 0
 #endif
 #define NET_ENABLED 1
@@ -887,10 +887,10 @@ volatile bool netNeedDisc = false;
 bool netStarted = false, apOn = false, netReconfig = false;
 unsigned long netLastState = 0, staLastOk = 0, staLastBegin = 0, apIdleSince = 0, mqttLastTry = 0, apLastTry = 0;
 bool mqttTried = false, apTried = false;
-int mdnsState = 0;               // 0 = még nem indult, 1 = működik, 2 = hiba (újrapróbálja), 3 = nincs a core-ban
+int mdnsState = 0;               // 0 = még nem indult, 1 = működik, 2 = hiba (újrapróbálja)
 unsigned long mdnsLastTry = 0;
 const char *mdnsName() {
-  return mdnsState == 1 ? "OK (" NET_ID ".local)" : mdnsState == 2 ? "hiba" : mdnsState == 3 ? "nincs a core-ban" : "nem indult";
+  return mdnsState == 1 ? "OK (" NET_ID ".local)" : mdnsState == 2 ? "hiba" : "nem indult";
 }
 
 void wifiMode(wifi_mode_t m) {   // energiatakarékos mód nélkül: megbízható mDNS (multicast) és gyors weboldal
@@ -1365,10 +1365,10 @@ void webNotFound() {   // AP módban minden ismeretlen cím a weboldalra irány�
   }
 }
 
-// ---- mDNS / Bonjour: "_erosito._tcp" szolgáltatás és erosito.local név (az első csatlakozáskor, utána magától követi) ----
+// ---- mDNS / Bonjour: erosito.local, "_erosito._tcp" és "_http._tcp" (ESPmDNS, vagy ha a core-ban nincs: saját válaszoló) ----
+#if MDNS_ENABLED
 void mdnsStart() {
   mdnsLastTry = millis();
-#if MDNS_ENABLED
   if (!MDNS.begin(NET_ID)) {
     mdnsState = 2;
     slogc("mDNS inditas sikertelen, ujraprobalas 60 s mulva\n");
@@ -1380,11 +1380,219 @@ void mdnsStart() {
   MDNS.addServiceTxt("erosito", "tcp", "board", BOARD_NAME);
   mdnsState = 1;
   slogc("mDNS: OK, http://" NET_ID ".local\n");
-#else
-  mdnsState = 3;
-  slogc("mDNS: nincs a core-ban (ESPmDNS), erosito.local nem mukodik; elerheto: http://%s\n", WiFi.localIP().toString().c_str());
-#endif
 }
+
+void mdnsService() {
+  if (WiFi.status() == WL_CONNECTED && (mdnsState == 0 || (mdnsState == 2 && millis() - mdnsLastTry >= 60000))) mdnsStart();
+}
+#else
+// ---- Saját mDNS válaszoló (RFC 6762): minden rá vonatkozó kérdésre a teljes rekordkészlettel válaszol ----
+// MDNS_PURE_BEGIN
+const char *MD_HOST = NET_ID ".local";
+const char *MD_SVC[2]  = {"_erosito._tcp.local", "_http._tcp.local"};
+const char *MD_INST[2] = {"Erosito._erosito._tcp.local", "Erosito._http._tcp.local"};
+const char *MD_TXT[2]  = {"board=" BOARD_NAME, "path=/"};
+const char *MD_ENUM = "_services._dns-sd._udp.local";
+
+int mdPutName(uint8_t *p, int pos, int cap, const char *dotted) {   // "a.b.c" -> DNS címkék
+  for (const char *s = dotted; *s;) {
+    const char *dot = strchr(s, '.');
+    int n = dot ? (int)(dot - s) : (int)strlen(s);
+    if (n == 0 || n > 63 || pos + n + 1 >= cap) return -1;
+    p[pos++] = (uint8_t)n;
+    memcpy(p + pos, s, n);
+    pos += n;
+    s += n;
+    if (*s == '.') s++;
+  }
+  if (pos >= cap) return -1;
+  p[pos++] = 0;
+  return pos;
+}
+
+int mdPutRec(uint8_t *p, int pos, int cap, const char *name, uint16_t type, bool unique, uint32_t ttl,
+             const uint8_t *rd, int rdLen) {
+  pos = mdPutName(p, pos, cap, name);
+  if (pos < 0 || pos + 10 + rdLen > cap) return -1;
+  uint16_t cls = unique ? 0x8001 : 0x0001;   // egyedi rekordnál cache-flush bit
+  p[pos++] = type >> 8; p[pos++] = type & 0xFF;
+  p[pos++] = cls >> 8;  p[pos++] = cls & 0xFF;
+  p[pos++] = ttl >> 24; p[pos++] = (ttl >> 16) & 0xFF; p[pos++] = (ttl >> 8) & 0xFF; p[pos++] = ttl & 0xFF;
+  p[pos++] = rdLen >> 8; p[pos++] = rdLen & 0xFF;
+  memcpy(p + pos, rd, rdLen);
+  return pos + rdLen;
+}
+
+int mdPutNameRec(uint8_t *p, int pos, int cap, const char *name, uint16_t type, bool unique, uint32_t ttl, const char *target) {
+  uint8_t rd[96];
+  int n = mdPutName(rd, 0, sizeof rd, target);
+  return n < 0 ? -1 : mdPutRec(p, pos, cap, name, type, unique, ttl, rd, n);
+}
+
+// teljes válasz: A, 2 x (PTR, SRV, TXT), 2 x szolgáltatás-felsorolás; legacy (nem 5353-as port): azonosító + kérdések vissza, rövid TTL
+int mdBuild(uint8_t *out, int cap, const uint8_t ip[4], const uint8_t *q, int qLen, int qCount, uint16_t id, bool legacy) {
+  if (cap < 12 + qLen) return -1;
+  memset(out, 0, 12);
+  out[0] = id >> 8; out[1] = id & 0xFF;
+  out[2] = 0x84;                       // válasz, hiteles
+  out[5] = legacy ? qCount : 0;
+  out[7] = 9;                          // válaszrekordok száma
+  int pos = 12;
+  if (legacy) { memcpy(out + pos, q, qLen); pos += qLen; }
+  uint32_t tHost = legacy ? 10 : 120, tSvc = legacy ? 10 : 4500;
+  bool uq = !legacy;                   // legacy válaszban nincs cache-flush bit (RFC 6762 6.7)
+  pos = mdPutRec(out, pos, cap, MD_HOST, 1, uq, tHost, ip, 4);
+  for (int i = 0; i < 2 && pos > 0; i++) {
+    pos = mdPutNameRec(out, pos, cap, MD_SVC[i], 12, false, tSvc, MD_INST[i]);
+    if (pos < 0) break;
+    uint8_t srv[96] = {0, 0, 0, 0, 0, 80};   // prioritás, súly, port 80
+    int n = mdPutName(srv, 6, sizeof srv, MD_HOST);
+    if (n < 0) return -1;
+    pos = mdPutRec(out, pos, cap, MD_INST[i], 33, uq, tHost, srv, n);
+    if (pos < 0) break;
+    uint8_t txt[64];
+    int tl = (int)strlen(MD_TXT[i]);
+    if (tl > 62) return -1;
+    txt[0] = (uint8_t)tl;
+    memcpy(txt + 1, MD_TXT[i], tl);
+    pos = mdPutRec(out, pos, cap, MD_INST[i], 16, uq, tSvc, txt, tl + 1);
+  }
+  for (int i = 0; i < 2 && pos > 0; i++) pos = mdPutNameRec(out, pos, cap, MD_ENUM, 12, false, tSvc, MD_SVC[i]);
+  return pos;
+}
+
+int mdReadName(const uint8_t *p, int len, int pos, char *out, int outCap) {   // tömörítést is kezel; a név utáni pozíció, -1 = hiba
+  int after = -1, o = 0, jumps = 0;
+  for (;;) {
+    if (pos >= len) return -1;
+    uint8_t n = p[pos];
+    if (n == 0) { pos++; break; }
+    if ((n & 0xC0) == 0xC0) {
+      if (pos + 1 >= len || ++jumps > 8) return -1;
+      if (after < 0) after = pos + 2;
+      pos = ((n & 0x3F) << 8) | p[pos + 1];
+      continue;
+    }
+    if (n > 63 || pos + 1 + n > len || o + n + 2 > outCap) return -1;
+    if (o) out[o++] = '.';
+    memcpy(out + o, p + pos + 1, n);
+    o += n;
+    pos += 1 + n;
+  }
+  out[o] = 0;
+  return after >= 0 ? after : pos;
+}
+
+bool mdIsOurs(const char *name) {
+  if (strcasecmp(name, MD_HOST) == 0 || strcasecmp(name, MD_ENUM) == 0) return true;
+  for (int i = 0; i < 2; i++)
+    if (strcasecmp(name, MD_SVC[i]) == 0 || strcasecmp(name, MD_INST[i]) == 0) return true;
+  return false;
+}
+
+// kérdés -> válasz hossza (0 = nem nekünk szól)
+int mdHandle(const uint8_t *q, int qLen, uint8_t *out, int cap, const uint8_t ip[4], bool legacy) {
+  if (qLen < 12 || (q[2] & 0x80)) return 0;   // csak kérdésre
+  int qd = (q[4] << 8) | q[5], pos = 12;
+  bool match = false;
+  char name[128];
+  for (int i = 0; i < qd && i < 16; i++) {
+    int np = mdReadName(q, qLen, pos, name, sizeof name);
+    if (np < 0 || np + 4 > qLen) return 0;
+    uint16_t type = (q[np] << 8) | q[np + 1];
+    pos = np + 4;
+    if (mdIsOurs(name) && (type == 1 || type == 12 || type == 16 || type == 33 || type == 255)) match = true;
+  }
+  if (!match) return 0;
+  int n = mdBuild(out, cap, ip, q + 12, pos - 12, qd, (q[0] << 8) | q[1], legacy);
+  return n > 0 ? n : 0;
+}
+// MDNS_PURE_END
+
+int mdSock = -1;
+uint8_t mdIp[4];
+uint8_t mdAnnounceLeft = 0;
+unsigned long mdAnnounceLast = 0;
+
+void mdClose() {
+  if (mdSock >= 0) { close(mdSock); mdSock = -1; }
+}
+
+bool mdOpen(const uint8_t ip[4]) {   // UDP 5353, csatlakozás a 224.0.0.251 csoporthoz a WiFi címén
+  mdClose();
+  int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (s < 0) return false;
+  int one = 1;
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  struct sockaddr_in a = {};
+  a.sin_family = AF_INET;
+  a.sin_port = htons(5353);
+  a.sin_addr.s_addr = htonl(INADDR_ANY);
+  struct ip_mreq m = {};
+  m.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+  memcpy(&m.imr_interface.s_addr, ip, 4);
+  struct in_addr ifa;
+  memcpy(&ifa.s_addr, ip, 4);
+  uint8_t ttl = 255;
+  if (bind(s, (struct sockaddr *)&a, sizeof a) < 0 ||
+      setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) < 0) {
+    close(s);
+    return false;
+  }
+  setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, &ifa, sizeof ifa);
+  setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof ttl);
+  mdSock = s;
+  memcpy(mdIp, ip, 4);
+  mdAnnounceLeft = 3;   // bejelentés 3-szor, 1 s-onként
+  mdAnnounceLast = millis() - 1000;
+  return true;
+}
+
+void mdSendMulticast(const uint8_t *b, int n) {
+  struct sockaddr_in d = {};
+  d.sin_family = AF_INET;
+  d.sin_port = htons(5353);
+  d.sin_addr.s_addr = inet_addr("224.0.0.251");
+  sendto(mdSock, b, n, 0, (struct sockaddr *)&d, sizeof d);
+}
+
+void mdnsService() {   // a hálózati taskból ~10 ms-onként: socket a WiFi címéhez, bejelentés, válaszok
+  if (WiFi.status() != WL_CONNECTED) {
+    mdClose();
+    if (mdnsState == 1) mdnsState = 0;
+    return;
+  }
+  IPAddress l = WiFi.localIP();
+  uint8_t ip[4] = {l[0], l[1], l[2], l[3]};
+  if (mdSock < 0 || memcmp(ip, mdIp, 4) != 0) {   // új csatlakozás vagy új IP: újra be kell lépni a csoportba
+    if (mdSock < 0 && mdnsState == 2 && millis() - mdnsLastTry < 60000) return;
+    mdnsLastTry = millis();
+    bool ok = mdOpen(ip);
+    mdnsState = ok ? 1 : 2;
+    if (ok) slogc("mDNS (beepitett): OK, http://" NET_ID ".local -> %u.%u.%u.%u\n", ip[0], ip[1], ip[2], ip[3]);
+    else slogc("mDNS (beepitett) inditas sikertelen, ujraprobalas 60 s mulva\n");
+    if (!ok) return;
+  }
+  static uint8_t in[512], out[600];
+  if (mdAnnounceLeft && millis() - mdAnnounceLast >= 1000) {
+    mdAnnounceLast = millis();
+    mdAnnounceLeft--;
+    int n = mdBuild(out, sizeof out, ip, nullptr, 0, 0, 0, false);
+    if (n > 0) mdSendMulticast(out, n);
+  }
+  for (int k = 0; k < 4; k++) {
+    struct sockaddr_in from;
+    socklen_t fl = sizeof from;
+    int n = recvfrom(mdSock, in, sizeof in, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+    if (n <= 0) break;
+    bool legacy = ntohs(from.sin_port) != 5353;   // egyszerű (nem mDNS) kérdező: közvetlen válasz
+    int r = mdHandle(in, n, out, sizeof out, ip, legacy);
+    if (r <= 0) continue;
+    if (legacy) sendto(mdSock, out, r, 0, (struct sockaddr *)&from, fl);
+    else mdSendMulticast(out, r);
+  }
+}
+#endif
 
 // ---- Hálózati task ----
 void netService() {
@@ -1407,7 +1615,7 @@ void netService() {
     if (apOn) wifiMode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
     staBegin();
   }
-  if (WiFi.status() == WL_CONNECTED && (mdnsState == 0 || (mdnsState == 2 && millis() - mdnsLastTry >= 60000))) mdnsStart();
+  mdnsService();
   if (!netStarted && ncfg.mqttUri[0] && WiFi.status() == WL_CONNECTED && (!mqttTried || millis() - mqttLastTry >= MQTT_RETRY_MS)) {
     mqttTried = true;
     mqttLastTry = millis();
