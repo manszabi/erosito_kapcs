@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdarg.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -64,6 +65,16 @@ const unsigned long MAINS_OFF_GRACE_MS = 1000; // kikapcsolás után ennyi ideig
 const unsigned long MAINS_LOSS_MS    = 25;     // bekapcsolva ennyi folyamatos HIGH = hálózatkiesés
 const unsigned long MAINS_GAP_MS     = 5;      // ennél hosszabb mintavételi szünet nem számít kiesésnek
 
+// ---- Állapotfigyelés (öregedés) ----
+const uint32_t      RELAY_LIFE       = 100000; // relé élettartam (kapcsolás), a gyártói adatlap szerint állítható
+const uint8_t       RELAY_WARN_PCT   = 80;     // figyelmeztetés ennyi %-nál
+const uint8_t       OPTO_DROP_PCT    = 25;     // figyelmeztetés: az opto átlaga ennyi %-kal az alapérték alatt
+const uint8_t       OPTO_MIN_AVG     = 15;     // figyelmeztetés: az opto átlaga ez alatt (a hibahatár MAINS_MIN_LOW)
+const uint8_t       OPTO_BASE_SESSIONS = 5;    // az első ennyi bekapcsolás átlaga lesz az alapérték
+const uint16_t      OPTO_MIN_WINDOWS = 250;    // egy bekapcsolás csak ennyi ablak (~10 s) felett számít
+const unsigned long STATS_SAVE_MS    = 3600000UL; // bekapcsolva óránként mentés
+
+static_assert(OPTO_MIN_AVG > MAINS_MIN_LOW, "OPTO_MIN_AVG > MAINS_MIN_LOW kell");
 static_assert(MAINS_LOSS_MS >= 20, "MAINS_LOSS_MS >= 20 ms kell (2 felperiodus)");
 static_assert(MAINS_GAP_MS < MAINS_LOSS_MS, "MAINS_GAP_MS < MAINS_LOSS_MS kell");
 static_assert(MAINS_FAULT_MS > MAINS_WIN_MS, "MAINS_FAULT_MS > MAINS_WIN_MS kell");
@@ -77,10 +88,13 @@ bool on = false;                // relék BE (RL1)
 bool rl2On = false;
 unsigned long onTime = 0;
 unsigned long rl2Time = 0;
+bool rl2Settled = false;        // az RL2 már legalább RL2_MIN_ON_MS-ig behúzva
 unsigned long offTime = 0;      // utolsó kikapcsolás (0 = boot)
+bool minOffActive = true;       // a minimális kikapcsolt idő fut (bootkor is)
 bool powerHold = false;         // áramszünet utáni várakozás
 bool holdBtnUsed = false;       // a várakozás alatt egy hosszú gombnyomás bekapcsolhat (csak egyszer)
-unsigned long powerHoldUntil = 0;
+unsigned long holdStart = 0;    // időzítések: kezdet + hossz (millis() túlcsordulás-biztos)
+unsigned long holdDur = 0;
 bool trigOff = false;           // trigger tiltva (NVS)
 bool faultActive = false;       // hibavillogás
 bool faultHold = false;         // bemenet-hibafigyelés szünetel a következő bekapcsolásig
@@ -88,14 +102,43 @@ unsigned long faultStart = 0;
 int lastFault = 0;
 int storedFault = 0;            // NVS-ben tárolt hiba
 bool lockoutPending = false;    // hiba utáni tiltás
-unsigned long lockoutUntil = 0;
+unsigned long lockoutStart = 0;
+unsigned long lockoutDur = 0;
 bool offPending = false;        // kikapcsolás az RL2 minimum idő után
 bool offByBtn = false;          // a függő kikapcsolást a gomb kérte
-unsigned long offAt = 0;
 bool onReqBtn = false;          // függő bekapcsolás: gomb (feltétel nélkül)
 bool onReqTrig = false;         // függő bekapcsolás: trigger (ha még aktív)
 const char *onReqSrc = "";
 volatile bool statusReq = false;
+volatile bool healthReq = false;    // 'h': állapotfigyelés kiírása
+volatile bool baseReq = false;      // 'B': új opto alapérték (optocsere után)
+volatile bool relayReq = false;     // 'R': relé számláló nullázása (relécsere után)
+volatile bool helpReq = false;      // bármely más karakter: parancslista
+
+// Állapotfigyelés: NVS-ben (blob), bekapcsoláskor, kikapcsoláskor és óránként mentve
+const uint32_t STATS_VER = 1;
+struct Stats {
+  uint32_t ver;
+  uint32_t onCount;       // bekapcsolások (RL1)
+  uint32_t rl2Count;      // RL2 behúzások
+  uint32_t relayCount;    // RL1 kapcsolások relécsere óta
+  uint32_t onSeconds;     // összes bekapcsolt idő
+  uint32_t mainsLoss;     // hálózatkiesések
+  uint32_t faults;        // egyéb hibák
+  uint32_t powerUps;      // áramszünet utáni indulások
+  float    optoAvg;       // opto LOW minta hosszú távú átlaga
+  float    optoBase;      // alapérték (új opto)
+  uint32_t optoBaseN;     // az alapértékbe számított bekapcsolások
+};
+Stats st = {};
+bool stDirty = false;
+bool stCounting = false;        // bekapcsolt idő számlálása fut
+unsigned long stAcctT = 0;
+unsigned long stAcctMs = 0;
+unsigned long stLastSave = 0;
+uint32_t sessSum = 0;           // aktuális bekapcsolás opto mintái
+uint32_t sessN = 0;
+float lastSessMean = 0;
 
 bool pressConsumed = false;
 unsigned long pressStart = 0;
@@ -120,6 +163,7 @@ unsigned long fbLastLow = 0;
 unsigned long fbLastSample = 0;
 unsigned long fbBadSince = 0;
 unsigned long fbCmdT = 0;       // utolsó relé-parancs
+bool          fbGraceOver = false; // letelt a kikapcsolás utáni türelmi idő
 
 Preferences prefs;
 
@@ -203,6 +247,10 @@ void logTask(void *) {
     while (Serial.available() > 0) {
       int c = Serial.read();
       if (c == 's' || c == 'S') statusReq = true;
+      else if (c == 'h' || c == 'H') healthReq = true;
+      else if (c == 'B') baseReq = true;
+      else if (c == 'R') relayReq = true;
+      else if (c > ' ') helpReq = true;
     }
   }
 }
@@ -247,6 +295,7 @@ void mainsCmd() {
   fbBad = false;
   fbConfirmed = false;
   fbCmdT = t;
+  fbGraceOver = false;
   fbLastLow = t;
 }
 
@@ -259,6 +308,7 @@ void mainsUpdate() {
     fbLastLow = now;
     if (fbLow < 255) fbLow++;
   }
+  if (!fbGraceOver && now - fbCmdT >= MAINS_OFF_GRACE_MS) fbGraceOver = true;
   if (now - fbWinStart < MAINS_WIN_MS) return;
   fbWinStart = now;
   bool present = (fbLow >= MAINS_MIN_LOW);
@@ -266,8 +316,9 @@ void mainsUpdate() {
   fbLow = 0;
   fbPresent = present;
   fbValid = true;
+  if (on && fbConfirmed && present) { sessSum += fbCount; sessN++; }
   bool mismatch = (present != on);
-  if (mismatch && !on && (now - fbCmdT) < MAINS_OFF_GRACE_MS) mismatch = false;
+  if (mismatch && !on && !fbGraceOver) mismatch = false;
   if (mismatch) {
     if (!fbBad) { fbBad = true; fbBadSince = now; }
   } else {
@@ -290,6 +341,85 @@ int mainsFault() {
   return F_NONE;
 }
 
+// ---- Állapotfigyelés ----
+void statsSave() {
+  if (!stDirty) return;
+  if (!prefs.begin("relay", false)) return;
+  if (prefs.putBytes("stats", &st, sizeof st) == sizeof st) stDirty = false;
+  prefs.end();
+  stLastSave = millis();
+}
+
+void statsAccount() {   // bekapcsolt idő hozzáadása
+  if (!stCounting) return;
+  unsigned long now = millis();
+  stAcctMs += now - stAcctT;
+  stAcctT = now;
+  if (stAcctMs >= 1000) { st.onSeconds += stAcctMs / 1000; stAcctMs %= 1000; stDirty = true; }
+}
+
+void statsFold() {   // a bekapcsolás opto átlagának beszámítása
+  if (sessN >= OPTO_MIN_WINDOWS) {
+    float m = (float)sessSum / sessN;
+    lastSessMean = m;
+    st.optoAvg = (st.optoAvg <= 0) ? m : (0.8f * st.optoAvg + 0.2f * m);
+    if (st.optoBaseN < OPTO_BASE_SESSIONS) {
+      st.optoBase = (st.optoBase * st.optoBaseN + m) / (st.optoBaseN + 1);
+      st.optoBaseN++;
+    }
+    stDirty = true;
+  }
+  sessSum = 0;
+  sessN = 0;
+}
+
+// figyelmeztetések szövege (üres = rendben)
+int statsWarnings(char *buf, size_t len) {
+  int n = 0;
+  buf[0] = 0;
+  if (st.relayCount >= (uint64_t)RELAY_LIFE * RELAY_WARN_PCT / 100) {
+    n++;
+    snprintf(buf + strlen(buf), len - strlen(buf), " rele kopik (%lu kapcsolas);", (unsigned long)st.relayCount);
+  }
+  if (MAINS_CHECK && st.optoAvg > 0) {
+    if (st.optoAvg < OPTO_MIN_AVG) {
+      n++;
+      snprintf(buf + strlen(buf), len - strlen(buf), " opto jele gyenge (%u);", (unsigned)(st.optoAvg + 0.5f));
+    } else if (st.optoBaseN >= OPTO_BASE_SESSIONS && st.optoAvg < st.optoBase * (100 - OPTO_DROP_PCT) / 100) {
+      n++;
+      snprintf(buf + strlen(buf), len - strlen(buf), " opto oregszik (%u%%-kal az alapertek alatt);",
+               (unsigned)(100 - st.optoAvg * 100 / st.optoBase + 0.5f));
+    }
+  }
+  return n;
+}
+
+void printHealth() {
+  statsAccount();
+  unsigned long h10 = st.onSeconds / 360;   // óra x10
+  slogc("ALLAPOTFIGYELES:\n");
+  slogc("  Uzemido: %lu,%lu ora, bekapcsolasok: %lu (RL2: %lu)\n", h10 / 10, h10 % 10,
+        (unsigned long)st.onCount, (unsigned long)st.rl2Count);
+  slogc("  Rele: %lu / %lu kapcsolas (%lu %%)\n", (unsigned long)st.relayCount, (unsigned long)RELAY_LIFE,
+        (unsigned long)((uint64_t)st.relayCount * 100 / RELAY_LIFE));
+  slogc("  Halozatkieses: %lu, hiba: %lu, aramszunet utani indulas: %lu\n", (unsigned long)st.mainsLoss,
+        (unsigned long)st.faults, (unsigned long)st.powerUps);
+  if (MAINS_CHECK) {
+    unsigned a = (unsigned)(st.optoAvg * 10 + 0.5f), b = (unsigned)(st.optoBase * 10 + 0.5f),
+             l = (unsigned)(lastSessMean * 10 + 0.5f);
+    if (st.optoBaseN == 0)
+      slogc("  Opto LOW minta: meg nincs adat (legalabb ~10 s bekapcsolas kell)\n");
+    else if (st.optoBaseN >= OPTO_BASE_SESSIONS)
+      slogc("  Opto LOW minta: atlag %u,%u, alapertek %u,%u, utolso %u,%u\n", a / 10, a % 10, b / 10, b % 10, l / 10, l % 10);
+    else
+      slogc("  Opto LOW minta: atlag %u,%u, alapertek: gyujtes (%lu / %u bekapcsolas)\n", a / 10, a % 10,
+            (unsigned long)st.optoBaseN, (unsigned)OPTO_BASE_SESSIONS);
+  }
+  char w[120];
+  if (statsWarnings(w, sizeof w)) slogc("  FIGYELMEZTETES:%s\n", w);
+  else slogc("  Allapot: rendben\n");
+}
+
 void setState(bool s, const char *src) {
   if (s == on) return;
   on = s;
@@ -303,15 +433,29 @@ void setState(bool s, const char *src) {
     ledBase = true;
     mainsCmd();
     slog("RL1 BE (%s), RL2 %lu ms mulva\n", src, RL2_DELAY_MS);
+    st.onCount++;
+    st.relayCount++;
+    stAcctT = onTime;
+    stCounting = true;
+    sessSum = 0;
+    sessN = 0;
+    stDirty = true;
+    statsSave();
   } else {
     digitalWrite(PIN_RL2, LOW);
     digitalWrite(PIN_RL1, LOW);
     rl2On = false;
+    rl2Settled = false;
     offTime = millis();
+    minOffActive = true;
     ledBase = false;
     ledFlashes = 0;
     mainsCmd();
     slog("RL1+RL2 KI (%s)\n", src);
+    statsAccount();
+    stCounting = false;
+    statsFold();
+    statsSave();
   }
 }
 
@@ -388,6 +532,9 @@ void saveFault(int f) {   // csak az ellenőrizhető hardverhibát mentjük (ber
 void startFault(int idx, int f) {
   onReqBtn = false;
   onReqTrig = false;
+  if (f == F_MAINSLOST) st.mainsLoss++;
+  else st.faults++;
+  stDirty = true;
   if (idx == IN_FB1) {   // hálózati hiba: relék azonnal KI
     bool retry = on && !offPending;
     setState(false, (f == F_MAINSLOST) ? "halozatkieses" : "halozati hiba");
@@ -423,6 +570,7 @@ void startFault(int idx, int f) {
 void endFault() {
   ledFaultBlink = false;
   setState(false, "hiba");
+  statsSave();
   ledBase = false;
   ledFlashes = 0;
   faultActive = false;
@@ -434,21 +582,29 @@ void endFault() {
   }
   faultHold = true;
   lockoutPending = true;
-  lockoutUntil = millis() + FAULT_LOCKOUT_MS;
+  lockoutStart = millis();
+  lockoutDur = FAULT_LOCKOUT_MS;
   slogc("Hiba vege: relek KI, %lu ms-ig nincs bekapcsolas\n", FAULT_LOCKOUT_MS);
 }
 
 // ---- Be / ki kérések ----
+unsigned long timeLeft(unsigned long start, unsigned long dur) {   // túlcsordulás-biztos hátralévő idő
+  unsigned long el = millis() - start;
+  return (el >= dur) ? 0 : (dur - el);
+}
+
 unsigned long minOffLeft() {
-  if (on) return 0;
-  unsigned long el = millis() - offTime;
-  return (el >= MIN_OFF_MS) ? 0 : (MIN_OFF_MS - el);
+  if (on || !minOffActive) return 0;
+  return timeLeft(offTime, MIN_OFF_MS);
+}
+
+unsigned long lockoutLeft() {
+  return lockoutPending ? timeLeft(lockoutStart, lockoutDur) : 0;
 }
 
 void requestOff(const char *src, bool byBtn) {   // az RL2 legalább RL2_MIN_ON_MS-ig behúzva marad
   if (!on) return;
-  unsigned long now = millis();
-  if (rl2On && (long)(now - rl2Time) >= (long)RL2_MIN_ON_MS) {
+  if (rl2Settled) {
     setState(false, src);
     return;
   }
@@ -456,8 +612,7 @@ void requestOff(const char *src, bool byBtn) {   // az RL2 legalább RL2_MIN_ON_
   if (offPending) return;
   offPending = true;
   if (rl2On) {
-    offAt = rl2Time + RL2_MIN_ON_MS;
-    slog("Kikapcsolas (%s) %lu ms mulva\n", src, offAt - now);
+    slog("Kikapcsolas (%s) %lu ms mulva\n", src, timeLeft(rl2Time, RL2_MIN_ON_MS));
   } else {
     slog("Kikapcsolas (%s) az RL2 utan %lu ms-mal\n", src, RL2_MIN_ON_MS);
   }
@@ -467,8 +622,8 @@ bool btnBusy() { return onReqBtn || (offPending && offByBtn); }   // függő gom
 
 void switchOn(const char *src, bool manual) {
   if (on || faultActive) return;
-  if (lockoutPending && (long)(millis() - lockoutUntil) < 0) {   // hiba utáni tiltás: a kérés elvész
-    slog("Bekapcsolas tiltva (%s): meg %lu ms\n", src, lockoutUntil - millis());
+  if (lockoutLeft() > 0) {   // hiba utáni tiltás: a kérés elvész
+    slog("Bekapcsolas tiltva (%s): meg %lu ms\n", src, lockoutLeft());
     return;
   }
   unsigned long left = minOffLeft();
@@ -483,7 +638,7 @@ void switchOn(const char *src, bool manual) {
     resyncInputs();
     faultHold = false;
   }
-  if (MAINS_CHECK && fbValid && fbPresent && (millis() - fbCmdT) >= MAINS_OFF_GRACE_MS) {
+  if (MAINS_CHECK && fbValid && fbPresent && fbGraceOver) {
     startFault(IN_FB1, F_MAINSOFF);
     return;
   }
@@ -521,7 +676,6 @@ void buttonLogic(bool changed) {
       pressStart = btn.t;
       pressConsumed = false;
     } else if (!pressConsumed) {
-      if (shortCount == 0 && burstTaint && (long)(pressStart - lastShortRel) > (long)DOUBLE_GAP_MS) burstTaint = false;
       shortCount++;
       lastShortRel = now;
       if (shortCount >= SHORT_FAULT_COUNT) {
@@ -546,14 +700,19 @@ void buttonLogic(bool changed) {
     if (burstTaint) burstTaint = false;
     else if (n == 2) toggleTrigOff();
   }
+  if (burstTaint && shortCount == 0 && btn.stable == HIGH && now - lastShortRel > DOUBLE_GAP_MS) burstTaint = false;   // új sorozat
+}
+
+void printHelp() {
+  slogc("Parancsok: s = allapot, h = allapotfigyeles, B = opto alapertek torles (optocsere), R = rele szamlalo nullazas (relecsere)\n");
 }
 
 void printStatus() {
   char lk[48] = "";
-  if (powerHold && (long)(powerHoldUntil - millis()) > 0)
-    snprintf(lk, sizeof lk, " [aramszunet utan: %lu s]", (powerHoldUntil - millis()) / 1000);
-  else if (lockoutPending && (long)(lockoutUntil - millis()) > 0)
-    snprintf(lk, sizeof lk, " [tiltas: %lu ms]", lockoutUntil - millis());
+  if (powerHold)
+    snprintf(lk, sizeof lk, " [aramszunet utan: %lu s]", timeLeft(holdStart, holdDur) / 1000);
+  else if (lockoutLeft() > 0)
+    snprintf(lk, sizeof lk, " [tiltas: %lu ms]", lockoutLeft());
   char rq[48] = "";
   if (onReqBtn || onReqTrig)
     snprintf(rq, sizeof rq, " [bekapcs. %s, %lu ms]", onReqBtn ? "gomb" : "trigger", minOffLeft());
@@ -565,6 +724,8 @@ void printStatus() {
     slogc("  RL1 kimenet: %s%s, LOW minta: %u (kuszob %u)\n",
           !fbValid ? "meres..." : (fbPresent ? "halozat VAN" : "halozat nincs"),
           fbBad ? " (ELTERES)" : "", (unsigned)fbCount, (unsigned)MAINS_MIN_LOW);
+  char w[120];
+  if (statsWarnings(w, sizeof w)) slogc("  FIGYELMEZTETES:%s ('h' = reszletek)\n", w);
 }
 
 const char *resetName(esp_reset_reason_t r) {
@@ -593,13 +754,17 @@ void setup() {
   digitalWrite(PIN_LED, LOW);
 
   Serial.begin(115200);
-  logQ = xQueueCreate(16, sizeof(LogMsg));
+  logQ = xQueueCreate(24, sizeof(LogMsg));   // boot üzenetekhez is elég; tele sornál az üzenet elvész, a vezérlés nem áll meg
   if (logQ) xTaskCreate(logTask, "slog", 4096, nullptr, 1, nullptr);
 
   bool nvsOk = prefs.begin("relay", false);
   if (nvsOk) {
     trigOff = prefs.getBool("trigOff", false);
     storedFault = prefs.getUChar("fault", 0);
+    if (prefs.getBytes("stats", &st, sizeof st) != sizeof st || st.ver != STATS_VER) {
+      memset(&st, 0, sizeof st);
+      st.ver = STATS_VER;
+    }
     prefs.end();
   }
   if (storedFault != F_NONE && storedFault != F_STUCK && storedFault != F_MAINSOFF) {   // régi / nem ellenőrizhető kód
@@ -612,7 +777,7 @@ void setup() {
   if (MAINS_CHECK) {
     pinMode(PIN_FB1, INPUT);   // külső 43k felhúzó
     mainsCmd();
-    fbCmdT -= MAINS_OFF_GRACE_MS;   // induláskor nincs türelmi idő
+    fbGraceOver = true;   // induláskor nincs türelmi idő
   }
   for (int i = 0; i < 50; i++) {
     mainsUpdate();
@@ -634,7 +799,8 @@ void setup() {
   unsigned long holdMs = powerLoss ? POWERUP_HOLD_MS : holdLoad();   // reset a várakozás alatt: folytatódik
   if (holdMs > 0) {
     powerHold = true;
-    powerHoldUntil = millis() + holdMs;
+    holdStart = millis();
+    holdDur = holdMs;
     holdSave(holdMs);
     lastHoldSave = millis();
   } else {
@@ -646,13 +812,20 @@ void setup() {
         trigOff ? "TILTVA" : "engedelyezve", MAINS_CHECK ? "BE" : "KI");
   if (!nvsOk) slogc("FIGYELEM: NVS hiba, alapertelmezett beallitasok\n");
   if (powerHold) slogc("Aramszunet utan: %lu s varakozas\n", holdMs / 1000);
+  if (powerLoss) { st.powerUps++; stDirty = true; statsSave(); }
+  printHelp();
+  {
+    char w[120];
+    if (statsWarnings(w, sizeof w)) slogc("FIGYELMEZTETES:%s ('h' = reszletek)\n", w);
+  }
 
   if (storedFault != F_NONE) {   // mentett hiba: a tiltás végén ellenőrzi az okot
     unsigned long wait = powerHold ? holdMs : FAULT_LOCKOUT_MS;
     lastFault = storedFault;
     faultHold = true;
     lockoutPending = true;
-    lockoutUntil = millis() + wait;
+    lockoutStart = millis();
+    lockoutDur = wait;
     slogc("Mentett hiba (%s): %lu ms mulva ellenorzes\n",
           storedFault == F_STUCK ? "beragadt gomb" : "halozat KI relenel", wait);
   } else if (!powerHold && !trigOff && trig.stable == LOW && (crashReset || TRIGGER_ON_BOOT)) {
@@ -667,6 +840,8 @@ void loop() {
   bool btnChanged  = updateInput(IN_BTN);
   bool trigChanged = updateInput(IN_TRIG);
   mainsUpdate();
+  if (rl2On && !rl2Settled && now - rl2Time >= RL2_MIN_ON_MS) rl2Settled = true;   // állapotok rögzítése: régi
+  if (minOffActive && !on && now - offTime >= MIN_OFF_MS) minOffActive = false;     // időbélyeg nem zavarhat be
 
   if (faultActive) {   // hibavillogás
     if (mainsLost()) {   // bemenet-hiba alatt (relék még BE) is azonnal KI
@@ -676,10 +851,10 @@ void loop() {
     if (btnChanged) lastShortRel = now;
     if (now - faultStart >= FAULT_BLINK_MS) endFault();
   } else if (powerHold) {   // áramszünet utáni várakozás: trigger hatástalan, a gomb egyszer bekapcsolhat
-    if ((long)(now - powerHoldUntil) < 0) {
+    if (timeLeft(holdStart, holdDur) > 0) {
       if (now - lastHoldSave >= 1000) {
         lastHoldSave = now;
-        holdSave(powerHoldUntil - now);
+        holdSave(timeLeft(holdStart, holdDur));
       }
       int mf = mainsFault();
       if (on && mf != F_NONE) startFault(IN_FB1, mf);
@@ -740,7 +915,7 @@ void loop() {
       else if (!trigOff && trig.stable == LOW) switchOn(src, false);
       else slog("Fuggo bekapcsolas elmarad: a trigger nem aktiv\n");
     }
-    if (!faultActive && lockoutPending && (long)(now - lockoutUntil) >= 0) {   // tiltás vége
+    if (!faultActive && lockoutPending && lockoutLeft() == 0) {   // tiltás vége
       lockoutPending = false;
       bool offMains = MAINS_CHECK && fbValid && fbPresent;
       if (btn.stable == LOW || btn.raw == LOW) {
@@ -760,20 +935,53 @@ void loop() {
   }
 
   // RL2: késleltetve, és csak ha az RL1 kimenetén már van hálózat
-  if (on && !rl2On && !faultActive && (!MAINS_CHECK || fbConfirmed) && (long)(now - onTime) >= (long)RL2_DELAY_MS) {
+  if (on && !rl2On && !faultActive && (!MAINS_CHECK || fbConfirmed) && now - onTime >= RL2_DELAY_MS) {
     digitalWrite(PIN_RL2, HIGH);
     rl2On = true;
     rl2Time = millis();
-    if (offPending) offAt = rl2Time + RL2_MIN_ON_MS;
+    rl2Settled = false;
+    st.rl2Count++;
+    stDirty = true;
     slog("RL2 BE\n");
   }
-  if (offPending && rl2On && !faultActive && (long)(now - offAt) >= 0) setState(false, "fuggo kikapcsolas");
+  if (offPending && rl2Settled && !faultActive) setState(false, "fuggo kikapcsolas");
 
   ledUpdate();
 
   if (statusReq) {
     statusReq = false;
     if (millis() - lastStatus >= STATUS_MIN_MS) { lastStatus = millis(); printStatus(); }
+  }
+  if (helpReq) {
+    helpReq = false;
+    if (millis() - lastStatus >= STATUS_MIN_MS) { lastStatus = millis(); printHelp(); }
+  }
+  if (healthReq) {
+    healthReq = false;
+    if (millis() - lastStatus >= STATUS_MIN_MS) { lastStatus = millis(); printHealth(); }
+  }
+  if (baseReq) {   // optocsere után: új alapérték az következő bekapcsolásokból
+    baseReq = false;
+    st.optoAvg = 0;
+    st.optoBase = 0;
+    st.optoBaseN = 0;
+    lastSessMean = 0;
+    stDirty = true;
+    statsSave();
+    slogc("Opto alapertek torolve: az kovetkezo %u bekapcsolasbol ujra kepzodik\n", (unsigned)OPTO_BASE_SESSIONS);
+  }
+  if (relayReq) {   // relécsere után
+    relayReq = false;
+    st.relayCount = 0;
+    stDirty = true;
+    statsSave();
+    slogc("Rele szamlalo nullazva\n");
+  }
+  if (on && now - stLastSave >= STATS_SAVE_MS) {   // bekapcsolva óránként
+    statsAccount();
+    statsFold();
+    statsSave();
+    stLastSave = now;
   }
   logWindow();
   delay(1);

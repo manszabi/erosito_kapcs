@@ -74,9 +74,43 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
   - A tiltás végén aktív triggerre bekapcsol.
   - A beragadt gombot és az összehegedt relét a program elmenti, és újraindítás után is ellenőrzi.
 
+## Állapotfigyelés
+
+A program az NVS-be menti (bekapcsoláskor, kikapcsoláskor és bekapcsolva óránként):
+
+- üzemidő, bekapcsolások száma, RL2 behúzások;
+- relé-kapcsolások száma a legutóbbi relécsere óta;
+- hálózatkiesések, hibák, áramszünet utáni indulások;
+- az optó LOW mintaszámának hosszú távú átlaga és alapértéke (az első 5, legalább 10 s-os bekapcsolás átlaga).
+
+**Figyelmeztetés** (indításkor és az `s` parancsnál is megjelenik):
+
+- **relé kopik:** a kapcsolások száma eléri a `RELAY_LIFE` (100 000) 80%-át;
+- **optó öregszik:** az átlag 25%-kal az alapérték alá esik;
+- **optó jele gyenge:** az átlag 15 alá esik (a hibahatár 8).
+
+**Soros parancsok** (indításkor a program kiírja őket, és bármely más karakterre is):
+
+| Parancs | Hatás |
+|---|---|
+| `s` | Állapot |
+| `h` | Állapotfigyelés részletesen |
+| `B` | Optócsere után: új alapérték a következő 5 bekapcsolásból |
+| `R` | Relécsere után: a relé-számláló nullázása |
+
+A soros kiírás külön taskban, nem blokkoló sorral működik: ha nincs csatlakoztatva gép, vagy a kimenet beragad, az üzenetek elvesznek, de a vezérlés nem áll meg, és nem okoz újraindulást.
+
+## Hosszú üzem
+
+A program hónapokig, évekig megszakítás nélkül futhat:
+
+- minden időzítés kezdőidő + időtartam alapú, így a `millis()` 49,7 naponkénti túlcsordulása nem okoz hibát;
+- futás közben nincs dinamikus memóriafoglalás, így a memória nem töredezik;
+- az NVS-be csak eseménykor és bekapcsolva óránként ír, ami a flash élettartamához képest elhanyagolható.
+
 ## Fordítás
 
 - Arduino-ESP32 core 3.x, alaplap: **XIAO_ESP32C3**
 - Eszközök → **USB CDC On Boot: Enabled**
-- Soros napló 115200 baud. Az `s` paranccsal kiírja az állapotot és a hálózatfigyelő optó LOW mintaszámát (bekapcsolt állapotban normálisan kb. 28–37).
+- Soros napló 115200 baud. Az `s` parancs a hálózatfigyelő optó LOW mintaszámát is kiírja (bekapcsolt állapotban normálisan kb. 28–37).
 - `MAINS_CHECK = true`: optó nélkül állítsd `false`-ra.
