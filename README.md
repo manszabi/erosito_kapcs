@@ -100,6 +100,14 @@ A program az NVS-be menti (bekapcsoláskor, kikapcsoláskor és bekapcsolva ór�
 
 A soros kiírás külön taskban, nem blokkoló sorral működik: ha nincs csatlakoztatva gép, vagy a kimenet beragad, az üzenetek elvesznek, de a vezérlés nem áll meg, és nem okoz újraindulást.
 
+## Hosszú üzem
+
+A program hónapokig, évekig megszakítás nélkül futhat:
+
+- minden időzítés kezdőidő + időtartam alapú, így a `millis()` 49,7 naponkénti túlcsordulása nem okoz hibát;
+- futás közben nincs dinamikus memóriafoglalás, így a memória nem töredezik;
+- az NVS-be csak eseménykor és bekapcsolva óránként ír, ami a flash élettartamához képest elhanyagolható.
+
 ## Fordítás
 
 - Arduino-ESP32 core 3.x, alaplap: **XIAO_ESP32C3**

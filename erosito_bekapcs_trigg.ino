@@ -88,10 +88,13 @@ bool on = false;                // relék BE (RL1)
 bool rl2On = false;
 unsigned long onTime = 0;
 unsigned long rl2Time = 0;
+bool rl2Settled = false;        // az RL2 már legalább RL2_MIN_ON_MS-ig behúzva
 unsigned long offTime = 0;      // utolsó kikapcsolás (0 = boot)
+bool minOffActive = true;       // a minimális kikapcsolt idő fut (bootkor is)
 bool powerHold = false;         // áramszünet utáni várakozás
 bool holdBtnUsed = false;       // a várakozás alatt egy hosszú gombnyomás bekapcsolhat (csak egyszer)
-unsigned long powerHoldUntil = 0;
+unsigned long holdStart = 0;    // időzítések: kezdet + hossz (millis() túlcsordulás-biztos)
+unsigned long holdDur = 0;
 bool trigOff = false;           // trigger tiltva (NVS)
 bool faultActive = false;       // hibavillogás
 bool faultHold = false;         // bemenet-hibafigyelés szünetel a következő bekapcsolásig
@@ -99,10 +102,10 @@ unsigned long faultStart = 0;
 int lastFault = 0;
 int storedFault = 0;            // NVS-ben tárolt hiba
 bool lockoutPending = false;    // hiba utáni tiltás
-unsigned long lockoutUntil = 0;
+unsigned long lockoutStart = 0;
+unsigned long lockoutDur = 0;
 bool offPending = false;        // kikapcsolás az RL2 minimum idő után
 bool offByBtn = false;          // a függő kikapcsolást a gomb kérte
-unsigned long offAt = 0;
 bool onReqBtn = false;          // függő bekapcsolás: gomb (feltétel nélkül)
 bool onReqTrig = false;         // függő bekapcsolás: trigger (ha még aktív)
 const char *onReqSrc = "";
@@ -160,6 +163,7 @@ unsigned long fbLastLow = 0;
 unsigned long fbLastSample = 0;
 unsigned long fbBadSince = 0;
 unsigned long fbCmdT = 0;       // utolsó relé-parancs
+bool          fbGraceOver = false; // letelt a kikapcsolás utáni türelmi idő
 
 Preferences prefs;
 
@@ -291,6 +295,7 @@ void mainsCmd() {
   fbBad = false;
   fbConfirmed = false;
   fbCmdT = t;
+  fbGraceOver = false;
   fbLastLow = t;
 }
 
@@ -303,6 +308,7 @@ void mainsUpdate() {
     fbLastLow = now;
     if (fbLow < 255) fbLow++;
   }
+  if (!fbGraceOver && now - fbCmdT >= MAINS_OFF_GRACE_MS) fbGraceOver = true;
   if (now - fbWinStart < MAINS_WIN_MS) return;
   fbWinStart = now;
   bool present = (fbLow >= MAINS_MIN_LOW);
@@ -312,7 +318,7 @@ void mainsUpdate() {
   fbValid = true;
   if (on && fbConfirmed && present) { sessSum += fbCount; sessN++; }
   bool mismatch = (present != on);
-  if (mismatch && !on && (now - fbCmdT) < MAINS_OFF_GRACE_MS) mismatch = false;
+  if (mismatch && !on && !fbGraceOver) mismatch = false;
   if (mismatch) {
     if (!fbBad) { fbBad = true; fbBadSince = now; }
   } else {
@@ -439,7 +445,9 @@ void setState(bool s, const char *src) {
     digitalWrite(PIN_RL2, LOW);
     digitalWrite(PIN_RL1, LOW);
     rl2On = false;
+    rl2Settled = false;
     offTime = millis();
+    minOffActive = true;
     ledBase = false;
     ledFlashes = 0;
     mainsCmd();
@@ -574,21 +582,29 @@ void endFault() {
   }
   faultHold = true;
   lockoutPending = true;
-  lockoutUntil = millis() + FAULT_LOCKOUT_MS;
+  lockoutStart = millis();
+  lockoutDur = FAULT_LOCKOUT_MS;
   slogc("Hiba vege: relek KI, %lu ms-ig nincs bekapcsolas\n", FAULT_LOCKOUT_MS);
 }
 
 // ---- Be / ki kérések ----
+unsigned long timeLeft(unsigned long start, unsigned long dur) {   // túlcsordulás-biztos hátralévő idő
+  unsigned long el = millis() - start;
+  return (el >= dur) ? 0 : (dur - el);
+}
+
 unsigned long minOffLeft() {
-  if (on) return 0;
-  unsigned long el = millis() - offTime;
-  return (el >= MIN_OFF_MS) ? 0 : (MIN_OFF_MS - el);
+  if (on || !minOffActive) return 0;
+  return timeLeft(offTime, MIN_OFF_MS);
+}
+
+unsigned long lockoutLeft() {
+  return lockoutPending ? timeLeft(lockoutStart, lockoutDur) : 0;
 }
 
 void requestOff(const char *src, bool byBtn) {   // az RL2 legalább RL2_MIN_ON_MS-ig behúzva marad
   if (!on) return;
-  unsigned long now = millis();
-  if (rl2On && (long)(now - rl2Time) >= (long)RL2_MIN_ON_MS) {
+  if (rl2Settled) {
     setState(false, src);
     return;
   }
@@ -596,8 +612,7 @@ void requestOff(const char *src, bool byBtn) {   // az RL2 legalább RL2_MIN_ON_
   if (offPending) return;
   offPending = true;
   if (rl2On) {
-    offAt = rl2Time + RL2_MIN_ON_MS;
-    slog("Kikapcsolas (%s) %lu ms mulva\n", src, offAt - now);
+    slog("Kikapcsolas (%s) %lu ms mulva\n", src, timeLeft(rl2Time, RL2_MIN_ON_MS));
   } else {
     slog("Kikapcsolas (%s) az RL2 utan %lu ms-mal\n", src, RL2_MIN_ON_MS);
   }
@@ -607,8 +622,8 @@ bool btnBusy() { return onReqBtn || (offPending && offByBtn); }   // függő gom
 
 void switchOn(const char *src, bool manual) {
   if (on || faultActive) return;
-  if (lockoutPending && (long)(millis() - lockoutUntil) < 0) {   // hiba utáni tiltás: a kérés elvész
-    slog("Bekapcsolas tiltva (%s): meg %lu ms\n", src, lockoutUntil - millis());
+  if (lockoutLeft() > 0) {   // hiba utáni tiltás: a kérés elvész
+    slog("Bekapcsolas tiltva (%s): meg %lu ms\n", src, lockoutLeft());
     return;
   }
   unsigned long left = minOffLeft();
@@ -623,7 +638,7 @@ void switchOn(const char *src, bool manual) {
     resyncInputs();
     faultHold = false;
   }
-  if (MAINS_CHECK && fbValid && fbPresent && (millis() - fbCmdT) >= MAINS_OFF_GRACE_MS) {
+  if (MAINS_CHECK && fbValid && fbPresent && fbGraceOver) {
     startFault(IN_FB1, F_MAINSOFF);
     return;
   }
@@ -661,7 +676,6 @@ void buttonLogic(bool changed) {
       pressStart = btn.t;
       pressConsumed = false;
     } else if (!pressConsumed) {
-      if (shortCount == 0 && burstTaint && (long)(pressStart - lastShortRel) > (long)DOUBLE_GAP_MS) burstTaint = false;
       shortCount++;
       lastShortRel = now;
       if (shortCount >= SHORT_FAULT_COUNT) {
@@ -686,6 +700,7 @@ void buttonLogic(bool changed) {
     if (burstTaint) burstTaint = false;
     else if (n == 2) toggleTrigOff();
   }
+  if (burstTaint && shortCount == 0 && btn.stable == HIGH && now - lastShortRel > DOUBLE_GAP_MS) burstTaint = false;   // új sorozat
 }
 
 void printHelp() {
@@ -694,10 +709,10 @@ void printHelp() {
 
 void printStatus() {
   char lk[48] = "";
-  if (powerHold && (long)(powerHoldUntil - millis()) > 0)
-    snprintf(lk, sizeof lk, " [aramszunet utan: %lu s]", (powerHoldUntil - millis()) / 1000);
-  else if (lockoutPending && (long)(lockoutUntil - millis()) > 0)
-    snprintf(lk, sizeof lk, " [tiltas: %lu ms]", lockoutUntil - millis());
+  if (powerHold)
+    snprintf(lk, sizeof lk, " [aramszunet utan: %lu s]", timeLeft(holdStart, holdDur) / 1000);
+  else if (lockoutLeft() > 0)
+    snprintf(lk, sizeof lk, " [tiltas: %lu ms]", lockoutLeft());
   char rq[48] = "";
   if (onReqBtn || onReqTrig)
     snprintf(rq, sizeof rq, " [bekapcs. %s, %lu ms]", onReqBtn ? "gomb" : "trigger", minOffLeft());
@@ -762,7 +777,7 @@ void setup() {
   if (MAINS_CHECK) {
     pinMode(PIN_FB1, INPUT);   // külső 43k felhúzó
     mainsCmd();
-    fbCmdT -= MAINS_OFF_GRACE_MS;   // induláskor nincs türelmi idő
+    fbGraceOver = true;   // induláskor nincs türelmi idő
   }
   for (int i = 0; i < 50; i++) {
     mainsUpdate();
@@ -784,7 +799,8 @@ void setup() {
   unsigned long holdMs = powerLoss ? POWERUP_HOLD_MS : holdLoad();   // reset a várakozás alatt: folytatódik
   if (holdMs > 0) {
     powerHold = true;
-    powerHoldUntil = millis() + holdMs;
+    holdStart = millis();
+    holdDur = holdMs;
     holdSave(holdMs);
     lastHoldSave = millis();
   } else {
@@ -808,7 +824,8 @@ void setup() {
     lastFault = storedFault;
     faultHold = true;
     lockoutPending = true;
-    lockoutUntil = millis() + wait;
+    lockoutStart = millis();
+    lockoutDur = wait;
     slogc("Mentett hiba (%s): %lu ms mulva ellenorzes\n",
           storedFault == F_STUCK ? "beragadt gomb" : "halozat KI relenel", wait);
   } else if (!powerHold && !trigOff && trig.stable == LOW && (crashReset || TRIGGER_ON_BOOT)) {
@@ -823,6 +840,8 @@ void loop() {
   bool btnChanged  = updateInput(IN_BTN);
   bool trigChanged = updateInput(IN_TRIG);
   mainsUpdate();
+  if (rl2On && !rl2Settled && now - rl2Time >= RL2_MIN_ON_MS) rl2Settled = true;   // állapotok rögzítése: régi
+  if (minOffActive && !on && now - offTime >= MIN_OFF_MS) minOffActive = false;     // időbélyeg nem zavarhat be
 
   if (faultActive) {   // hibavillogás
     if (mainsLost()) {   // bemenet-hiba alatt (relék még BE) is azonnal KI
@@ -832,10 +851,10 @@ void loop() {
     if (btnChanged) lastShortRel = now;
     if (now - faultStart >= FAULT_BLINK_MS) endFault();
   } else if (powerHold) {   // áramszünet utáni várakozás: trigger hatástalan, a gomb egyszer bekapcsolhat
-    if ((long)(now - powerHoldUntil) < 0) {
+    if (timeLeft(holdStart, holdDur) > 0) {
       if (now - lastHoldSave >= 1000) {
         lastHoldSave = now;
-        holdSave(powerHoldUntil - now);
+        holdSave(timeLeft(holdStart, holdDur));
       }
       int mf = mainsFault();
       if (on && mf != F_NONE) startFault(IN_FB1, mf);
@@ -896,7 +915,7 @@ void loop() {
       else if (!trigOff && trig.stable == LOW) switchOn(src, false);
       else slog("Fuggo bekapcsolas elmarad: a trigger nem aktiv\n");
     }
-    if (!faultActive && lockoutPending && (long)(now - lockoutUntil) >= 0) {   // tiltás vége
+    if (!faultActive && lockoutPending && lockoutLeft() == 0) {   // tiltás vége
       lockoutPending = false;
       bool offMains = MAINS_CHECK && fbValid && fbPresent;
       if (btn.stable == LOW || btn.raw == LOW) {
@@ -916,16 +935,16 @@ void loop() {
   }
 
   // RL2: késleltetve, és csak ha az RL1 kimenetén már van hálózat
-  if (on && !rl2On && !faultActive && (!MAINS_CHECK || fbConfirmed) && (long)(now - onTime) >= (long)RL2_DELAY_MS) {
+  if (on && !rl2On && !faultActive && (!MAINS_CHECK || fbConfirmed) && now - onTime >= RL2_DELAY_MS) {
     digitalWrite(PIN_RL2, HIGH);
     rl2On = true;
     rl2Time = millis();
+    rl2Settled = false;
     st.rl2Count++;
     stDirty = true;
-    if (offPending) offAt = rl2Time + RL2_MIN_ON_MS;
     slog("RL2 BE\n");
   }
-  if (offPending && rl2On && !faultActive && (long)(now - offAt) >= 0) setState(false, "fuggo kikapcsolas");
+  if (offPending && rl2Settled && !faultActive) setState(false, "fuggo kikapcsolas");
 
   ledUpdate();
 
