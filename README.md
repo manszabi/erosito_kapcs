@@ -44,7 +44,7 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
   - gyors villogás = hiba;
   - 3 s-onként felvillan = áramszünet utáni várakozás;
   - 2 villanás = a trigger tiltva (kézi bekapcsoláskor és tiltáskor);
-  - 3 villanás = a trigger engedélyezve.
+  - 4 villanás = a trigger engedélyezve.
 
 ## Időzítések
 

@@ -499,7 +499,7 @@ void toggleTrigOff() {
     saved = prefs.putBool("trigOff", trigOff) > 0;
     prefs.end();
   }
-  ledFlash(trigOff ? 2 : 3);
+  ledFlash(trigOff ? 2 : 4);   // tiltva: 2, engedélyezve: 4 villanás
   slogc("TRIGGER %s%s\n", trigOff ? "TILTVA" : "ENGEDELYEZVE", saved ? "" : " (FIGYELEM: NVS mentes sikertelen)");
 }
 
