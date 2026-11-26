@@ -49,6 +49,16 @@ const UBaseType_t AUX_PRIO = 0;  // a vezérlés (1) alatt: C3-on a hálózat se
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <mqtt_client.h>
+#if __has_include(<esp_random.h>)
+#include <esp_random.h>
+#endif
+#include "icon_png.h"   // a weboldal ikonja (tools/make_icon.py)
+#if __has_include(<ESPmDNS.h>)
+#include <ESPmDNS.h>   // Bonjour: a telefonos app és a http://erosito.local így találja meg
+#define MDNS_ENABLED 1
+#else
+#define MDNS_ENABLED 0
+#endif
 #define NET_ENABLED 1
 #else
 #define NET_ENABLED 0
@@ -875,8 +885,9 @@ volatile bool mqttUp = false;
 volatile bool netNeedDisc = false;
 bool netStarted = false, apOn = false, netReconfig = false;
 unsigned long netLastState = 0, staLastOk = 0, staLastBegin = 0, apIdleSince = 0, mqttLastTry = 0, apLastTry = 0;
-bool mqttTried = false, apTried = false;
+bool mqttTried = false, apTried = false, mdnsStarted = false;
 char apSsid[24];
+char webToken[33];             // bejelentkezési süti (NVS-ben: áramszünet után is érvényes; jelszócserekor új)
 const char *T_STATE   = NET_ID "/state";
 const char *T_EVENT   = NET_ID "/event";
 const char *T_CMD     = NET_ID "/power/set";
@@ -891,7 +902,9 @@ void netCfgLoad() {
   strlcpy(ncfg.mqttUser, MQTT_USER, sizeof ncfg.mqttUser);
   strlcpy(ncfg.mqttPass, MQTT_PASS, sizeof ncfg.mqttPass);
   strlcpy(ncfg.webPass, AP_PASS, sizeof ncfg.webPass);
+  webToken[0] = 0;
   if (!netPrefs.begin("net", true)) return;   // nincs mentett beállítás
+  if (netPrefs.isKey("token")) netPrefs.getString("token", webToken, sizeof webToken);
   if (netPrefs.isKey("ssid")) {
     netPrefs.getString("ssid", ncfg.ssid, sizeof ncfg.ssid);
     netPrefs.getString("pass", ncfg.pass, sizeof ncfg.pass);
@@ -913,6 +926,15 @@ bool netCfgSave() {
   ok &= netPrefs.putString("webPass", ncfg.webPass) == strlen(ncfg.webPass);
   netPrefs.end();
   return ok;
+}
+
+void tokenNew() {   // új bejelentkezési süti: a régiek érvénytelenek (a WiFi indulása után: valódi véletlenszám)
+  snprintf(webToken, sizeof webToken, "%08lx%08lx%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random(),
+           (unsigned long)esp_random(), (unsigned long)esp_random());
+  if (netPrefs.begin("net", false)) {
+    netPrefs.putString("token", webToken);
+    netPrefs.end();
+  }
 }
 
 void netCfgClear() {
@@ -1150,75 +1172,149 @@ void wifiService() {
 }
 
 // ---- Weboldal (jelszóval: admin / webPass) ----
-const char PAGE[] = R"HTML(<!DOCTYPE html><html lang="hu"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Erősítő</title><style>
-body{font-family:sans-serif;max-width:560px;margin:auto;padding:12px;background:#f2f2f2;color:#222}
+#define PAGE_HEAD R"HTML(<!DOCTYPE html><html lang="hu"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Erősítő"><meta name="theme-color" content="#263238">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png"><link rel="icon" href="/apple-touch-icon.png"><link rel="manifest" href="/manifest.json">
+<title>Erősítő</title><style>
+body{font-family:-apple-system,system-ui,sans-serif;max-width:560px;margin:auto;background:#f2f2f2;color:#222;
+padding:max(12px,env(safe-area-inset-top)) max(12px,env(safe-area-inset-right)) max(12px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left))}
+button{-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+@media (prefers-color-scheme:dark){body{background:#000;color:#eee}section{background:#1c1c1e!important}td{border-color:#333!important}input{background:#2c2c2e;color:#eee;border:1px solid #444}}
+)HTML"
+
+const char PAGE[] = PAGE_HEAD R"HTML(
 section{background:#fff;border-radius:8px;padding:12px;margin:10px 0}h1{font-size:1.3em}h2{font-size:1.05em;margin:0 0 8px}
 table{width:100%;border-collapse:collapse}td{padding:4px 0;border-bottom:1px solid #eee}td+td{text-align:right;font-weight:bold}
-button{padding:10px 14px;margin:4px 4px 4px 0;border:0;border-radius:6px;font-size:1em;color:#fff;background:#455a64}
+button{padding:14px 16px;margin:4px 4px 4px 0;border:0;border-radius:10px;font-size:1.05em;color:#fff;background:#455a64}
+.big{width:calc(50% - 6px)}.wide{width:100%}a{color:#888;font-size:.85em}
 .on{background:#2e7d32}.off{background:#c62828}.warn{color:#c62828}
 label{display:block;margin-top:8px;font-size:.9em}input{width:100%;padding:7px;box-sizing:border-box;margin-top:2px}
+.st{font-size:1.6em;font-weight:bold;margin:4px 0 10px}.st.on1{color:#2e7d32}summary{font-weight:bold;cursor:pointer}
 </style></head><body><h1>Erősítő bekapcsoló</h1>
-<section><h2>Állapot</h2><table id="t"><tr><td>Betöltés…</td></tr></table></section>
-<section><h2>Vezérlés</h2>
-<button class="on" onclick="post('/api/power','state=on')">Bekapcsolás</button>
-<button class="off" onclick="post('/api/power','state=off')">Kikapcsolás</button><br>
-<button id="tb" onclick="post('/api/trigger','enabled='+(tr?0:1))">Trigger figyelés</button></section>
-<section><h2>Beállítások</h2><form method="post" action="/api/config">
+<section><div id="st" class="st">Betöltés…</div>
+<button class="on big" onclick="post('/api/power','state=on')">Bekapcsolás</button><button class="off big" onclick="post('/api/power','state=off')">Kikapcsolás</button>
+<button id="tb" class="wide" onclick="post('/api/trigger','enabled='+(tr?0:1))">Trigger figyelés</button></section>
+<section><h2>Állapot</h2><table id="t"></table></section>
+<section><details><summary>Beállítások</summary><form method="post" action="/api/config">
 <label>WiFi hálózat neve<input name="ssid" id="ssid" maxlength="32"></label>
 <label>WiFi jelszó (üresen hagyva nem változik)<input name="pass" type="password" maxlength="64"></label>
 <label>MQTT cím (pl. mqtt://192.168.1.10:1883; üresen: nincs MQTT)<input name="mqtt_uri" id="mu" maxlength="95"></label>
 <label>MQTT felhasználó<input name="mqtt_user" id="mus" maxlength="32"></label>
 <label>MQTT jelszó (üresen hagyva nem változik)<input name="mqtt_pass" type="password" maxlength="64"></label>
 <label>Weboldal jelszó (legalább 8 karakter; üresen hagyva nem változik)<input name="web_pass" type="password" maxlength="32"></label>
-<button type="submit">Mentés</button></form></section>
+<button type="submit">Mentés</button></form></details></section><p><a href="/logout">Kijelentkezés</a></p>
 <script>
 let tr=false,cf=false;const $=i=>document.getElementById(i);
-const L={power:'Erősítő',rl2:'NTC áthidalva (RL2)',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
+const L={rl2:'NTC áthidalva (RL2)',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
 fault:'Hiba',warning:'Figyelmeztetés',on_hours:'Üzemidő (óra)',on_count:'Bekapcsolások',relay_count:'Relé kapcsolások',
 mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',
 rssi:'WiFi jel (dBm)',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',board:'Alaplap'};
 const V=x=>x===true?'igen':x===false?'nem':x==='ON'?'BE':x==='OFF'?'KI':x;
-async function upd(){try{const s=await(await fetch('/api/status')).json();tr=s.trig_enabled;let h='';
+async function upd(){try{const r=await fetch('/api/status');if(r.status==401){location='/login';return;}const s=await r.json();tr=s.trig_enabled;let h='';
 for(const k in L)if(k in s)h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
-$('t').innerHTML=h;$('tb').textContent='Trigger figyelés: '+(tr?'BE – kikapcsolás':'KI – bekapcsolás');
+$('t').innerHTML=h;const st=$('st');st.textContent=s.power=='ON'?'Bekapcsolva':'Kikapcsolva';st.className='st'+(s.power=='ON'?' on1':'');$('tb').textContent='Trigger figyelés: '+(tr?'BE – kikapcsolás':'KI – bekapcsolás');
 if(!cf){cf=true;$('ssid').value=s.cfg_ssid;$('mu').value=s.cfg_mqtt_uri;$('mus').value=s.cfg_mqtt_user;}}catch(e){}}
-async function post(u,b){await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});setTimeout(upd,300);}
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});if(r.status==401){location='/login';return;}setTimeout(upd,300);}
 upd();setInterval(upd,2000);
 </script></body></html>)HTML";
 
-bool webAuth() {
-  if (web.authenticate("admin", ncfg.webPass)) return true;
-  web.requestAuthentication(BASIC_AUTH, "Erosito");
+const char LOGIN_PAGE[] = PAGE_HEAD R"HTML(section{background:#fff;border-radius:8px;padding:16px;margin:10px 0}
+input{width:100%;padding:12px;box-sizing:border-box;margin:8px 0;font-size:1.05em}
+button{width:100%;padding:14px;border:0;border-radius:10px;font-size:1.05em;color:#fff;background:#455a64}.err{color:#c62828}
+</style></head><body><h1>Erősítő bekapcsoló</h1><section><form method="post" action="/login">
+<p class="err">%ERR%</p><label>Jelszó<input name="pw" type="password" autocomplete="current-password" autofocus></label>
+<button type="submit">Belépés</button></form></section></body></html>)HTML";
+
+const char MANIFEST[] = R"JSON({"name":"Erősítő","short_name":"Erősítő","start_url":"/","display":"standalone",
+"background_color":"#f2f2f2","theme_color":"#263238","icons":[{"src":"/apple-touch-icon.png","sizes":"180x180","type":"image/png"}]})JSON";
+
+bool cookieOk() {   // weboldal: tartós süti (a kezdőképernyőre tett app is megjegyzi)
+  if (!webToken[0]) return false;
+  char want[48];
+  snprintf(want, sizeof want, "erosito_auth=%s", webToken);
+  return strstr(web.header("Cookie").c_str(), want) != nullptr;
+}
+
+bool apiAuth() {   // API: süti (weboldal) vagy Basic jelszó (iOS-app, más kliensek)
+  if (cookieOk() || web.authenticate("admin", ncfg.webPass)) return true;
+  web.send(401, "text/plain", "Bejelentkezes szukseges");
   return false;
 }
 
+bool pageAuth() {   // oldal: bejelentkezés hiányában a belépő oldalra irányít
+  if (cookieOk() || web.authenticate("admin", ncfg.webPass)) return true;
+  web.sendHeader("Location", "/login");
+  web.send(303, "text/plain", "");
+  return false;
+}
+
+void setAuthCookie() {
+  char c[96];
+  snprintf(c, sizeof c, "erosito_auth=%s; Max-Age=31536000; Path=/; HttpOnly; SameSite=Strict", webToken);
+  web.sendHeader("Set-Cookie", c);
+}
+
+void loginPage(const char *err) {
+  String html(LOGIN_PAGE);
+  html.replace("%ERR%", err);
+  web.send(200, "text/html; charset=utf-8", html);
+}
+
+void webLogin() {
+  if (web.method() == HTTP_GET) { loginPage(""); return; }
+  if (strcmp(web.arg("pw").c_str(), ncfg.webPass) != 0) {
+    vTaskDelay(pdMS_TO_TICKS(1000));   // próbálgatás lassítása
+    loginPage("Hibás jelszó.");
+    return;
+  }
+  setAuthCookie();
+  web.sendHeader("Location", "/");
+  web.send(303, "text/plain", "");
+}
+
+void webLogout() {
+  web.sendHeader("Set-Cookie", "erosito_auth=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict");
+  web.sendHeader("Location", "/login");
+  web.send(303, "text/plain", "");
+}
+
+void webIcon() {   // bejelentkezés nélkül: a kezdőképernyő ikonja
+  web.sendHeader("Cache-Control", "max-age=31536000");
+  web.send_P(200, "image/png", (const char *)ICON_PNG, sizeof ICON_PNG);
+}
+
+void webManifest() {
+  web.send(200, "application/manifest+json; charset=utf-8", MANIFEST);
+}
+
 void webRoot() {
-  if (webAuth()) web.send(200, "text/html; charset=utf-8", PAGE);
+  if (pageAuth()) web.send(200, "text/html; charset=utf-8", PAGE);
 }
 
 void webStatus() {
-  if (!webAuth()) return;
+  if (!apiAuth()) return;
   char js[1200];
   buildState(js, sizeof js, true);
   web.send(200, "application/json; charset=utf-8", js);
 }
 
 void webPower() {   // mint a gomb / Home Assistant: ugyanazok a szabályok
-  if (!webAuth()) return;
+  if (!apiAuth()) return;
   if (web.arg("state") == "on") remoteOnReq = true;
   else if (web.arg("state") == "off") remoteOffReq = true;
   web.send(200, "text/plain", "OK");
 }
 
 void webTrigger() {
-  if (!webAuth()) return;
+  if (!apiAuth()) return;
   remoteTrigReq = (web.arg("enabled") == "1") ? 1 : 0;
   web.send(200, "text/plain", "OK");
 }
 
 void webConfig() {   // mentés NVS-be, majd élő újracsatlakozás (nincs újraindítás: a relék nem engednek el)
-  if (!webAuth()) return;
+  if (!pageAuth()) return;
   NetCfg n = ncfg;
   strlcpy(n.ssid, web.arg("ssid").c_str(), sizeof n.ssid);
   strlcpy(n.mqttUri, web.arg("mqtt_uri").c_str(), sizeof n.mqttUri);
@@ -1226,9 +1322,14 @@ void webConfig() {   // mentés NVS-be, majd élő újracsatlakozás (nincs újr
   if (web.arg("pass").length()) strlcpy(n.pass, web.arg("pass").c_str(), sizeof n.pass);
   if (web.arg("mqtt_pass").length()) strlcpy(n.mqttPass, web.arg("mqtt_pass").c_str(), sizeof n.mqttPass);
   bool pwOk = web.arg("web_pass").length() == 0 || web.arg("web_pass").length() >= 8;
-  if (pwOk && web.arg("web_pass").length()) strlcpy(n.webPass, web.arg("web_pass").c_str(), sizeof n.webPass);
+  bool pwChanged = pwOk && web.arg("web_pass").length() && strcmp(web.arg("web_pass").c_str(), ncfg.webPass) != 0;
+  if (pwChanged) strlcpy(n.webPass, web.arg("web_pass").c_str(), sizeof n.webPass);
   ncfg = n;
   bool ok = netCfgSave();
+  if (pwChanged) {   // jelszócsere: a többi bejelentkezés érvénytelen, ez a böngésző új sütit kap
+    tokenNew();
+    setAuthCookie();
+  }
   netReconfig = true;
   slogc("Halozati beallitasok %s (weboldal): WiFi \"%s\", MQTT \"%s\"\n", ok ? "mentve" : "NEM mentve", ncfg.ssid, ncfg.mqttUri);
   char html[400];
@@ -1249,6 +1350,19 @@ void webNotFound() {   // AP módban minden ismeretlen cím a weboldalra irány�
   }
 }
 
+// ---- mDNS / Bonjour: "_erosito._tcp" szolgáltatás és erosito.local név (az első csatlakozáskor, utána magától követi) ----
+void mdnsStart() {
+  mdnsStarted = true;
+#if MDNS_ENABLED
+  if (!MDNS.begin(NET_ID)) { slogc("mDNS inditas sikertelen\n"); return; }
+  MDNS.setInstanceName("Erosito");
+  MDNS.addService("http", "tcp", 80);
+  MDNS.addService("erosito", "tcp", 80);
+  MDNS.addServiceTxt("erosito", "tcp", "board", BOARD_NAME);
+  slogc("mDNS: http://" NET_ID ".local\n");
+#endif
+}
+
 // ---- Hálózati task ----
 void netService() {
   wifiService();
@@ -1257,6 +1371,7 @@ void netService() {
     netResetReq = false;
     netCfgClear();
     netCfgLoad();
+    tokenNew();
     netReconfig = true;
     slogc("Halozati beallitasok torolve\n");
   }
@@ -1269,6 +1384,7 @@ void netService() {
     if (apOn) WiFi.mode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
     staBegin();
   }
+  if (!mdnsStarted && WiFi.status() == WL_CONNECTED) mdnsStart();
   if (!netStarted && ncfg.mqttUri[0] && WiFi.status() == WL_CONNECTED && (!mqttTried || millis() - mqttLastTry >= MQTT_RETRY_MS)) {
     mqttTried = true;
     mqttLastTry = millis();
@@ -1286,9 +1402,18 @@ void netInit() {   // beállítások betöltése, WiFi indítása, weboldal útv
   WiFi.setHostname(NET_ID);
   WiFi.setAutoReconnect(true);
   WiFi.mode(WIFI_STA);
+  if (!webToken[0]) tokenNew();   // a rádió már fut: valódi véletlenszám
   staLastOk = millis();
   staBegin();
+  const char *hdrs[] = {"Cookie"};
+  web.collectHeaders(hdrs, 1);
   web.on("/", HTTP_GET, webRoot);
+  web.on("/login", HTTP_ANY, webLogin);
+  web.on("/logout", HTTP_GET, webLogout);
+  web.on("/apple-touch-icon.png", HTTP_GET, webIcon);
+  web.on("/apple-touch-icon-precomposed.png", HTTP_GET, webIcon);
+  web.on("/favicon.ico", HTTP_GET, webIcon);
+  web.on("/manifest.json", HTTP_GET, webManifest);
   web.on("/api/status", HTTP_GET, webStatus);
   web.on("/api/power", HTTP_POST, webPower);
   web.on("/api/trigger", HTTP_POST, webTrigger);

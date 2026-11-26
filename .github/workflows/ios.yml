@@ -1,0 +1,43 @@
+# iOS-app fordítása macOS-en, aláírás nélküli .ipa (Windowsról Sideloadly-vel telepíthető, lásd ios/README.md)
+name: iOS app (alairatlan IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode-projekt generalasa (XcodeGen)
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      - name: Forditas (alairas nelkul)
+        run: |
+          cd ios
+          xcodebuild -project Erosito.xcodeproj -scheme Erosito -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+
+      - name: IPA keszitese
+        run: |
+          cd ios
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/Erosito.app Payload/
+          zip -qry Erosito.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Erosito-ipa
+          path: ios/Erosito.ipa
+          retention-days: 30

@@ -120,14 +120,21 @@ Ki- és bekapcsolható a program elején: `#define HOME_ASSISTANT true` / `false
 
 ### Weboldal
 
-Normál üzemben az ESP IP-címén érhető el (a soros `s` parancs kiírja). Felhasználó: `admin`, jelszó: alapból az AP jelszava, a weboldalon módosítható (legalább 8 karakter).
+Normál üzemben az ESP IP-címén vagy a `http://erosito.local` címen érhető el (a soros `s` parancs kiírja az IP-t). Felhasználó: `admin`, jelszó: alapból az AP jelszava, a weboldalon módosítható (legalább 8 karakter).
 
 - **Állapot** (2 s-onként frissül): be / ki, RL2, trigger, várakozás, hiba, figyelmeztetés, számlálók, optó, WiFi, IP, MQTT.
 - **Vezérlés:** Bekapcsolás / Kikapcsolás (ugyanazok a szabályok, mint a gombnál), Trigger figyelés be / ki (mentve, mint a két rövid gombnyomás).
 - **Beállítások:** WiFi név és jelszó, MQTT cím, felhasználó és jelszó, weboldal jelszó. Az üresen hagyott jelszómezők nem változnak; üres MQTT cím = nincs MQTT.
 - **Elfelejtett jelszó:** a soros `W` parancs törli a mentett hálózati beállításokat (vissza a `secrets.h` / AP módhoz).
 
-A weboldal sima HTTP-n, Basic jelszóval működik: csak a helyi hálózaton használd.
+- **Bejelentkezés:** a weboldal belépő oldalt ad (jelszó), utána egy tartós süti 1 évig megjegyzi; áramszünet után is érvényes. Jelszócserekor a többi bejelentkezés érvénytelen lesz. Az iOS-app és más kliensek Basic jelszóval (felhasználó: `admin`) is elérik az `/api/...` címeket.
+- **iPhone-on appként (Mac nélkül):** Safariban nyisd meg a `http://erosito.local` címet, lépj be, majd Megosztás → **Főképernyőhöz adás**. Saját ikonnal, teljes képernyőn indul, a belépést megjegyzi.
+
+A weboldal sima HTTP-n működik: csak a helyi hálózaton használd.
+
+### iOS-app
+
+Az `ios/` mappában egy egyszerű iPhone-app van (SwiftUI): megkeresi az eszközt a helyi hálózaton (Bonjour, `_erosito._tcp`), be/ki kapcsol, trigger figyelés be/ki, állapot. Mac-en Xcode-dal, Windowsról a GitHub Actions által fordított `.ipa`-val és a Sideloadly-vel telepíthető: `ios/README.md`.
 
 ### Home Assistant (MQTT, AI-elemzés)
 
