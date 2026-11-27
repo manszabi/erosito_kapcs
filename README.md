@@ -177,7 +177,16 @@ A program hónapokig, évekig megszakítás nélkül futhat:
 - minden időzítés kezdőidő + időtartam alapú, így a `millis()` 49,7 naponkénti túlcsordulása nem okoz hibát;
 - a vezérlés futás közben nem foglal dinamikus memóriát (a WiFi- és MQTT-könyvtár a saját taskjában igen, a vezérléstől függetlenül);
 - az NVS-be csak eseménykor és bekapcsolva óránként ír, ami a flash élettartamához képest elhanyagolható;
-- a szabad, a valaha mért legkisebb szabad memória és a legnagyobb szabad blokk (töredezettség) látszik a `h` parancsnál, a weboldalon és a Home Assistantben; figyelmeztetés jön 20 kB legkisebb szabad memória, 8 kB legnagyobb blokk, illetve bármelyik task 512 bájt alatti szabad verme esetén (a `h` a legkevesebb szabad vermet is kiírja);
+- **memória-őr** (belső RAM, mindkét lapon azonos határokkal; a `h` parancs kiírja az értékeket és a határokat, a weboldal és a Home Assistant is mutatja):
+
+  | | szabad memória | legnagyobb blokk | szabad verem | teendő |
+  |---|---|---|---|---|
+  | figyelmeztetés | 20 kB | 8 kB | 512 B | figyelmeztetés (soros, web, Home Assistant, AI-elemzés) |
+  | kritikus, 30 s-ig | 12 kB | 4 kB | 256 B | előbb a hálózat újraindul (a relék nem érintettek); ha 60 s alatt nem javul, szabályos újraindítás, amint a relék KI vannak |
+  | vészhelyzet, 3 s-ig | 6 kB | 2 kB | 128 B | azonnali szabályos újraindítás: relék KI, mentés, újraindulás után (5 s) a relék visszakapcsolnak, ha be voltak |
+
+  - Normál futásnál a szabad belső RAM kb. 150–200 kB (C3), illetve 200–280 kB (S3), így a határok messze vannak; az S3 PSRAM-ja nem számít bele (a WiFi nem használhatja).
+  - Hurok ellen: 3 egymás utáni memória-újraindítás után csak figyelmeztet; 1 óra zavartalan futás nullázza a számlálót. Újraindulás után esemény megy a Home Assistantnak.
 - a futásidő és az események életkora 64 bites órával számol; a Home Assistant csomag a 10 percnél régebbi eseményt (pl. hosszú MQTT-kimaradás után) nem elemzi.
 
 ## Fordítás

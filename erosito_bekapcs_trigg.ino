@@ -138,9 +138,22 @@ const unsigned long AP_LINGER_MS     = 60000;    // csatlakozás után az AP enn
 const unsigned long STA_RETRY_BUSY_MS = 300000;  // AP-n lévő kliens mellett ritkábban próbálja a routert (pl. megjegyzett AP a telefonon)
 const unsigned long MQTT_RETRY_MS    = 10000;    // sikertelen MQTT-kliens indítás után ennyi múlva újra
 const unsigned long EVENT_MAX_AGE_S  = 600;      // a Home Assistant csomag ennél régebbi eseményt nem elemez
-const uint32_t      HEAP_WARN_BYTES  = 20000;    // figyelmeztetés, ha a legkisebb szabad memória ez alá esett
-const uint32_t      HEAP_BLOCK_WARN  = 8000;     // figyelmeztetés: a legnagyobb szabad blokk ez alatt (töredezettség)
-const uint32_t      STACK_WARN_BYTES = 512;      // figyelmeztetés: egy task szabad verme ez alatt
+
+// Memória-őr: a belső RAM-ot méri (a WiFi, az lwIP és a taskok csak ezt használhatják; az S3 PSRAM-ja nem számít),
+// így a határok mindkét lapon azonosak. Normál futásnál a szabad belső RAM: C3 kb. 150-200 kB, S3 kb. 200-280 kB.
+//                                 figyelmeztetés   kritikus*      vészhelyzet**
+const uint32_t HEAP_WARN_BYTES  = 20000, HEAP_CRIT_BYTES  = 12000, HEAP_EMERG_BYTES  = 6000;   // szabad belső RAM
+const uint32_t HEAP_BLOCK_WARN  = 8000,  HEAP_BLOCK_CRIT  = 4000,  HEAP_BLOCK_EMERG  = 2000;   // legnagyobb blokk (WiFi: 1,6-2 kB-os pufferek)
+const uint32_t STACK_WARN_BYTES = 512,   STACK_CRIT_BYTES = 256,   STACK_EMERG_BYTES = 128;    // legkevesebb szabad verem
+// * MEM_CRIT_MS-ig tartó kritikus állapot: előbb a hálózat újraindul (a relék nem érintettek), ha nem javul,
+//   szabályos újraindítás, amikor a relék KI vannak.  ** MEM_EMERG_MS után azonnali szabályos újraindítás
+//   (relék KI, újraindulás után a korábbi állapot visszaáll), mielőtt egy összeomlás döntene helyette.
+const unsigned long MEM_CRIT_MS      = 30000;
+const unsigned long MEM_EMERG_MS     = 3000;
+const unsigned long NET_RECOVER_WAIT_MS = 60000;   // a hálózat újraindítása után ennyi idő a javulásra
+const unsigned long MEM_OK_RESET_MS  = 600000UL;   // ennyi rendben lévő idő után a hálózat újra újraindítható
+const uint8_t       MEM_RESTART_MAX  = 3;          // ennyi egymás utáni memória-újraindítás után csak figyelmeztet (hurok ellen)
+const unsigned long MEM_RESTART_OK_MS = 3600000UL; // ennyi zavartalan futás után a számláló nullázódik
 
 static_assert(OPTO_MIN_AVG > MAINS_MIN_LOW, "OPTO_MIN_AVG > MAINS_MIN_LOW kell");
 static_assert(MAINS_LOSS_MS >= 20, "MAINS_LOSS_MS >= 20 ms kell (2 felperiodus)");
@@ -150,6 +163,9 @@ static_assert(RL2_DELAY_MS > MAINS_WIN_MS + MAINS_FAULT_MS, "RL2_DELAY_MS: az RL
 static_assert(MAINS_OFF_GRACE_MS < MIN_OFF_MS, "MAINS_OFF_GRACE_MS < MIN_OFF_MS kell");
 static_assert(LONG_PRESS_MS < DOUBLE_GAP_MS, "LONG_PRESS_MS < DOUBLE_GAP_MS kell");
 static_assert(WDT_MS >= 1000, "WDT_MS >= 1000 kell (NVS iras)");
+static_assert(HEAP_WARN_BYTES > HEAP_CRIT_BYTES && HEAP_CRIT_BYTES > HEAP_EMERG_BYTES, "memoria hatarok sorrendje");
+static_assert(HEAP_BLOCK_WARN > HEAP_BLOCK_CRIT && HEAP_BLOCK_CRIT > HEAP_BLOCK_EMERG, "blokk hatarok sorrendje");
+static_assert(STACK_WARN_BYTES > STACK_CRIT_BYTES && STACK_CRIT_BYTES > STACK_EMERG_BYTES, "verem hatarok sorrendje");
 
 // ======================================================================= Típusok, kódok (int, nem enum: az Arduino IDE prototípusai miatt)
 const int F_NONE = 0, F_STUCK = 1, F_CHATTER = 2, F_PRESSES = 3, F_NOMAINS = 4, F_MAINSOFF = 5, F_MAINSLOST = 6;
@@ -260,6 +276,7 @@ volatile bool relayReq = false;     // 'R': relé számláló nullázása (relé
 volatile bool remoteOnReq = false, remoteOffReq = false;
 volatile int8_t remoteTrigReq = -1;   // weboldal / Home Assistant: trigger figyelés 1 = be, 0 = ki
 volatile bool netResetReq = false;    // 'W': hálózati beállítások törlése
+volatile bool netRecoverReq = false;  // memória-őr: a hálózat újraindítása (a relék nem érintettek)
 volatile bool netStateDirty = true;
 void netEvent(const char *type, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void switchOn(const char *src, bool manual);   // előre deklarálva: a hibakezelés is hívja
@@ -278,6 +295,21 @@ uint32_t stackMinFree(const char **name) {   // a legkevesebb szabad verem a tas
   }
   if (name) *name = nm;
   return best;
+}
+const uint32_t MEM_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+uint32_t memFree()    { return (uint32_t)heap_caps_get_free_size(MEM_CAPS); }
+uint32_t memMinFree() { return (uint32_t)heap_caps_get_minimum_free_size(MEM_CAPS); }
+uint32_t memBlock()   { return (uint32_t)heap_caps_get_largest_free_block(MEM_CAPS); }
+
+// Memória miatti újraindítás nyoma (RTC: szoftveres reset után megmarad, tápvesztéskor elvész)
+const uint32_t MEMR_MAGIC = 0x4D454D52UL;
+RTC_NOINIT_ATTR uint32_t rtcMemInfo;    // 0-7: egymás utáni újraindítások, 8-15: ok, 16: relék BE voltak, 17: most történt
+RTC_NOINIT_ATTR uint32_t rtcMemCheck;
+uint32_t memInfo = 0;
+void memInfoSave(uint32_t v) { memInfo = v; rtcMemInfo = v; rtcMemCheck = MEMR_MAGIC ^ v; }
+void memInfoLoad() { memInfo = (rtcMemCheck == (MEMR_MAGIC ^ rtcMemInfo)) ? rtcMemInfo : 0; }
+const char *memReasonName(int r) {
+  return r == 1 ? "keves szabad memoria" : r == 2 ? "toredezett memoria" : r == 3 ? "keves verem" : "?";
 }
 
 // Áramszünet utáni várakozás hátralévő ideje: reset után megmarad, tápvesztéskor elvész
@@ -551,12 +583,11 @@ int statsWarnings(char *buf, size_t len) {   // figyelmeztetések szövege (üre
                (unsigned)(100 - st.optoAvg * 100 / st.optoBase + 0.5f));
     }
   }
-  if (esp_get_minimum_free_heap_size() < HEAP_WARN_BYTES) {   // hónapokig tartó futásnál: memóriafogyás jele
+  if (memMinFree() < HEAP_WARN_BYTES) {   // hónapokig tartó futásnál: memóriafogyás jele
     n++;
-    snprintf(buf + strlen(buf), len - strlen(buf), " keves szabad memoria (min. %lu bajt);",
-             (unsigned long)esp_get_minimum_free_heap_size());
+    snprintf(buf + strlen(buf), len - strlen(buf), " keves szabad memoria (min. %lu bajt);", (unsigned long)memMinFree());
   }
-  size_t blk = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  uint32_t blk = memBlock();
   if (blk < HEAP_BLOCK_WARN) {   // sok szabad memória, de csak apró darabokban
     n++;
     snprintf(buf + strlen(buf), len - strlen(buf), " toredezett memoria (legnagyobb blokk %lu);", (unsigned long)blk);
@@ -817,7 +848,7 @@ void processPendingOn(bool inHold) {   // függő bekapcsolás a minimális kika
   const char *src = onReqSrc;
   onReqBtn = false;
   onReqTrig = false;
-  if (byBtn) switchOn("gomb", true);
+  if (byBtn) switchOn(src, true);
   else if (!trigOff && trig.stable == LOW) switchOn(src, false);
   else slog("Fuggo bekapcsolas elmarad: a trigger nem aktiv\n");
 }
@@ -1175,8 +1206,8 @@ void buildState(char *js, size_t len, bool forWeb) {
            trigOff ? "OFF" : "ON", powerHold ? "true" : "false", flt ? faultName(lastFault) : "nincs", w[0] ? w + 1 : "nincs",
            (flt || w[0]) ? "ON" : "OFF", h10 / 10, h10 % 10, (unsigned long)st.onCount, (unsigned long)st.relayCount,
            (unsigned long)st.mainsLoss, (unsigned long)st.faults, (unsigned long)st.powerUps, (unsigned)fbCount,
-           a / 10, a % 10, b / 10, b % 10, (int)WiFi.RSSI(), (unsigned long)esp_get_free_heap_size(),
-           (unsigned long)esp_get_minimum_free_heap_size(), (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+           a / 10, a % 10, b / 10, b % 10, (int)WiFi.RSSI(), (unsigned long)memFree(),
+           (unsigned long)memMinFree(), (unsigned long)memBlock());
   if (n < 0 || (size_t)n >= len) { strlcpy(js, "{}", len); return; }
   if (forWeb) {
     char ss[70], mu[200], mus[70], ci[34], cg[34], cm[34], cd[34];
@@ -1850,6 +1881,24 @@ void netService() {
     reconfAt = millis() - RECONF_DELAY_MS;   // nincs HTTP-válasz: azonnal
     slogc("Halozati beallitasok torolve\n");
   }
+  if (netRecoverReq) {   // memória-őr: WiFi, MQTT, mDNS leáll és újraindul (felszabadítja a pufferjeit)
+    netRecoverReq = false;
+    slogc("Memoria: halozat ujrainditasa (a relek nem erintettek)\n");
+    mqttStop();
+    mqttTried = false;
+#if !MDNS_ENABLED
+    mdClose();
+    if (mdnsState == 1) mdnsState = 0;
+#endif
+    if (apOn) { dns.stop(); apOn = false; }
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    wifiMode(WIFI_STA);
+    staLastOk = millis();
+    apTried = false;
+    staBegin();
+  }
   if ((reconfWifi || reconfMqtt) && millis() - reconfAt >= RECONF_DELAY_MS) {   // csak ami változott; a relék nem érintettek
     mqttStop();   // WiFi-váltásnál is: új kapcsolat kell
     mqttTried = false;
@@ -1965,12 +2014,16 @@ void printHealth() {
   slogc("  Halozatkieses: %lu, hiba: %lu, aramszunet utani indulas: %lu\n", (unsigned long)st.mainsLoss,
         (unsigned long)st.faults, (unsigned long)st.powerUps);
   slogc("  Futasido: %lu ora, szabad memoria: %lu bajt (legkisebb: %lu, legnagyobb blokk: %lu)\n", uptimeHours(),
-        (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size(),
-        (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        (unsigned long)memFree(), (unsigned long)memMinFree(), (unsigned long)memBlock());
   {
     const char *tn;
     uint32_t sf = stackMinFree(&tn);
-    slogc("  Szabad verem (legkevesebb): %lu bajt (%s)\n", (unsigned long)sf, tn);
+    slogc("  Szabad verem (legkevesebb): %lu bajt (%s); memoria-ujrainditasok egymas utan: %lu\n", (unsigned long)sf, tn,
+          (unsigned long)(memInfo & 0xFF));
+    slogc("  Memoriahatarok (belso RAM): figyelm. %lu / %lu / %lu, ujrainditas %lu / %lu / %lu, azonnal %lu / %lu / %lu bajt (szabad / blokk / verem)\n",
+          (unsigned long)HEAP_WARN_BYTES, (unsigned long)HEAP_BLOCK_WARN, (unsigned long)STACK_WARN_BYTES,
+          (unsigned long)HEAP_CRIT_BYTES, (unsigned long)HEAP_BLOCK_CRIT, (unsigned long)STACK_CRIT_BYTES,
+          (unsigned long)HEAP_EMERG_BYTES, (unsigned long)HEAP_BLOCK_EMERG, (unsigned long)STACK_EMERG_BYTES);
   }
   if (MAINS_CHECK) {
     unsigned a = (unsigned)(st.optoAvg * 10 + 0.5f), b = (unsigned)(st.optoBase * 10 + 0.5f),
@@ -2105,6 +2158,12 @@ void setup() {
                      (rr == ESP_RST_BROWNOUT && !BROWNOUT_IS_POWERLOSS));
   bool powerLoss = (rr == ESP_RST_POWERON) || (rr == ESP_RST_BROWNOUT && BROWNOUT_IS_POWERLOSS);
   unsigned long holdMs = powerLoss ? POWERUP_HOLD_MS : holdLoad();   // reset a várakozás alatt: folytatódik
+  memInfoLoad();
+  if (powerLoss) memInfoSave(0);
+  bool memRestarted = (rr == ESP_RST_SW) && (memInfo & 0x20000UL);   // a memória-őr indította újra
+  bool memWasOn = memRestarted && (memInfo & 0x10000UL);
+  int memReason = (int)((memInfo >> 8) & 0xFF);
+  if (memInfo & 0x30000UL) memInfoSave(memInfo & 0xFFUL);   // csak az egymás utáni számláló marad
   if (holdMs > 0) {
     powerHold = true;
     holdStart = lastHoldSave = millis();
@@ -2119,11 +2178,16 @@ void setup() {
   slogc("TRIGGER: %s, %s; halozatfigyeles: %s\n", trig.stable == LOW ? "aktiv" : "nincs",
         trigOff ? "TILTVA" : "engedelyezve", MAINS_CHECK ? "BE" : "KI");
   if (!nvsOk) slogc("FIGYELEM: NVS hiba, alapertelmezett beallitasok\n");
+  if (memRestarted) {
+    slogc("Memoria miatti ujrainditas utan (%s, %lu. egymas utan)%s\n", memReasonName(memReason), (unsigned long)(memInfo & 0xFF),
+          memWasOn ? ": a relek visszakapcsolnak" : "");
+  }
   if (powerHold) slogc("Aramszunet utan: %lu s varakozas\n", holdMs / 1000);
   if (powerLoss) { st.powerUps++; stDirty = true; statsSave(true); }
   printHelp();
   netStart();
   netEvent("boot", "Indulás: %s%s", resetName(rr), powerHold ? ", áramszünet utáni várakozás" : "");
+  if (memRestarted) netEvent("warning", "Memória miatti újraindítás: %s", memReasonName(memReason));
   checkWarnings();
   if (lastWarnCount > 0) {
     char w[120];
@@ -2141,6 +2205,9 @@ void setup() {
     lockoutDur = wait;
     slogc("Mentett hiba (%s): %lu ms mulva ellenorzes\n",
           storedFault == F_STUCK ? "beragadt gomb" : "halozat KI relenel", wait);
+  } else if (memWasOn) {   // a memória-őr kapcsolta ki: a korábbi állapot visszaáll (minimális kikapcsolt idő után)
+    if (powerHold) holdBtnUsed = true;
+    switchOn("memoria ujrainditas utan", true);
   } else if (!powerHold && !trigOff && trig.stable == LOW && (crashReset || TRIGGER_ON_BOOT)) {
     switchOn(crashReset ? "fagyas utan" : "indulaskor aktiv trigger", false);
   }
@@ -2210,6 +2277,77 @@ void handleNormal(bool btnChanged, bool trigChanged) {
   }
 }
 
+// ---- Memória-őr: másodpercenként; figyelmeztetés a statsWarnings-ban, itt a kritikus és a vészhelyzeti szint ----
+unsigned long memLastCheck = 0, memCritSince = 0, memEmergSince = 0, memOkSince = 0, netRecoverT = 0;
+bool memCrit = false, memEmerg = false, netRecoverDone = false, memWaitLogged = false, memLimitLogged = false;
+
+int memProblem(uint32_t heapLim, uint32_t blockLim, uint32_t stackLim) {   // 0 = rendben, különben az ok kódja
+  if (memFree() < heapLim) return 1;
+  if (memBlock() < blockLim) return 2;
+  if (stackMinFree(nullptr) < stackLim) return 3;
+  return 0;
+}
+
+void memRestart(int reason, bool emergency) {   // szabályos újraindítás: relék KI, mentés, nyom az RTC-ben
+  bool wasOn = on;
+  slogc("!!! MEMORIA %s (szabad %lu, blokk %lu, verem %lu bajt): %s\n", memReasonName(reason), (unsigned long)memFree(),
+        (unsigned long)memBlock(), (unsigned long)stackMinFree(nullptr),
+        emergency ? "AZONNALI ujrainditas (relek KI, utana visszakapcsol)" : "szabalyos ujrainditas (relek KI-kapcsolt allapotban)");
+  setState(false, "memoria ujrainditas");
+  statsSave(true);
+  if (powerHold) holdSave(timeLeft(holdStart, holdDur));
+  uint32_t cnt = (memInfo & 0xFF) + 1;
+  memInfoSave((cnt & 0xFF) | ((uint32_t)reason << 8) | (wasOn ? 0x10000UL : 0) | 0x20000UL);
+  for (int i = 0; i < 4; i++) { esp_task_wdt_reset(); delay(50); }   // a napló kiírása
+  esp_restart();
+}
+
+void memGuard(unsigned long now) {
+  if (now - memLastCheck < 1000) return;
+  memLastCheck = now;
+  if ((memInfo & 0xFF) && esp_timer_get_time() / 1000 >= (int64_t)MEM_RESTART_OK_MS) memInfoSave(0);   // zavartalan futás: számláló nulla
+  bool limit = (memInfo & 0xFF) >= MEM_RESTART_MAX;
+  int emerg = memProblem(HEAP_EMERG_BYTES, HEAP_BLOCK_EMERG, STACK_EMERG_BYTES);
+  int crit = emerg ? emerg : memProblem(HEAP_CRIT_BYTES, HEAP_BLOCK_CRIT, STACK_CRIT_BYTES);
+  if (!emerg) memEmerg = false;
+  else if (!memEmerg) { memEmerg = true; memEmergSince = now; }
+  if (!crit) {
+    if (memCrit) slog("Memoria: ismet rendben\n");
+    memCrit = false;
+    memWaitLogged = false;
+    if (!memOkSince) memOkSince = now;
+    if (netRecoverDone && now - memOkSince >= MEM_OK_RESET_MS) netRecoverDone = false;
+    return;
+  }
+  memOkSince = 0;
+  if (!memCrit) {
+    memCrit = true;
+    memCritSince = now;
+    slogc("!!! MEMORIA kritikus: %s (szabad %lu, blokk %lu, verem %lu bajt)\n", memReasonName(crit), (unsigned long)memFree(),
+          (unsigned long)memBlock(), (unsigned long)stackMinFree(nullptr));
+    netEvent("warning", "Memória kritikus: %s", memReasonName(crit));
+  }
+  if (limit) {   // újraindítási hurok ellen: csak jelzés
+    if (!memLimitLogged) slogc("!!! MEMORIA: %u egymas utani ujrainditas utan nincs tobb automatikus ujrainditas\n", (unsigned)MEM_RESTART_MAX);
+    memLimitLogged = true;
+    return;
+  }
+  if (memEmerg && now - memEmergSince >= MEM_EMERG_MS) { memRestart(emerg, true); return; }
+  if (now - memCritSince < MEM_CRIT_MS) return;
+#if NET_ENABLED
+  if (crit != 3 && !netRecoverDone) {   // először a hálózat (a verem nem javul tőle)
+    netRecoverDone = true;
+    netRecoverT = now;
+    netRecoverReq = true;
+    return;
+  }
+  if (crit != 3 && now - netRecoverT < NET_RECOVER_WAIT_MS) return;
+#endif
+  if (!on && !faultActive && !onReqBtn && !onReqTrig) { memRestart(crit, false); return; }
+  if (!memWaitLogged) slogc("Memoria: ujrainditas a relek kikapcsolasa utan\n");
+  memWaitLogged = true;
+}
+
 void handleStatsTimer(unsigned long now) {   // halasztott mentés (STATS_MIN_GAP_MS), bekapcsolva óránként mentés
   if (stDirty && !on && now - stLastSave >= STATS_MIN_GAP_MS) statsSave();   // bekapcsolva a kikapcsolás / az óránkénti mentés viszi
   if (!on || now - stLastSave < STATS_SAVE_MS) return;
@@ -2240,6 +2378,7 @@ void loop() {
   handleRemoteTrigger();
   handleSerial();
   handleStatsTimer(now);
+  memGuard(now);
   logWindow();
   delay(1);
 }
