@@ -2208,6 +2208,8 @@ void setup() {
   } else if (memWasOn) {   // a memória-őr kapcsolta ki: a korábbi állapot visszaáll (minimális kikapcsolt idő után)
     if (powerHold) holdBtnUsed = true;
     switchOn("memoria ujrainditas utan", true);
+  } else if (memRestarted) {   // kikapcsolt relénél indult újra: KI is marad (a trigger következő aktív éle kapcsol be)
+    slogc("Memoria miatti ujrainditas kikapcsolt relenel: KI marad\n");
   } else if (!powerHold && !trigOff && trig.stable == LOW && (crashReset || TRIGGER_ON_BOOT)) {
     switchOn(crashReset ? "fagyas utan" : "indulaskor aktiv trigger", false);
   }
