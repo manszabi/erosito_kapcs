@@ -14,6 +14,7 @@
 #include <esp_system.h>
 #include <esp_attr.h>
 #include <esp_timer.h>
+#include <esp_heap_caps.h>
 
 // ======================================================================= Platform
 #if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
@@ -138,6 +139,8 @@ const unsigned long STA_RETRY_BUSY_MS = 300000;  // AP-n lévő kliens mellett r
 const unsigned long MQTT_RETRY_MS    = 10000;    // sikertelen MQTT-kliens indítás után ennyi múlva újra
 const unsigned long EVENT_MAX_AGE_S  = 600;      // a Home Assistant csomag ennél régebbi eseményt nem elemez
 const uint32_t      HEAP_WARN_BYTES  = 20000;    // figyelmeztetés, ha a legkisebb szabad memória ez alá esett
+const uint32_t      HEAP_BLOCK_WARN  = 8000;     // figyelmeztetés: a legnagyobb szabad blokk ez alatt (töredezettség)
+const uint32_t      STACK_WARN_BYTES = 512;      // figyelmeztetés: egy task szabad verme ez alatt
 
 static_assert(OPTO_MIN_AVG > MAINS_MIN_LOW, "OPTO_MIN_AVG > MAINS_MIN_LOW kell");
 static_assert(MAINS_LOSS_MS >= 20, "MAINS_LOSS_MS >= 20 ms kell (2 felperiodus)");
@@ -260,6 +263,22 @@ volatile bool netResetReq = false;    // 'W': hálózati beállítások törlés
 volatile bool netStateDirty = true;
 void netEvent(const char *type, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void switchOn(const char *src, bool manual);   // előre deklarálva: a hibakezelés is hívja
+
+// Taskok (verem-figyeléshez)
+TaskHandle_t loopTaskH = nullptr, logTaskH = nullptr, netTaskH = nullptr;
+uint32_t stackMinFree(const char **name) {   // a legkevesebb szabad verem a taskok közül (bájt)
+  uint32_t best = UINT32_MAX;
+  const char *nm = "-";
+  TaskHandle_t h[3] = {loopTaskH, logTaskH, netTaskH};
+  const char *n[3] = {"vezerles", "naplo", "halozat"};
+  for (int i = 0; i < 3; i++) {
+    if (!h[i]) continue;
+    uint32_t f = (uint32_t)uxTaskGetStackHighWaterMark(h[i]);
+    if (f < best) { best = f; nm = n[i]; }
+  }
+  if (name) *name = nm;
+  return best;
+}
 
 // Áramszünet utáni várakozás hátralévő ideje: reset után megmarad, tápvesztéskor elvész
 const uint32_t HOLD_MAGIC = 0x484F4C44UL;
@@ -536,6 +555,17 @@ int statsWarnings(char *buf, size_t len) {   // figyelmeztetések szövege (üre
     n++;
     snprintf(buf + strlen(buf), len - strlen(buf), " keves szabad memoria (min. %lu bajt);",
              (unsigned long)esp_get_minimum_free_heap_size());
+  }
+  size_t blk = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  if (blk < HEAP_BLOCK_WARN) {   // sok szabad memória, de csak apró darabokban
+    n++;
+    snprintf(buf + strlen(buf), len - strlen(buf), " toredezett memoria (legnagyobb blokk %lu);", (unsigned long)blk);
+  }
+  const char *tn;
+  uint32_t sf = stackMinFree(&tn);
+  if (sf < STACK_WARN_BYTES) {
+    n++;
+    snprintf(buf + strlen(buf), len - strlen(buf), " keves verem (%s: %lu);", tn, (unsigned long)sf);
   }
   return n;
 }
@@ -1140,13 +1170,13 @@ void buildState(char *js, size_t len, bool forWeb) {
            "{\"power\":\"%s\",\"rl2\":\"%s\",\"trigger\":\"%s\",\"trig_enabled\":%s,\"trig_en\":\"%s\",\"hold\":%s,"
            "\"fault\":\"%s\",\"warning\":\"%s\",\"problem\":\"%s\",\"on_hours\":%lu.%lu,\"on_count\":%lu,"
            "\"relay_count\":%lu,\"mains_loss\":%lu,\"faults\":%lu,\"power_ups\":%lu,\"opto_now\":%u,"
-           "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d,\"heap_free\":%lu,\"heap_min\":%lu",
+           "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d,\"heap_free\":%lu,\"heap_min\":%lu,\"heap_block\":%lu",
            on ? "ON" : "OFF", rl2On ? "ON" : "OFF", trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
            trigOff ? "OFF" : "ON", powerHold ? "true" : "false", flt ? faultName(lastFault) : "nincs", w[0] ? w + 1 : "nincs",
            (flt || w[0]) ? "ON" : "OFF", h10 / 10, h10 % 10, (unsigned long)st.onCount, (unsigned long)st.relayCount,
            (unsigned long)st.mainsLoss, (unsigned long)st.faults, (unsigned long)st.powerUps, (unsigned)fbCount,
            a / 10, a % 10, b / 10, b % 10, (int)WiFi.RSSI(), (unsigned long)esp_get_free_heap_size(),
-           (unsigned long)esp_get_minimum_free_heap_size());
+           (unsigned long)esp_get_minimum_free_heap_size(), (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   if (n < 0 || (size_t)n >= len) { strlcpy(js, "{}", len); return; }
   if (forWeb) {
     char ss[70], mu[200], mus[70], ci[34], cg[34], cm[34], cd[34];
@@ -1234,6 +1264,7 @@ void netDiscovery() {
   netDisc("sensor", "opto_base", "\"Optó alapérték\"", ",\"ent_cat\":\"diagnostic\"");
   netDisc("sensor", "rssi", "\"WiFi jel\"", ",\"unit_of_meas\":\"dBm\",\"dev_cla\":\"signal_strength\",\"ent_cat\":\"diagnostic\"");
   netDisc("sensor", "heap_min", "\"Legkisebb szabad memória\"", ",\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\"");
+  netDisc("sensor", "heap_block", "\"Legnagyobb szabad memóriablokk\"", ",\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\"");
 }
 
 void mqttStart() {
@@ -1385,7 +1416,7 @@ let tr=false,cf=false;const $=i=>document.getElementById(i);
 const L={rl2:'NTC áthidalva (RL2)',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
 fault:'Hiba',warning:'Figyelmeztetés',on_hours:'Üzemidő (óra)',on_count:'Bekapcsolások',relay_count:'Relé kapcsolások',
 mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',ip_mode:'IP mód',ip_error:'IP-hiba',
-rssi:'WiFi jel (dBm)',mdns:'mDNS',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',board:'Alaplap'};
+rssi:'WiFi jel (dBm)',mdns:'mDNS',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',heap_block:'Legnagyobb szabad blokk (B)',board:'Alaplap'};
 const V=x=>x===true?'igen':x===false?'nem':x==='ON'?'BE':x==='OFF'?'KI':x;
 async function upd(){try{const r=await fetch('/api/status');if(r.status==401){location='/login';return;}const s=await r.json();tr=s.trig_enabled;let h='';
 for(const k in L)if(k in s&&s[k]!=='')h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
@@ -1881,7 +1912,7 @@ void netTask(void *) {
 
 void netStart() {
   netQ = xQueueCreate(16, sizeof(NetEvt));
-  if (netQ) xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, AUX_PRIO, nullptr, AUX_CORE);
+  if (netQ) xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, AUX_PRIO, &netTaskH, AUX_CORE);
 }
 
 void netStatusLine() {
@@ -1933,8 +1964,14 @@ void printHealth() {
         (unsigned long)((uint64_t)st.relayCount * 100 / RELAY_LIFE));
   slogc("  Halozatkieses: %lu, hiba: %lu, aramszunet utani indulas: %lu\n", (unsigned long)st.mainsLoss,
         (unsigned long)st.faults, (unsigned long)st.powerUps);
-  slogc("  Futasido: %lu ora, szabad memoria: %lu bajt (legkisebb: %lu)\n", uptimeHours(),
-        (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
+  slogc("  Futasido: %lu ora, szabad memoria: %lu bajt (legkisebb: %lu, legnagyobb blokk: %lu)\n", uptimeHours(),
+        (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size(),
+        (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+  {
+    const char *tn;
+    uint32_t sf = stackMinFree(&tn);
+    slogc("  Szabad verem (legkevesebb): %lu bajt (%s)\n", (unsigned long)sf, tn);
+  }
   if (MAINS_CHECK) {
     unsigned a = (unsigned)(st.optoAvg * 10 + 0.5f), b = (unsigned)(st.optoBase * 10 + 0.5f),
              l = (unsigned)(lastSessMean * 10 + 0.5f);
@@ -2057,7 +2094,8 @@ void setup() {
   initOutputs();
   Serial.begin(115200);
   logQ = xQueueCreate(24, sizeof(LogMsg));   // tele sornál az üzenet elvész, a vezérlés nem áll meg
-  if (logQ) xTaskCreatePinnedToCore(logTask, "slog", 4096, nullptr, AUX_PRIO, nullptr, AUX_CORE);
+  if (logQ) xTaskCreatePinnedToCore(logTask, "slog", 4096, nullptr, AUX_PRIO, &logTaskH, AUX_CORE);
+  loopTaskH = xTaskGetCurrentTaskHandle();   // a setup és a loop ugyanabban a taskban fut
   bool nvsOk = loadSettings();
   initInputs();
   initWatchdog();

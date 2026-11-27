@@ -177,7 +177,7 @@ A program hónapokig, évekig megszakítás nélkül futhat:
 - minden időzítés kezdőidő + időtartam alapú, így a `millis()` 49,7 naponkénti túlcsordulása nem okoz hibát;
 - a vezérlés futás közben nem foglal dinamikus memóriát (a WiFi- és MQTT-könyvtár a saját taskjában igen, a vezérléstől függetlenül);
 - az NVS-be csak eseménykor és bekapcsolva óránként ír, ami a flash élettartamához képest elhanyagolható;
-- a szabad és a valaha mért legkisebb szabad memória látszik a `h` parancsnál, a weboldalon és a Home Assistantben; 20 kB alatt figyelmeztetés jön;
+- a szabad, a valaha mért legkisebb szabad memória és a legnagyobb szabad blokk (töredezettség) látszik a `h` parancsnál, a weboldalon és a Home Assistantben; figyelmeztetés jön 20 kB legkisebb szabad memória, 8 kB legnagyobb blokk, illetve bármelyik task 512 bájt alatti szabad verme esetén (a `h` a legkevesebb szabad vermet is kiírja);
 - a futásidő és az események életkora 64 bites órával számol; a Home Assistant csomag a 10 percnél régebbi eseményt (pl. hosszú MQTT-kimaradás után) nem elemzi.
 
 ## Fordítás
