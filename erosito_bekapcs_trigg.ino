@@ -486,10 +486,10 @@ int mainsFault() {
 void statsSave(bool force = false) {   // force nélkül legfeljebb STATS_MIN_GAP_MS-onként; a többit a statsTimer menti
   if (!stDirty) return;
   if (!force && stLastSave && millis() - stLastSave < STATS_MIN_GAP_MS) return;
+  stLastSave = millis();   // a próbálkozás ideje: hibás NVS-nél se próbálja minden ciklusban
   if (!prefs.begin("relay", false)) return;
   if (prefs.putBytes("stats", &st, sizeof st) == sizeof st) stDirty = false;
   prefs.end();
-  stLastSave = millis();
 }
 
 void statsAccount() {   // bekapcsolt idő hozzáadása
