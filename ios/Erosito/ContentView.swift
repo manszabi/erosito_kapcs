@@ -47,6 +47,8 @@ struct ContentView: View {
                     Section("Állapot") {
                         row("Trigger jel", s.trigger == "ON" ? "aktív" : "nincs")
                         row("NTC áthidalva (RL2)", s.rl2 == "ON" ? "igen" : "nem")
+                        if let spk = s.spk { row("Hangszórók", spk == "ON" ? "csatlakoztatva" : "leválasztva") }
+                        if s.dc == "ON" { row("DC a hangszórókimeneten", "VAN", alert: true) }
                         if s.hold == true { row("Áramszünet utáni várakozás", "folyamatban") }
                         row("Hiba", s.fault ?? "-", alert: (s.fault ?? "nincs") != "nincs")
                         row("Figyelmeztetés", s.warning ?? "-", alert: (s.warning ?? "nincs") != "nincs")
@@ -79,12 +81,25 @@ struct ContentView: View {
     }
 }
 
+private func ipField(_ title: String, _ text: Binding<String>) -> some View {
+    TextField(title, text: text)
+        .keyboardType(.numbersAndPunctuation)
+        .textInputAutocapitalization(.never)
+        .autocorrectionDisabled()
+}
+
 struct SettingsView: View {
     @Environment(ErositoClient.self) private var client
     @Environment(Discovery.self) private var discovery
     @Environment(\.dismiss) private var dismiss
     @State private var host = ""
     @State private var password = ""
+    @State private var espIp = ""
+    @State private var espGw = ""
+    @State private var espMask = ""
+    @State private var espDns = ""
+    @State private var ipMessage: String?
+    @State private var ipLoaded = false   // az IP-mezők csak akkor töltődnek, ha már megjött az állapot (különben üresen DHCP-t mentene)
 
     var body: some View {
         NavigationStack {
@@ -125,6 +140,27 @@ struct SettingsView: View {
                 } footer: {
                     Text("Felhasználó: admin. Ugyanaz a jelszó, mint az erősítő weboldalán.")
                 }
+                Section {
+                    ipField("Fix IP-cím (üresen: DHCP)", $espIp)
+                    ipField("Átjáró (router)", $espGw)
+                    ipField("Maszk (üresen: 255.255.255.0)", $espMask)
+                    ipField("DNS (üresen: az átjáró)", $espDns)
+                    Button("Mentés az erősítőn") {
+                        Task {
+                            ipMessage = await client.setNetworkIP(ip: espIp, gateway: espGw, mask: espMask, dns: espDns)
+                            host = client.host
+                        }
+                    }
+                    .disabled(!ipLoaded || client.busy)
+                    if let error = client.status?.ipError, !error.isEmpty {
+                        Text("IP-hiba: \(error) – az erősítő DHCP-t használ.").font(.callout).foregroundStyle(.red)
+                    }
+                    if let ipMessage { Text(ipMessage).font(.callout).foregroundStyle(.secondary) }
+                } header: {
+                    Text("Az erősítő IP-címe")
+                } footer: {
+                    Text("Jelenleg: \(client.status?.ipMode ?? "-"). Hibás beállításnál az erősítő DHCP-t használ. Az erősítő a mentés után pár másodpercre lecsatlakozik; a relék nem kapcsolnak.")
+                }
             }
             .navigationTitle("Eszköz")
             .toolbar {
@@ -143,6 +179,14 @@ struct SettingsView: View {
                 host = client.host
                 password = client.password
                 discovery.start()
+            }
+            .onChange(of: client.status?.power, initial: true) { _, _ in
+                guard !ipLoaded, let s = client.status else { return }
+                espIp = s.cfgIp ?? ""
+                espGw = s.cfgGw ?? ""
+                espMask = s.cfgMask ?? ""
+                espDns = s.cfgDns ?? ""
+                ipLoaded = true
             }
             .onDisappear { discovery.stop() }
         }

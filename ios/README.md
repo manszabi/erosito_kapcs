@@ -61,6 +61,8 @@ Ha a nyers `Info.plist`-et szerkeszted, ugyanez XML-ben:
 
 - **Be / Ki:** ugyanazok a szabályok, mint a gombnál: 5 s minimális kikapcsolt idő, az RL2 2 s-os minimuma, hiba utáni tiltás; az áramszünet utáni 2 perces várakozás alatt egyszer kapcsolható be.
 - **Trigger figyelés:** be- és kikapcsolás, az ESP elmenti.
+- **Az erősítő IP-címe** (fogaskerék → „Az erősítő IP-címe”): fix IP vagy üresen DHCP; hibás beállításnál az ESP DHCP-t használ. Fix IP mentése után az app az új címre vált.
 - **Állapot:** 2 s-onként frissül, amíg az app előtérben van; lehúzással azonnal frissíthető.
-- **Nem találja?** A telefon és az erősítő ugyanazon a WiFi-hálózaton legyen (vendéghálózat vagy kliens-elszigetelés esetén a keresés nem működik). Kézzel megadható az IP-cím (a soros `s` parancs kiírja) vagy az `erosito.local` név.
+- **Keresés:** Bonjourral (ha az ESP mDNS-e működik) és a telefon saját /24 hálózatának végigpróbálásával (`/api/id`), így mDNS nélkül is megtalálja (kb. 10 s).
+- **Nem találja?** A telefon és az erősítő ugyanazon a WiFi-hálózaton legyen (vendéghálózat vagy kliens-elszigetelés esetén nem működik). Kézzel megadható az IP-cím (a soros `s` parancs kiírja) vagy az `erosito.local` név (ez csak működő mDNS-sel).
 - A kapcsolat sima HTTP, Basic jelszóval: csak a helyi hálózaton használd.

@@ -17,6 +17,8 @@ A program a XIAO D-lábneveit használja, így a bekötés **mindkét lapon azon
 | D4 | 6 | 5 | Hálózatfigyelő optó, LOW = van hálózat (43k felhúzó) |
 | D5 | 7 | 6 | RL2 tranzisztor |
 | D10 | 10 | 9 | RL1 tranzisztor |
+| D7 | 20 | 44 | Hangszórórelék (bal + jobb) tranzisztora |
+| D8 | 8 | 7 | Hangszóróvédő: 2 optó (bal, jobb) közösítve, LOW = DC (10k felhúzó) |
 
 A relé-tranzisztorok bázisán legyen lehúzó ellenállás, hogy reset alatt ne kattanjanak be.
 
@@ -37,6 +39,23 @@ A relé-tranzisztorok bázisán legyen lehúzó ellenállás, hogy reset alatt n
 
 Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalább 6 mm legyen.
 
+## Hangszóróvédő
+
+```
+ 3V3 ──[10k]──┬── D8            D7 ──[470]──┬── B (NPN, pl. BC337)
+              ├── optó BAL  C               └─[10k]── GND
+              └── optó JOBB C               C ── mindkét relé tekercse (+ szabadonfutó dióda tekercsenként) ── tápfeszültség
+    optó E (mindkettő) ── GND               E ── GND
+```
+
+- A két optó kimenete közösítve: bármelyik csatornán DC = LOW. A D8 C3-on indítási láb, ezért a 10k felhúzó kötelező, és induláskor nem lehet LOW (bekapcsolatlan erősítőnél az optók nem vezetnek).
+- A relé-tranzisztor bázisán 10k lehúzó: reset alatt a hangszórók biztosan le vannak választva. A 470 Ω-os bázisellenállással (kb. 5 mA) a BC337 két relé tekercsáramát (100–200 mA) is telítésben kapcsolja.
+- **Bekapcsolás:** RL1 → 1 s → RL2 → 1 s (`SPK_DELAY_MS`) → hangszórók.
+- **Kikapcsolás, hálózatkiesés, bármilyen hiba:** a hangszórók elsőként (ugyanabban a ms-ban) válnak le.
+- **DC a kimeneten** (20 ms szűrés, `DC_FILTER_MS`): a hangszórók és a relék azonnal KI, hibajelzés (LED, napló, weboldal, Home Assistant). Utána csak gomb, távoli parancs vagy a trigger új éle kapcsol be; magától nem.
+- **Bekapcsoláskor DC** (pl. bekapcsolási tranziens): a hangszórók legfeljebb 2 s-ig várnak (`DC_START_WAIT_MS`); ha addig nem szűnik meg, hiba.
+- A rövid (20 ms alatti) tüske nem hiba. `SPEAKER_PROTECT = false`: a D7 / D8 nincs használva.
+
 ## Kezelés
 
 - **Gomb, hosszú nyomás (≥ 0,4 s):** be / ki.
@@ -55,10 +74,11 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
 | Beállítás | Érték | Jelentés |
 |---|---|---|
 | `RL2_DELAY_MS` | 1 s | Lágyindítás: az RL1 után ennyivel húz be az RL2 |
+| `SPK_DELAY_MS` | 1 s | Az RL2 után ennyivel kapcsolnak a hangszórók |
 | `RL2_MIN_ON_MS` | 2 s | Kikapcsolás előtt az RL2 legalább ennyi ideig be van húzva |
 | `MIN_OFF_MS` | 5 s | Minimális kikapcsolt idő; az ez alatti kérést a program megjegyzi |
 | `POWERUP_HOLD_MS` | 2 perc | Áramszünet után eddig nincs trigger, a gomb csak egyszer kapcsolhat be |
-| `FAULT_LOCKOUT_MS` | 5 s | Hiba után eddig nincs bekapcsolás |
+| `FAULT_LOCKOUT_MS` | 5 s | Hiba után eddig nincs bekapcsolás (ismétlődő hibánál duplázódik, legfeljebb `FAULT_LOCKOUT_MAX_MS` = 5 perc) |
 | `MAINS_LOSS_MS` | 25 ms | Hálózatkiesés: a relék azonnal elengednek |
 
 ## Működés röviden
@@ -69,6 +89,8 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
 
   A függő kérés alatt a további gombnyomásokat figyelmen kívül hagyja.
 - **Hálózatkiesés:** a relék azonnal elengednek. 5 s múlva, ha a trigger még aktív, a program újra bekapcsol lágyindítással.
+  - **Sorozatos kiesés:** ha 3 kiesés jön úgy, hogy mindegyik az előzőtől számított 10 percen belül van, a program nem kapcsol vissza magától (a LED 3 s-onként kettőt villan). Gomb, weboldal, app és Home Assistant bekapcsol.
+  - 10 perc kiesés nélkül a sorozat nullázódik; ha a trigger aktív, a program bekapcsol.
 - **Áramszünet után:** 2 perc várakozás, utána aktív triggerre bekapcsol.
   - A trigger a várakozás alatt hatástalan.
   - Egy hosszú gombnyomás a várakozás alatt is bekapcsol (a boot utáni első 5 s-ban nyomva az 5 s leteltével), de csak egyszer: a további gombnyomás a várakozás végéig hatástalan, így gombbal addig kikapcsolni sem lehet.
@@ -77,6 +99,11 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
   - A tiltás alatti gombnyomás elvész.
   - A tiltás végén aktív triggerre bekapcsol.
   - A beragadt gombot és az összehegedt relét a program elmenti, és újraindítás után is ellenőrzi.
+- **Ismétlődő hiba** (beragadt gomb, zajos trigger, hibás RL1 kimenet): a tiltás minden újabb hibánál duplázódik (5, 10, 20 … s, legfeljebb 5 perc).
+  - A 3. ismétlődő hibától a trigger nem kapcsol be automatikusan; a gomb és a távoli bekapcsolás működik (a LED 3 s-onként kettőt villan).
+  - 10 perc nyugodt bemenet (a trigger zaja kikapcsolt relénél is figyelve) után a sorozat nullázódik; ha a trigger aktív, a program bekapcsol.
+  - A szándékos 3 rövid gombnyomás és a hálózatkiesés nem számít a sorozatba.
+- **Flash kímélése:** a statisztikát legfeljebb percenként menti (hálózatkiesésnél legfeljebb 30 s-onként); a halasztott mentést a program magától pótolja.
 
 ## Állapotfigyelés
 
@@ -114,13 +141,21 @@ Ki- és bekapcsolható a program elején: `#define HOME_ASSISTANT true` / `false
 - **Beállítások forrása:** a weboldalon mentett beállítás (NVS); ha nincs, a `secrets.h` (nem kötelező, minta: `secrets.example.h`); ha az sincs, azonnal AP mód.
 - **AP mód:** ha 30 s alatt nem sikerül csatlakozni (vagy nincs beállítás), saját WiFi indul:
   - hálózat: `Erosito-XXXX`, jelszó: `erosito123` (vagy a `secrets.h`-ban megadott `AP_PASS`);
-  - weboldal: `http://192.168.4.1` (a telefon általában magától megnyitja).
+  - weboldal: `http://192.168.4.1` (a telefon általában magától megnyitja); AP módban az `erosito.local` név nem működik.
 - Az AP alatt a program 30 s-onként újrapróbálja a routert (ha kliens van az AP-n, 5 percenként), így áramszünet után, amikor a router lassabban indul, magától csatlakozik. Csatlakozás után az AP leáll, amint 1 percig nincs rajta kliens.
 - A beállítások mentése **nem indítja újra** az ESP-t (a relék nem engednek el): a program élőben csatlakozik újra.
 
+### Fix IP-cím
+
+- Megadható a `secrets.h`-ban (`STATIC_IP`, `STATIC_GW`, `STATIC_MASK`, `STATIC_DNS`), a weboldalon (AP módban is) és az iOS-appban; a mentett érték felülírja a `secrets.h`-t.
+- **Üres IP-cím: DHCP.** Hibás beállításnál (rossz formátum, az átjáró nincs az alhálózatban, hálózati / szórási cím, nem összefüggő maszk) is DHCP; az ok a soros naplóban és a weboldal „IP-hiba” sorában látszik.
+- Maszk üresen: 255.255.255.0; DNS üresen: az átjáró.
+- Mentés után az ESP újraindulás nélkül csatlakozik újra (a relék nem engednek el); a weboldal és az iOS-app az új címre vált.
+- A fix címet a router DHCP-tartományán kívül válaszd, hogy ne ütközzön más eszközzel.
+
 ### Weboldal
 
-Normál üzemben az ESP IP-címén vagy a `http://erosito.local` címen érhető el (a soros `s` parancs kiírja az IP-t). Felhasználó: `admin`, jelszó: alapból az AP jelszava, a weboldalon módosítható (legalább 8 karakter).
+Normál üzemben az ESP IP-címén vagy a `http://erosito.local` címen érhető el (a soros `s` parancs kiírja az IP-t és az mDNS állapotát). Ha a core-ban nincs `ESPmDNS` (pl. 4.0.0 / ESP-IDF 6), a program beépített mDNS-válaszolót használ. Felhasználó: `admin`, jelszó: alapból az AP jelszava, a weboldalon módosítható (legalább 8 karakter).
 
 - **Állapot** (2 s-onként frissül): be / ki, RL2, trigger, várakozás, hiba, figyelmeztetés, számlálók, optó, WiFi, IP, MQTT.
 - **Vezérlés:** Bekapcsolás / Kikapcsolás (ugyanazok a szabályok, mint a gombnál), Trigger figyelés be / ki (mentve, mint a két rövid gombnyomás).
@@ -162,7 +197,16 @@ A program hónapokig, évekig megszakítás nélkül futhat:
 - minden időzítés kezdőidő + időtartam alapú, így a `millis()` 49,7 naponkénti túlcsordulása nem okoz hibát;
 - a vezérlés futás közben nem foglal dinamikus memóriát (a WiFi- és MQTT-könyvtár a saját taskjában igen, a vezérléstől függetlenül);
 - az NVS-be csak eseménykor és bekapcsolva óránként ír, ami a flash élettartamához képest elhanyagolható;
-- a szabad és a valaha mért legkisebb szabad memória látszik a `h` parancsnál, a weboldalon és a Home Assistantben; 20 kB alatt figyelmeztetés jön;
+- **memória-őr** (belső RAM, mindkét lapon azonos határokkal; a `h` parancs kiírja az értékeket és a határokat, a weboldal és a Home Assistant is mutatja):
+
+  | | szabad memória | legnagyobb blokk | szabad verem | teendő |
+  |---|---|---|---|---|
+  | figyelmeztetés | 20 kB | 8 kB | 512 B | figyelmeztetés (soros, web, Home Assistant, AI-elemzés) |
+  | kritikus, 30 s-ig | 12 kB | 4 kB | 256 B | előbb a hálózat újraindul (a relék nem érintettek); ha 60 s alatt nem javul, szabályos újraindítás, amint a relék KI vannak |
+  | vészhelyzet, 3 s-ig | 6 kB | 2 kB | 128 B | azonnali szabályos újraindítás: relék KI, mentés, újraindulás után (5 s) a relék visszakapcsolnak, ha be voltak |
+
+  - Normál futásnál a szabad belső RAM kb. 150–200 kB (C3), illetve 200–280 kB (S3), így a határok messze vannak; az S3 PSRAM-ja nem számít bele (a WiFi nem használhatja).
+  - Hurok ellen: 3 egymás utáni memória-újraindítás után csak figyelmeztet; 1 óra zavartalan futás nullázza a számlálót. Újraindulás után esemény megy a Home Assistantnak.
 - a futásidő és az események életkora 64 bites órával számol; a Home Assistant csomag a 10 percnél régebbi eseményt (pl. hosszú MQTT-kimaradás után) nem elemzi.
 
 ## Fordítás

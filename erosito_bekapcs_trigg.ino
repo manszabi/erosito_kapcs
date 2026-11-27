@@ -14,6 +14,7 @@
 #include <esp_system.h>
 #include <esp_attr.h>
 #include <esp_timer.h>
+#include <esp_heap_caps.h>
 
 // ======================================================================= Platform
 #if !defined(ESP_ARDUINO_VERSION_MAJOR) || (ESP_ARDUINO_VERSION_MAJOR < 3)
@@ -57,6 +58,7 @@ const UBaseType_t AUX_PRIO = 0;  // a vezérlés (1) alatt: C3-on a hálózat se
 #include <ESPmDNS.h>   // Bonjour: a telefonos app és a http://erosito.local így találja meg
 #define MDNS_ENABLED 1
 #else
+#include <lwip/sockets.h>   // ESPmDNS nélkül (pl. core 4.0 / IDF 6): beépített mDNS válaszoló
 #define MDNS_ENABLED 0
 #endif
 #define NET_ENABLED 1
@@ -71,6 +73,9 @@ const int PIN_TRIG = D3;   // trigger opto, LOW = aktív, 10k felhúzó         
 const int PIN_FB1  = D4;   // RL1 kimenet opto (CNY17-3 + DB106 + 3x43k), LOW = hálózat  C3: GPIO6,  S3: GPIO5
 const int PIN_RL2  = D5;   // RL2 tranzisztor                                            C3: GPIO7,  S3: GPIO6
 const int PIN_RL1  = D10;  // RL1 tranzisztor                                            C3: GPIO10, S3: GPIO9
+const int PIN_SPK  = D7;   // hangszórórelék (bal + jobb) tranzisztora, bázis 10k lehúzó C3: GPIO20, S3: GPIO44
+const int PIN_DC   = D8;   // hangszóróvédő: 2 opto (bal, jobb) közösítve, LOW = DC     C3: GPIO8 (indítási láb:
+                           // 10k felhúzó kell, induláskor ne legyen LOW),                    S3: GPIO7
 
 // ======================================================================= Beállítások
 // Relék, indulás
@@ -80,6 +85,12 @@ const unsigned long MIN_OFF_MS       = 5000;     // minimális kikapcsolt idő (
 const unsigned long POWERUP_HOLD_MS  = 120000UL; // áramszünet után ennyi ideig nincs trigger (a gomb egyszer bekapcsolhat)
 const bool          TRIGGER_ON_BOOT  = true;     // induláskor aktív triggerre bekapcsol
 const bool          BROWNOUT_IS_POWERLOSS = true; // brownout reset = áramszünet (különben fagyás)
+
+// Hangszóróvédő
+const bool          SPEAKER_PROTECT  = true;     // false: a D7 / D8 nincs használva
+const unsigned long SPK_DELAY_MS     = 1000;     // az RL2 után ennyivel kapcsolnak a hangszórók (mint az RL2 késleltetése)
+const unsigned long DC_FILTER_MS     = 20;       // ennyi ideig folyamatos LOW = DC (relé-zavar ellen)
+const unsigned long DC_START_WAIT_MS = 2000;     // bekapcsoláskor ennyi ideig várhat a DC megszűnésére a hangszórók előtt
 
 // Gomb, LED
 const unsigned long DEBOUNCE_MS      = 30;
@@ -96,6 +107,10 @@ const unsigned long FAULT_BLINK_MS   = 1000;     // hibavillogás hossza
 const unsigned long FAULT_HALF_MS    = 100;
 const unsigned long FAULT_LOCKOUT_MS = 5000;     // hiba után ennyi ideig nincs bekapcsolás
 const bool          AUTO_ON_AFTER_FAULT = true;  // tiltás végén aktív triggerre bekapcsol
+const unsigned long FAULT_LOCKOUT_MAX_MS = 300000UL; // ismétlődő hibánál a tiltás duplázódik, legfeljebb eddig
+const unsigned long FAULT_STREAK_RESET_MS = 600000UL; // ennyi hibamentes idő után a sorozat nullázódik
+const uint8_t       FAULT_STREAK_PAUSE = 3;      // ennyi ismétlődő hiba után a trigger nem kapcsol be automatikusan
+const uint8_t       LOSS_STREAK_PAUSE = 3;       // ennyi hálózatkiesés FAULT_STREAK_RESET_MS-on belül: nincs automatikus visszakapcsolás
 const unsigned long BTN_STUCK_MS     = 10000;    // ennyi ideig nyomott gomb = beragadt
 const unsigned long WINDOW_MS        = 1000;     // váltásszámláló ablak
 const uint8_t       CHANGE_LIMIT     = 4;        // trigger: max. váltás / ablak
@@ -119,6 +134,7 @@ const uint8_t       OPTO_MIN_AVG     = 15;       // figyelmeztetés: az opto át
 const uint8_t       OPTO_BASE_SESSIONS = 5;      // az első ennyi mérési szakasz átlaga lesz az alapérték
 const uint16_t      OPTO_MIN_WINDOWS = 250;      // egy szakasz csak ennyi ablak (~10 s) felett számít
 const unsigned long STATS_SAVE_MS    = 3600000UL; // bekapcsolva óránként mentés
+const unsigned long STATS_MIN_GAP_MS = 60000;    // két NVS-mentés között legalább ennyi idő (flash kímélése)
 
 // Soros napló, Home Assistant
 const uint8_t       LOG_MAX_PER_SEC  = 5;        // slog() korlát; slogc() korlátlan
@@ -131,9 +147,27 @@ const unsigned long AP_LINGER_MS     = 60000;    // csatlakozás után az AP enn
 const unsigned long STA_RETRY_BUSY_MS = 300000;  // AP-n lévő kliens mellett ritkábban próbálja a routert (pl. megjegyzett AP a telefonon)
 const unsigned long MQTT_RETRY_MS    = 10000;    // sikertelen MQTT-kliens indítás után ennyi múlva újra
 const unsigned long EVENT_MAX_AGE_S  = 600;      // a Home Assistant csomag ennél régebbi eseményt nem elemez
-const uint32_t      HEAP_WARN_BYTES  = 20000;    // figyelmeztetés, ha a legkisebb szabad memória ez alá esett
+
+// Memória-őr: a belső RAM-ot méri (a WiFi, az lwIP és a taskok csak ezt használhatják; az S3 PSRAM-ja nem számít),
+// így a határok mindkét lapon azonosak. Normál futásnál a szabad belső RAM: C3 kb. 150-200 kB, S3 kb. 200-280 kB.
+//                                 figyelmeztetés   kritikus*      vészhelyzet**
+const uint32_t HEAP_WARN_BYTES  = 20000, HEAP_CRIT_BYTES  = 12000, HEAP_EMERG_BYTES  = 6000;   // szabad belső RAM
+const uint32_t HEAP_BLOCK_WARN  = 8000,  HEAP_BLOCK_CRIT  = 4000,  HEAP_BLOCK_EMERG  = 2000;   // legnagyobb blokk (WiFi: 1,6-2 kB-os pufferek)
+const uint32_t STACK_WARN_BYTES = 512,   STACK_CRIT_BYTES = 256,   STACK_EMERG_BYTES = 128;    // legkevesebb szabad verem
+// * MEM_CRIT_MS-ig tartó kritikus állapot: előbb a hálózat újraindul (a relék nem érintettek), ha nem javul,
+//   szabályos újraindítás, amikor a relék KI vannak.  ** MEM_EMERG_MS után azonnali szabályos újraindítás
+//   (relék KI, újraindulás után a korábbi állapot visszaáll), mielőtt egy összeomlás döntene helyette.
+const unsigned long MEM_CRIT_MS      = 30000;
+const unsigned long MEM_EMERG_MS     = 3000;
+const unsigned long NET_RECOVER_WAIT_MS = 60000;   // a hálózat újraindítása után ennyi idő a javulásra
+const unsigned long MEM_OK_RESET_MS  = 600000UL;   // ennyi rendben lévő idő után a hálózat újra újraindítható
+const uint8_t       MEM_RESTART_MAX  = 3;          // ennyi egymás utáni memória-újraindítás után csak figyelmeztet (hurok ellen)
+const unsigned long MEM_RESTART_OK_MS = 3600000UL; // ennyi zavartalan futás után a számláló nullázódik
 
 static_assert(OPTO_MIN_AVG > MAINS_MIN_LOW, "OPTO_MIN_AVG > MAINS_MIN_LOW kell");
+#if !defined(ARDUINO_USB_CDC_ON_BOOT) || (ARDUINO_USB_CDC_ON_BOOT == 0)
+static_assert(!SPEAKER_PROTECT, "A D7 (hangszororele) a soros port RX laba: Eszkozok > USB CDC On Boot > Enabled kell");
+#endif
 static_assert(MAINS_LOSS_MS >= 20, "MAINS_LOSS_MS >= 20 ms kell (2 felperiodus)");
 static_assert(MAINS_GAP_MS < MAINS_LOSS_MS, "MAINS_GAP_MS < MAINS_LOSS_MS kell");
 static_assert(MAINS_FAULT_MS > MAINS_WIN_MS, "MAINS_FAULT_MS > MAINS_WIN_MS kell");
@@ -141,10 +175,13 @@ static_assert(RL2_DELAY_MS > MAINS_WIN_MS + MAINS_FAULT_MS, "RL2_DELAY_MS: az RL
 static_assert(MAINS_OFF_GRACE_MS < MIN_OFF_MS, "MAINS_OFF_GRACE_MS < MIN_OFF_MS kell");
 static_assert(LONG_PRESS_MS < DOUBLE_GAP_MS, "LONG_PRESS_MS < DOUBLE_GAP_MS kell");
 static_assert(WDT_MS >= 1000, "WDT_MS >= 1000 kell (NVS iras)");
+static_assert(HEAP_WARN_BYTES > HEAP_CRIT_BYTES && HEAP_CRIT_BYTES > HEAP_EMERG_BYTES, "memoria hatarok sorrendje");
+static_assert(HEAP_BLOCK_WARN > HEAP_BLOCK_CRIT && HEAP_BLOCK_CRIT > HEAP_BLOCK_EMERG, "blokk hatarok sorrendje");
+static_assert(STACK_WARN_BYTES > STACK_CRIT_BYTES && STACK_CRIT_BYTES > STACK_EMERG_BYTES, "verem hatarok sorrendje");
 
 // ======================================================================= Típusok, kódok (int, nem enum: az Arduino IDE prototípusai miatt)
-const int F_NONE = 0, F_STUCK = 1, F_CHATTER = 2, F_PRESSES = 3, F_NOMAINS = 4, F_MAINSOFF = 5, F_MAINSLOST = 6;
-const int IN_BTN = 0, IN_TRIG = 1, IN_FB1 = 2;
+const int F_NONE = 0, F_STUCK = 1, F_CHATTER = 2, F_PRESSES = 3, F_NOMAINS = 4, F_MAINSOFF = 5, F_MAINSLOST = 6, F_DC = 7;
+const int IN_BTN = 0, IN_TRIG = 1, IN_FB1 = 2, IN_DC = 3;
 
 struct Input {
   uint8_t pin;
@@ -182,6 +219,11 @@ bool rl2Settled = false;        // az RL2 már legalább RL2_MIN_ON_MS-ig behúz
 unsigned long onTime = 0, rl2Time = 0;
 unsigned long offTime = 0;      // utolsó kikapcsolás (0 = boot)
 bool minOffActive = true;       // a minimális kikapcsolt idő fut (bootkor is)
+bool spkOn = false;             // hangszórórelék BE
+bool spkReady = false;          // az RL2 óta letelt SPK_DELAY_MS (rögzítve: túlcsordulás-biztos)
+bool dcActive = false;          // szűrt DC-jel (hangszóróvédő)
+bool dcRawPrev = false, spkWait = false;
+unsigned long dcLowSince = 0, spkWaitT = 0;
 bool powerHold = false;         // áramszünet utáni várakozás
 bool holdBtnUsed = false;       // a várakozás alatt egy kézi (gomb / távoli) bekapcsolás engedett
 unsigned long holdStart = 0, holdDur = 0, lastHoldSave = 0;
@@ -202,6 +244,12 @@ int lastFault = F_NONE;
 int storedFault = F_NONE;       // NVS-ben tárolt hiba
 bool lockoutPending = false;    // hiba utáni tiltás
 unsigned long lockoutStart = 0, lockoutDur = 0;
+bool pauseLogged = false;           // a szünetelés üzenete egyszer
+uint8_t lossStreak = 0;             // egymás utáni hálózatkiesések
+unsigned long lossLastT = 0;        // az utolsó hálózatkiesés
+uint8_t faultStreak = 0;            // egymás utáni hardverhibák (zaj, beragadás, RL1 kimenet)
+unsigned long faultQuietT = 0;      // az utolsó hiba vége (a sorozat nullázásához)
+bool manualWait = false;           // F_NOMAINS / F_DC után: csak gomb / távoli / új trigger él kapcsol be
 
 // Bemenetek, gomb
 Input inputs[2] = {
@@ -245,9 +293,41 @@ volatile bool relayReq = false;     // 'R': relé számláló nullázása (relé
 volatile bool remoteOnReq = false, remoteOffReq = false;
 volatile int8_t remoteTrigReq = -1;   // weboldal / Home Assistant: trigger figyelés 1 = be, 0 = ki
 volatile bool netResetReq = false;    // 'W': hálózati beállítások törlése
+volatile bool netRecoverReq = false;  // memória-őr: a hálózat újraindítása (a relék nem érintettek)
 volatile bool netStateDirty = true;
 void netEvent(const char *type, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void switchOn(const char *src, bool manual);   // előre deklarálva: a hibakezelés is hívja
+
+// Taskok (verem-figyeléshez)
+TaskHandle_t loopTaskH = nullptr, logTaskH = nullptr, netTaskH = nullptr;
+uint32_t stackMinFree(const char **name) {   // a legkevesebb szabad verem a taskok közül (bájt)
+  uint32_t best = UINT32_MAX;
+  const char *nm = "-";
+  TaskHandle_t h[3] = {loopTaskH, logTaskH, netTaskH};
+  const char *n[3] = {"vezerles", "naplo", "halozat"};
+  for (int i = 0; i < 3; i++) {
+    if (!h[i]) continue;
+    uint32_t f = (uint32_t)uxTaskGetStackHighWaterMark(h[i]);
+    if (f < best) { best = f; nm = n[i]; }
+  }
+  if (name) *name = nm;
+  return best;
+}
+const uint32_t MEM_CAPS = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+uint32_t memFree()    { return (uint32_t)heap_caps_get_free_size(MEM_CAPS); }
+uint32_t memMinFree() { return (uint32_t)heap_caps_get_minimum_free_size(MEM_CAPS); }
+uint32_t memBlock()   { return (uint32_t)heap_caps_get_largest_free_block(MEM_CAPS); }
+
+// Memória miatti újraindítás nyoma (RTC: szoftveres reset után megmarad, tápvesztéskor elvész)
+const uint32_t MEMR_MAGIC = 0x4D454D52UL;
+RTC_NOINIT_ATTR uint32_t rtcMemInfo;    // 0-7: egymás utáni újraindítások, 8-15: ok, 16: relék BE voltak, 17: most történt
+RTC_NOINIT_ATTR uint32_t rtcMemCheck;
+uint32_t memInfo = 0;
+void memInfoSave(uint32_t v) { memInfo = v; rtcMemInfo = v; rtcMemCheck = MEMR_MAGIC ^ v; }
+void memInfoLoad() { memInfo = (rtcMemCheck == (MEMR_MAGIC ^ rtcMemInfo)) ? rtcMemInfo : 0; }
+const char *memReasonName(int r) {
+  return r == 1 ? "keves szabad memoria" : r == 2 ? "toredezett memoria" : r == 3 ? "keves verem" : "?";
+}
 
 // Áramszünet utáni várakozás hátralévő ideje: reset után megmarad, tápvesztéskor elvész
 const uint32_t HOLD_MAGIC = 0x484F4C44UL;
@@ -263,6 +343,8 @@ unsigned long uptimeHours() { return (unsigned long)(esp_timer_get_time() / 3600
 
 unsigned long minOffLeft() { return (on || !minOffActive) ? 0 : timeLeft(offTime, MIN_OFF_MS); }
 unsigned long lockoutLeft() { return lockoutPending ? timeLeft(lockoutStart, lockoutDur) : 0; }
+bool lossPaused() { return lossStreak >= LOSS_STREAK_PAUSE; }      // sorozatos hálózatkiesés
+bool autoPaused() { return faultStreak >= FAULT_STREAK_PAUSE || lossPaused(); }   // ismétlődő hiba: csak gomb / távoli kapcsol be
 
 void holdSave(unsigned long left) {
   rtcHoldLeft = (uint32_t)left;
@@ -364,6 +446,9 @@ void ledUpdate() {
     level = (ledFlashes > 0) ? ledFlashOn : ledBase;
   } else if (powerHold && !on) {
     level = (now % HOLD_FLASH_PERIOD_MS) < HOLD_FLASH_MS;
+  } else if (!on && autoPaused()) {   // ismétlődő hiba / sorozatos kiesés: dupla felvillanás 3 s-onként
+    unsigned long ph = now % HOLD_FLASH_PERIOD_MS;
+    level = ph < HOLD_FLASH_MS || (ph >= 4 * HOLD_FLASH_MS && ph < 5 * HOLD_FLASH_MS);
   }
   digitalWrite(PIN_LED, level ? HIGH : LOW);
 }
@@ -466,12 +551,13 @@ int mainsFault() {
 }
 
 // ======================================================================= Állapotfigyelés (NVS)
-void statsSave() {
+void statsSave(bool force = false) {   // force nélkül legfeljebb STATS_MIN_GAP_MS-onként; a többit a statsTimer menti
   if (!stDirty) return;
+  if (!force && stLastSave && millis() - stLastSave < STATS_MIN_GAP_MS) return;
+  stLastSave = millis();   // a próbálkozás ideje: hibás NVS-nél se próbálja minden ciklusban
   if (!prefs.begin("relay", false)) return;
   if (prefs.putBytes("stats", &st, sizeof st) == sizeof st) stDirty = false;
   prefs.end();
-  stLastSave = millis();
 }
 
 void statsAccount() {   // bekapcsolt idő hozzáadása
@@ -514,10 +600,20 @@ int statsWarnings(char *buf, size_t len) {   // figyelmeztetések szövege (üre
                (unsigned)(100 - st.optoAvg * 100 / st.optoBase + 0.5f));
     }
   }
-  if (esp_get_minimum_free_heap_size() < HEAP_WARN_BYTES) {   // hónapokig tartó futásnál: memóriafogyás jele
+  if (memMinFree() < HEAP_WARN_BYTES) {   // hónapokig tartó futásnál: memóriafogyás jele
     n++;
-    snprintf(buf + strlen(buf), len - strlen(buf), " keves szabad memoria (min. %lu bajt);",
-             (unsigned long)esp_get_minimum_free_heap_size());
+    snprintf(buf + strlen(buf), len - strlen(buf), " keves szabad memoria (min. %lu bajt);", (unsigned long)memMinFree());
+  }
+  uint32_t blk = memBlock();
+  if (blk < HEAP_BLOCK_WARN) {   // sok szabad memória, de csak apró darabokban
+    n++;
+    snprintf(buf + strlen(buf), len - strlen(buf), " toredezett memoria (legnagyobb blokk %lu);", (unsigned long)blk);
+  }
+  const char *tn;
+  uint32_t sf = stackMinFree(&tn);
+  if (sf < STACK_WARN_BYTES) {
+    n++;
+    snprintf(buf + strlen(buf), len - strlen(buf), " keves verem (%s: %lu);", tn, (unsigned long)sf);
   }
   return n;
 }
@@ -527,6 +623,30 @@ void checkWarnings() {
   int n = statsWarnings(w, sizeof w);
   if (lastWarnCount >= 0 && n > lastWarnCount) netEvent("warning", "Öregedés:%s", w);
   lastWarnCount = n;
+}
+
+// ======================================================================= Hangszórók (az RL2 után SPK_DELAY_MS-mal, DC nélkül)
+void spkSet(bool s) {
+  if (!SPEAKER_PROTECT || s == spkOn) return;
+  digitalWrite(PIN_SPK, s ? HIGH : LOW);
+  spkOn = s;
+  netStateDirty = true;
+  slog(s ? "Hangszorok BE\n" : "Hangszorok KI\n");
+}
+
+void dcUpdate() {   // LOW = DC valamelyik csatornán; DC_FILTER_MS szűrés
+  if (!SPEAKER_PROTECT) return;
+  unsigned long now = millis();
+  bool raw = digitalRead(PIN_DC) == LOW;
+  if (raw && !dcRawPrev) dcLowSince = now;
+  dcRawPrev = raw;
+  if (!raw) dcActive = false;
+  else if (!dcActive && now - dcLowSince >= DC_FILTER_MS) dcActive = true;
+}
+
+void updateSpeakers() {   // a hibakezelés után fut: hiba, DC vagy kikapcsolt RL2 mellett azonnal KI
+  if (!SPEAKER_PROTECT) return;
+  spkSet(on && rl2On && spkReady && !faultActive && !dcActive);
 }
 
 // ======================================================================= Relék
@@ -539,6 +659,7 @@ void setState(bool s, const char *src) {
   onReqTrig = false;
   if (on) {
     digitalWrite(PIN_RL1, HIGH);
+    manualWait = false;
     onTime = millis();
     ledBase = true;
     mainsCmd();
@@ -553,10 +674,13 @@ void setState(bool s, const char *src) {
     stDirty = true;
     statsSave();
   } else {
+    spkSet(false);   // a hangszórók elsőként válnak le
     digitalWrite(PIN_RL2, LOW);
     digitalWrite(PIN_RL1, LOW);
     rl2On = false;
     rl2Settled = false;
+    spkReady = false;
+    spkWait = false;
     offTime = millis();
     minOffActive = true;
     ledBase = false;
@@ -573,11 +697,13 @@ void setState(bool s, const char *src) {
 }
 
 void updateRl2(unsigned long now) {   // RL2 késleltetve (csak igazolt hálózat után), függő kikapcsolás az RL2 minimum után
-  if (on && !rl2On && !faultActive && (!MAINS_CHECK || fbConfirmed) && now - onTime >= RL2_DELAY_MS) {
+  if (on && !rl2On && !faultActive && (!MAINS_CHECK || (fbConfirmed && now - fbLastLow <= MAINS_GAP_MS)) &&   // épp van hálózat (nem kiesés eleje)
+      now - onTime >= RL2_DELAY_MS) {
     digitalWrite(PIN_RL2, HIGH);
     rl2On = true;
     rl2Time = millis();
     rl2Settled = false;
+    spkReady = false;
     st.rl2Count++;
     stDirty = true;
     netStateDirty = true;
@@ -587,6 +713,7 @@ void updateRl2(unsigned long now) {   // RL2 késleltetve (csak igazolt hálóza
 }
 
 // ======================================================================= Hibák
+
 void saveFault(int f) {   // csak az ellenőrizhető hardverhibát mentjük (beragadt gomb, hálózat KI relénél)
   if (f != F_NONE && f != F_STUCK && f != F_MAINSOFF) return;
   if (f == storedFault) return;
@@ -603,6 +730,7 @@ const char *faultName(int f) {
     case F_NOMAINS:   return "nincs hálózat az RL1 után";
     case F_MAINSOFF:  return "hálózat van kikapcsolt relénél (összehegedt érintkező?)";
     case F_MAINSLOST: return "hálózatkiesés";
+    case F_DC:        return "DC a hangszórókimeneten (végfok hiba?)";
     default:          return "nincs";
   }
 }
@@ -613,27 +741,52 @@ void startFault(int idx, int f) {
   if (f == F_MAINSLOST) st.mainsLoss++;
   else st.faults++;
   stDirty = true;
+  if (f != F_MAINSLOST && f != F_PRESSES) {   // a szándékos 3 nyomás és a kiesés nem hardverhiba-sorozat
+    if (faultStreak && millis() - faultQuietT >= FAULT_STREAK_RESET_MS) faultStreak = 0;
+    if (faultStreak < 255) faultStreak++;
+    pauseLogged = false;
+  }
+  if (f == F_MAINSLOST) {   // FAULT_STREAK_RESET_MS-on belüli kiesések száma
+    if (lossStreak && millis() - lossLastT >= FAULT_STREAK_RESET_MS) lossStreak = 0;
+    if (lossStreak < 255) lossStreak++;
+    lossLastT = millis();
+    pauseLogged = false;
+  }
+  if (idx == IN_DC) {   // DC a kimeneten: hangszórók és relék azonnal KI
+    spkSet(false);
+    setState(false, "DC a hangszorokimeneten");
+  }
   if (idx == IN_FB1) {   // hálózati hiba: relék azonnal KI
     bool retry = on && !offPending;
     setState(false, (f == F_MAINSLOST) ? "halozatkieses" : "halozati hiba");
-    if (f == F_MAINSLOST && retry) {
+    if (f == F_MAINSLOST && retry && lossPaused())
+      slogc("!!! %u halozatkieses %lu percen belul: nincs automatikus visszakapcsolas (gomb / tavoli: igen)\n",
+            (unsigned)lossStreak, FAULT_STREAK_RESET_MS / 60000);
+    else if (f == F_MAINSLOST && retry) {
       onReqTrig = true;
       onReqSrc = "trigger halozatkieses utan";
     }
   }
+  if (f == F_MAINSLOST && millis() - stLastSave >= 30000) statsSave(true);   // valódi áramszünet: a számláló ne vesszen el (legfeljebb 30 s-onként)
   lastFault = f;
   saveFault(f);
-  if (f == F_MAINSLOST) netEvent("mains_loss", "Hálózatkiesés bekapcsolt állapotban%s", onReqTrig ? ", újrakapcsolás aktív triggerre" : "");
-  else netEvent("fault", "%s: %s", idx == IN_FB1 ? "RL1 kimenet" : inputs[idx].name, faultName(f));
+  if (f == F_MAINSLOST) netEvent("mains_loss", "Hálózatkiesés bekapcsolt állapotban%s", onReqTrig ? ", újrakapcsolás aktív triggerre"
+                                 : lossPaused() ? ", sorozatos kiesés: nincs automatikus visszakapcsolás" : "");
+  else netEvent("fault", "%s: %s", idx == IN_FB1 ? "RL1 kimenet" : idx == IN_DC ? "Hangszóróvédő" : inputs[idx].name, faultName(f));
   faultActive = true;
   faultStart = millis();
   ledFaultBlink = true;
   ledFlashes = 0;
   ledT = faultStart;
+  if (idx == IN_DC) {
+    slogc("!!! HANGSZOROVEDO: DC a kimeneten -> hangszorok es relek AZONNAL KI (ujra: gomb, tavoli vagy uj trigger el)\n");
+    return;
+  }
   if (idx == IN_FB1) {
     if (f == F_MAINSLOST)
       slogc("!!! HALOZATKIESES: relek AZONNAL KI%s\n",
-            onReqTrig ? ", MIN_OFF_MS utan aktiv triggerre ujra be" : " (kikapcsolas volt fuggoben: nincs ujrakapcsolas)");
+            onReqTrig ? ", MIN_OFF_MS utan aktiv triggerre ujra be"
+            : lossPaused() ? " (sorozatos kieses: nincs ujrakapcsolas)" : " (kikapcsolas volt fuggoben: nincs ujrakapcsolas)");
     else
       slogc("!!! RL1 kimenet HIBA: %s -> relek KI\n",
             (f == F_NOMAINS) ? "nincs halozat (az RL1 nem huzott be, vagy nincs halozat)"
@@ -664,7 +817,12 @@ void endFault() {
   lockoutPending = true;
   lockoutStart = millis();
   lockoutDur = FAULT_LOCKOUT_MS;
-  slogc("Hiba vege: relek KI, %lu ms-ig nincs bekapcsolas\n", FAULT_LOCKOUT_MS);
+  if (lastFault != F_PRESSES)   // ismétlődő hiba: 5, 10, 20 ... s, legfeljebb FAULT_LOCKOUT_MAX_MS
+    for (uint8_t i = 1; i < faultStreak && lockoutDur < FAULT_LOCKOUT_MAX_MS; i++) lockoutDur *= 2;
+  if (lockoutDur > FAULT_LOCKOUT_MAX_MS) lockoutDur = FAULT_LOCKOUT_MAX_MS;
+  faultQuietT = millis();
+  slogc("Hiba vege: relek KI, %lu ms-ig nincs bekapcsolas%s\n", lockoutDur,
+        autoPaused() ? " (ismetlodo hiba: a trigger automatika szunetel)" : "");
 }
 
 void endLockout() {   // tiltás vége: ok ellenőrzése, mentett hiba törlése, automata bekapcsolás
@@ -680,8 +838,23 @@ void endLockout() {   // tiltás vége: ok ellenőrzése, mentett hiba törlése
     int was = lastFault;
     lastFault = F_NONE;
     saveFault(F_NONE);
-    if (was == F_NOMAINS) slog("Nincs automatikus ujrakapcsolas: gomb vagy uj trigger kell\n");
-    else if (AUTO_ON_AFTER_FAULT && !trigOff && trig.stable == LOW) switchOn("aktiv trigger hiba utan", false);
+    manualWait = (was == F_NOMAINS || was == F_DC);
+    if (manualWait) slog("Nincs automatikus ujrakapcsolas: gomb vagy uj trigger kell\n");
+    else if (AUTO_ON_AFTER_FAULT && !trigOff && trig.stable == LOW && !autoPaused()) switchOn("aktiv trigger hiba utan", false);
+  }
+}
+
+void dcCheck() {   // bekapcsolva: DC a hangszórók alatt = azonnali hiba; csatlakozás előtt DC_START_WAIT_MS türelem
+  if (!SPEAKER_PROTECT || !on || faultActive) return;
+  if (!dcActive) { spkWait = false; return; }
+  if (spkOn) { startFault(IN_DC, F_DC); return; }
+  if (!(rl2On && spkReady)) return;   // még nem esedékes: a bekapcsolási tranziens nem hiba
+  if (!spkWait) {
+    spkWait = true;
+    spkWaitT = millis();
+    slog("DC a kimeneten: a hangszorok varnak (%lu ms)\n", DC_START_WAIT_MS);
+  } else if (millis() - spkWaitT >= DC_START_WAIT_MS) {
+    startFault(IN_DC, F_DC);
   }
 }
 
@@ -744,7 +917,7 @@ void processPendingOn(bool inHold) {   // függő bekapcsolás a minimális kika
   const char *src = onReqSrc;
   onReqBtn = false;
   onReqTrig = false;
-  if (byBtn) switchOn("gomb", true);
+  if (byBtn) switchOn(src, true);
   else if (!trigOff && trig.stable == LOW) switchOn(src, false);
   else slog("Fuggo bekapcsolas elmarad: a trigger nem aktiv\n");
 }
@@ -755,7 +928,11 @@ void triggerEdge() {   // trigger: aktív élre be, inaktív élre ki
       offPending = false;
       slog("Trigger ujra aktiv: kikapcsolas elmarad\n");
     }
-    switchOn("trigger", false);
+    if (!on && autoPaused()) {
+      if (!pauseLogged) slog("Trigger: ismetlodo hiba miatt nincs automatikus bekapcsolas (gomb / tavoli: igen)\n");
+      pauseLogged = true;
+    }
+    else switchOn("trigger", false);
   } else {
     requestOff("trigger", false);
   }
@@ -872,8 +1049,20 @@ void holdButton(unsigned long now, bool changed) {   // áramszünet utáni vár
 #define AP_PASS "erosito123"   // AP jelszó és a weboldal alapjelszava (legalább 8 karakter)
 #endif
 static_assert(sizeof(AP_PASS) - 1 >= 8 && sizeof(AP_PASS) - 1 <= 32, "AP_PASS: 8-32 karakter kell (WPA2)");
+#ifndef STATIC_IP
+#define STATIC_IP ""   // üres: DHCP
+#endif
+#ifndef STATIC_GW
+#define STATIC_GW ""
+#endif
+#ifndef STATIC_MASK
+#define STATIC_MASK ""   // üres: 255.255.255.0
+#endif
+#ifndef STATIC_DNS
+#define STATIC_DNS ""    // üres: az átjáró
+#endif
 
-struct NetCfg { char ssid[33], pass[65], mqttUri[96], mqttUser[33], mqttPass[65], webPass[33]; };
+struct NetCfg { char ssid[33], pass[65], mqttUri[96], mqttUser[33], mqttPass[65], webPass[33], ip[16], gw[16], mask[16], dns[16]; };
 NetCfg ncfg;
 Preferences netPrefs;           // külön példány: a hálózati task használja
 struct NetEvt { char type[12]; char text[100]; int64_t t; };   // t: 64 bites óra (µs)
@@ -883,9 +1072,32 @@ DNSServer dns;
 esp_mqtt_client_handle_t mqtt = nullptr;
 volatile bool mqttUp = false;
 volatile bool netNeedDisc = false;
-bool netStarted = false, apOn = false, netReconfig = false;
+bool netStarted = false, apOn = false;
+bool reconfWifi = false, reconfMqtt = false;   // függő újrakonfigurálás (a HTTP-válasz kiküldése után)
+unsigned long reconfAt = 0;
+const unsigned long RECONF_DELAY_MS = 1500;   // ennyi idő marad a válasz kiküldésére a WiFi bontása előtt
+
+void requestReconfig(bool wifiChanged, bool mqttChanged) {
+  reconfWifi |= wifiChanged;
+  reconfMqtt |= mqttChanged;
+  reconfAt = millis();
+}
+
+bool ipCfgDiffers(const NetCfg &x, const NetCfg &y) {
+  return strcmp(x.ip, y.ip) || strcmp(x.gw, y.gw) || strcmp(x.mask, y.mask) || strcmp(x.dns, y.dns);
+}
 unsigned long netLastState = 0, staLastOk = 0, staLastBegin = 0, apIdleSince = 0, mqttLastTry = 0, apLastTry = 0;
-bool mqttTried = false, apTried = false, mdnsStarted = false;
+bool mqttTried = false, apTried = false;
+int mdnsState = 0;               // 0 = még nem indult, 1 = működik, 2 = hiba (újrapróbálja)
+unsigned long mdnsLastTry = 0;
+const char *mdnsName() {
+  return mdnsState == 1 ? "OK (" NET_ID ".local)" : mdnsState == 2 ? "hiba" : "nem indult";
+}
+
+void wifiMode(wifi_mode_t m) {   // energiatakarékos mód nélkül: megbízható mDNS (multicast) és gyors weboldal
+  WiFi.mode(m);
+  WiFi.setSleep(false);
+}
 char apSsid[24];
 char webToken[33];             // bejelentkezési süti (NVS-ben: áramszünet után is érvényes; jelszócserekor új)
 const char *T_STATE   = NET_ID "/state";
@@ -893,6 +1105,75 @@ const char *T_EVENT   = NET_ID "/event";
 const char *T_CMD     = NET_ID "/power/set";
 const char *T_TRIGCMD = NET_ID "/trigger/set";
 const char *T_STATUS  = NET_ID "/status";
+
+// ---- Fix IP: ellenőrzés (hibás vagy üres beállításnál DHCP) ----
+// IPCFG_PURE_BEGIN
+bool ipParse(const char *s, uint32_t *out) {   // "a.b.c.d" -> 32 bites szám; üres vagy hibás: false
+  uint32_t v = 0;
+  for (int part = 0; part < 4; part++) {
+    if (*s < '0' || *s > '9') return false;
+    uint32_t x = 0;
+    int digits = 0;
+    while (*s >= '0' && *s <= '9') {
+      x = x * 10 + (uint32_t)(*s - '0');
+      if (++digits > 3 || x > 255) return false;
+      s++;
+    }
+    v = (v << 8) | x;
+    if (part < 3) {
+      if (*s != '.') return false;
+      s++;
+    }
+  }
+  if (*s) return false;
+  *out = v;
+  return true;
+}
+
+// nullptr = rendben (o[0..3]: IP, átjáró, maszk, DNS), egyébként a hiba oka
+const char *ipCheck(const char *ip, const char *gw, const char *mask, const char *dnsIp, uint32_t o[4]) {
+  uint32_t a, g, m, d;
+  if (!ipParse(ip, &a)) return "hibás IP-cím";
+  if (!ipParse(mask[0] ? mask : "255.255.255.0", &m)) return "hibás maszk";
+  uint32_t host = ~m;
+  if (m == 0 || (host & (host + 1)) != 0) return "a maszk nem összefüggő";
+  if (host < 3) return "túl kicsi alhálózat";
+  if ((a >> 24) == 0 || (a >> 24) == 127 || (a >> 24) >= 224) return "nem használható IP-cím";
+  if ((a & host) == 0 || (a & host) == host) return "az IP-cím hálózati vagy szórási cím";
+  if (!gw[0]) return "hiányzik az átjáró";
+  if (!ipParse(gw, &g)) return "hibás átjáró";
+  if ((g & m) != (a & m)) return "az átjáró nincs az IP-cím alhálózatában";
+  if (g == a) return "az átjáró nem lehet maga az eszköz";
+  if (dnsIp[0]) {
+    if (!ipParse(dnsIp, &d)) return "hibás DNS";
+  } else {
+    d = g;
+  }
+  o[0] = a; o[1] = g; o[2] = m; o[3] = d;
+  return nullptr;
+}
+// IPCFG_PURE_END
+
+int ipMode = 0;                  // 0 = DHCP, 1 = fix IP, 2 = hibás fix IP, ezért DHCP
+const char *ipErr = nullptr;
+
+IPAddress ipAddr(uint32_t v) { return IPAddress((v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF); }
+
+void ipApply() {   // WiFi.begin előtt: fix IP, vagy DHCP (üres / hibás beállításnál)
+  uint32_t o[4];
+  ipErr = ncfg.ip[0] ? ipCheck(ncfg.ip, ncfg.gw, ncfg.mask, ncfg.dns, o) : nullptr;
+  ipMode = !ncfg.ip[0] ? 0 : (ipErr ? 2 : 1);
+  if (ipMode == 1) {
+    WiFi.config(ipAddr(o[0]), ipAddr(o[1]), ipAddr(o[2]), ipAddr(o[3]));
+  } else {
+    WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));   // DHCP
+    if (ipMode == 2) slogc("Fix IP hibas (%s): DHCP\n", ipErr);
+  }
+}
+
+const char *ipModeName() {
+  return ipMode == 1 ? "fix" : ipMode == 2 ? "hibás fix IP, DHCP" : "DHCP";
+}
 
 // ---- Beállítások: NVS ("net"), ennek hiányában a secrets.h ----
 void netCfgLoad() {
@@ -902,6 +1183,10 @@ void netCfgLoad() {
   strlcpy(ncfg.mqttUser, MQTT_USER, sizeof ncfg.mqttUser);
   strlcpy(ncfg.mqttPass, MQTT_PASS, sizeof ncfg.mqttPass);
   strlcpy(ncfg.webPass, AP_PASS, sizeof ncfg.webPass);
+  strlcpy(ncfg.ip, STATIC_IP, sizeof ncfg.ip);
+  strlcpy(ncfg.gw, STATIC_GW, sizeof ncfg.gw);
+  strlcpy(ncfg.mask, STATIC_MASK, sizeof ncfg.mask);
+  strlcpy(ncfg.dns, STATIC_DNS, sizeof ncfg.dns);
   webToken[0] = 0;
   if (!netPrefs.begin("net", true)) return;   // nincs mentett beállítás
   if (netPrefs.isKey("token")) netPrefs.getString("token", webToken, sizeof webToken);
@@ -912,6 +1197,12 @@ void netCfgLoad() {
     netPrefs.getString("mqttUser", ncfg.mqttUser, sizeof ncfg.mqttUser);
     netPrefs.getString("mqttPass", ncfg.mqttPass, sizeof ncfg.mqttPass);
     netPrefs.getString("webPass", ncfg.webPass, sizeof ncfg.webPass);
+  }
+  if (netPrefs.isKey("ip")) {   // a fix IP külön is menthető (iOS-app)
+    netPrefs.getString("ip", ncfg.ip, sizeof ncfg.ip);
+    netPrefs.getString("gw", ncfg.gw, sizeof ncfg.gw);
+    netPrefs.getString("mask", ncfg.mask, sizeof ncfg.mask);
+    netPrefs.getString("dns", ncfg.dns, sizeof ncfg.dns);
   }
   netPrefs.end();
 }
@@ -924,6 +1215,10 @@ bool netCfgSave() {
   ok &= netPrefs.putString("mqttUser", ncfg.mqttUser) == strlen(ncfg.mqttUser);
   ok &= netPrefs.putString("mqttPass", ncfg.mqttPass) == strlen(ncfg.mqttPass);
   ok &= netPrefs.putString("webPass", ncfg.webPass) == strlen(ncfg.webPass);
+  ok &= netPrefs.putString("ip", ncfg.ip) == strlen(ncfg.ip);
+  ok &= netPrefs.putString("gw", ncfg.gw) == strlen(ncfg.gw);
+  ok &= netPrefs.putString("mask", ncfg.mask) == strlen(ncfg.mask);
+  ok &= netPrefs.putString("dns", ncfg.dns) == strlen(ncfg.dns);
   netPrefs.end();
   return ok;
 }
@@ -972,30 +1267,35 @@ void buildState(char *js, size_t len, bool forWeb) {
   unsigned a = (unsigned)(st.optoAvg * 10 + 0.5f), b = (unsigned)(st.optoBase * 10 + 0.5f);
   bool flt = faultActive || lockoutPending;
   int n = snprintf(js, len,
-           "{\"power\":\"%s\",\"rl2\":\"%s\",\"trigger\":\"%s\",\"trig_enabled\":%s,\"trig_en\":\"%s\",\"hold\":%s,"
+           "{\"power\":\"%s\",\"rl2\":\"%s\",\"spk\":\"%s\",\"dc\":\"%s\",\"trigger\":\"%s\",\"trig_enabled\":%s,\"trig_en\":\"%s\",\"hold\":%s,"
            "\"fault\":\"%s\",\"warning\":\"%s\",\"problem\":\"%s\",\"on_hours\":%lu.%lu,\"on_count\":%lu,"
            "\"relay_count\":%lu,\"mains_loss\":%lu,\"faults\":%lu,\"power_ups\":%lu,\"opto_now\":%u,"
-           "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d,\"heap_free\":%lu,\"heap_min\":%lu",
-           on ? "ON" : "OFF", rl2On ? "ON" : "OFF", trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
+           "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d,\"heap_free\":%lu,\"heap_min\":%lu,\"heap_block\":%lu",
+           on ? "ON" : "OFF", rl2On ? "ON" : "OFF", spkOn ? "ON" : "OFF", dcActive ? "ON" : "OFF", trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
            trigOff ? "OFF" : "ON", powerHold ? "true" : "false", flt ? faultName(lastFault) : "nincs", w[0] ? w + 1 : "nincs",
            (flt || w[0]) ? "ON" : "OFF", h10 / 10, h10 % 10, (unsigned long)st.onCount, (unsigned long)st.relayCount,
            (unsigned long)st.mainsLoss, (unsigned long)st.faults, (unsigned long)st.powerUps, (unsigned)fbCount,
-           a / 10, a % 10, b / 10, b % 10, (int)WiFi.RSSI(), (unsigned long)esp_get_free_heap_size(),
-           (unsigned long)esp_get_minimum_free_heap_size());
+           a / 10, a % 10, b / 10, b % 10, (int)WiFi.RSSI(), (unsigned long)memFree(),
+           (unsigned long)memMinFree(), (unsigned long)memBlock());
   if (n < 0 || (size_t)n >= len) { strlcpy(js, "{}", len); return; }
   if (forWeb) {
-    char ss[70], mu[200], mus[70];
+    char ss[70], mu[200], mus[70], ci[34], cg[34], cm[34], cd[34];
+    jsonEsc(ci, sizeof ci, ncfg.ip);
+    jsonEsc(cg, sizeof cg, ncfg.gw);
+    jsonEsc(cm, sizeof cm, ncfg.mask);
+    jsonEsc(cd, sizeof cd, ncfg.dns);
     jsonEsc(ss, sizeof ss, ncfg.ssid);
     jsonEsc(mu, sizeof mu, ncfg.mqttUri);
     jsonEsc(mus, sizeof mus, ncfg.mqttUser);
     bool sta = WiFi.status() == WL_CONNECTED;
     n += snprintf(js + n, len - n,
-                  ",\"wifi\":\"%s\",\"ip\":\"%s\",\"mqtt\":\"%s\",\"uptime_h\":%lu,\"board\":\"" BOARD_NAME "\","
-                  "\"cfg_ssid\":\"%s\",\"cfg_mqtt_uri\":\"%s\",\"cfg_mqtt_user\":\"%s\"",
+                  ",\"wifi\":\"%s\",\"ip\":\"%s\",\"mdns\":\"%s\",\"mqtt\":\"%s\",\"uptime_h\":%lu,\"board\":\"" BOARD_NAME "\","
+                  "\"cfg_ssid\":\"%s\",\"cfg_mqtt_uri\":\"%s\",\"cfg_mqtt_user\":\"%s\",\"ip_mode\":\"%s\",\"ip_error\":\"%s\","
+                  "\"cfg_ip\":\"%s\",\"cfg_gw\":\"%s\",\"cfg_mask\":\"%s\",\"cfg_dns\":\"%s\"",
                   sta ? (apOn ? "csatlakozva + AP" : "csatlakozva") : (apOn ? "AP mód" : "nincs"),
-                  sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"),
+                  sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"), mdnsName(),
                   !ncfg.mqttUri[0] ? "nincs beállítva" : (mqttUp ? "OK" : "nincs kapcsolat"),
-                  uptimeHours(), ss, mu, mus);
+                  uptimeHours(), ss, mu, mus, ipModeName(), ipErr ? ipErr : "", ci, cg, cm, cd);
     if (n < 0 || (size_t)n >= len - 1) { strlcpy(js, "{}", len); return; }
   }
   strlcat(js, "}", len);
@@ -1050,6 +1350,10 @@ void netDiscovery() {
   netDisc("switch", "trig_en", "\"Trigger figyelés\"", ",\"cmd_t\":\"" NET_ID "/trigger/set\",\"ic\":\"mdi:import\"");
   netDisc("binary_sensor", "rl2", "\"NTC áthidalva (RL2)\"", ",\"ent_cat\":\"diagnostic\"");
   netDisc("binary_sensor", "trigger", "\"Trigger\"", "");
+  if (SPEAKER_PROTECT) {
+    netDisc("binary_sensor", "spk", "\"Hangszórók\"", "");
+    netDisc("binary_sensor", "dc", "\"DC a hangszórókimeneten\"", ",\"dev_cla\":\"problem\"");
+  }
   netDisc("binary_sensor", "problem", "\"Probléma\"", ",\"dev_cla\":\"problem\"");
   netDisc("sensor", "fault", "\"Hiba\"", "");
   netDisc("sensor", "warning", "\"Figyelmeztetés\"", "");
@@ -1064,6 +1368,7 @@ void netDiscovery() {
   netDisc("sensor", "opto_base", "\"Optó alapérték\"", ",\"ent_cat\":\"diagnostic\"");
   netDisc("sensor", "rssi", "\"WiFi jel\"", ",\"unit_of_meas\":\"dBm\",\"dev_cla\":\"signal_strength\",\"ent_cat\":\"diagnostic\"");
   netDisc("sensor", "heap_min", "\"Legkisebb szabad memória\"", ",\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\"");
+  netDisc("sensor", "heap_block", "\"Legnagyobb szabad memóriablokk\"", ",\"unit_of_meas\":\"B\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\"");
 }
 
 void mqttStart() {
@@ -1124,6 +1429,7 @@ void mqttService() {   // discovery, események, állapot
 // ---- WiFi: STA a beállítások szerint; sikertelenség esetén AP mód (közben újrapróbál) ----
 void staBegin() {
   if (!ncfg.ssid[0]) return;
+  ipApply();
   WiFi.begin(ncfg.ssid, ncfg.pass);
   WiFi.setTxPower(WIFI_TX_POWER);
   staLastBegin = millis();
@@ -1132,7 +1438,7 @@ void staBegin() {
 void apStart() {
   apTried = true;
   apLastTry = millis();
-  WiFi.mode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
+  wifiMode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
   if (!WiFi.softAP(apSsid, AP_PASS)) {   // később újrapróbálja
     slogc("AP inditas sikertelen, ujraprobalas %lu s mulva\n", STA_RETRY_MS / 1000);
     return;
@@ -1148,7 +1454,7 @@ void apStart() {
 void apStop() {
   dns.stop();
   WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
+  wifiMode(WIFI_STA);
   apOn = false;
   slogc("AP mod vege: csatlakozva, weboldal: http://%s\n", WiFi.localIP().toString().c_str());
 }
@@ -1195,7 +1501,7 @@ label{display:block;margin-top:8px;font-size:.9em}input{width:100%;padding:7px;b
 </style></head><body><h1>Erősítő bekapcsoló</h1>
 <section><div id="st" class="st">Betöltés…</div>
 <button class="on big" onclick="post('/api/power','state=on')">Bekapcsolás</button><button class="off big" onclick="post('/api/power','state=off')">Kikapcsolás</button>
-<button id="tb" class="wide" onclick="post('/api/trigger','enabled='+(tr?0:1))">Trigger figyelés</button></section>
+<button id="tb" class="wide" disabled onclick="post('/api/trigger','enabled='+(tr?0:1))">Trigger figyelés</button></section>
 <section><h2>Állapot</h2><table id="t"></table></section>
 <section><details><summary>Beállítások</summary><form method="post" action="/api/config">
 <label>WiFi hálózat neve<input name="ssid" id="ssid" maxlength="32"></label>
@@ -1204,19 +1510,26 @@ label{display:block;margin-top:8px;font-size:.9em}input{width:100%;padding:7px;b
 <label>MQTT felhasználó<input name="mqtt_user" id="mus" maxlength="32"></label>
 <label>MQTT jelszó (üresen hagyva nem változik)<input name="mqtt_pass" type="password" maxlength="64"></label>
 <label>Weboldal jelszó (legalább 8 karakter; üresen hagyva nem változik)<input name="web_pass" type="password" maxlength="32"></label>
+<label>Fix IP-cím (üresen: DHCP, a router adja)<input name="ip" id="ip" maxlength="15" inputmode="decimal" placeholder="pl. 192.168.1.50"></label>
+<label>Átjáró (router címe)<input name="gw" id="gw" maxlength="15" inputmode="decimal" placeholder="pl. 192.168.1.1"></label>
+<label>Maszk (üresen: 255.255.255.0)<input name="mask" id="mask" maxlength="15" inputmode="decimal"></label>
+<label>DNS (üresen: az átjáró)<input name="dns" id="dns" maxlength="15" inputmode="decimal"></label>
 <button type="submit">Mentés</button></form></details></section><p><a href="/logout">Kijelentkezés</a></p>
 <script>
 let tr=false,cf=false;const $=i=>document.getElementById(i);
-const L={rl2:'NTC áthidalva (RL2)',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
+const L={rl2:'NTC áthidalva (RL2)',spk:'Hangszórók',dc:'DC a kimeneten',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
 fault:'Hiba',warning:'Figyelmeztetés',on_hours:'Üzemidő (óra)',on_count:'Bekapcsolások',relay_count:'Relé kapcsolások',
-mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',
-rssi:'WiFi jel (dBm)',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',board:'Alaplap'};
-const V=x=>x===true?'igen':x===false?'nem':x==='ON'?'BE':x==='OFF'?'KI':x;
-async function upd(){try{const r=await fetch('/api/status');if(r.status==401){location='/login';return;}const s=await r.json();tr=s.trig_enabled;let h='';
-for(const k in L)if(k in s)h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
+mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',ip_mode:'IP mód',ip_error:'IP-hiba',
+rssi:'WiFi jel (dBm)',mdns:'mDNS',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',heap_block:'Legnagyobb szabad blokk (B)',board:'Alaplap'};
+const E=x=>String(x).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const V=x=>x===true?'igen':x===false?'nem':x==='ON'?'BE':x==='OFF'?'KI':E(x);let fails=0;
+function off(){if(++fails<3)return;const st=$('st');st.textContent='Nincs kapcsolat';st.className='st';$('t').innerHTML='';$('tb').disabled=true;}
+async function upd(){try{const r=await fetch('/api/status',{cache:'no-store'});if(r.status==401){location='/login';return;}const s=await r.json();
+if(!('power' in s)){off();return;}fails=0;tr=s.trig_enabled;$('tb').disabled=false;let h='';
+for(const k in L)if(k in s&&s[k]!=='')h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
 $('t').innerHTML=h;const st=$('st');st.textContent=s.power=='ON'?'Bekapcsolva':'Kikapcsolva';st.className='st'+(s.power=='ON'?' on1':'');$('tb').textContent='Trigger figyelés: '+(tr?'BE – kikapcsolás':'KI – bekapcsolás');
-if(!cf){cf=true;$('ssid').value=s.cfg_ssid;$('mu').value=s.cfg_mqtt_uri;$('mus').value=s.cfg_mqtt_user;}}catch(e){}}
-async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});if(r.status==401){location='/login';return;}setTimeout(upd,300);}
+if(!cf&&'cfg_ssid' in s){cf=true;$('ssid').value=s.cfg_ssid;$('mu').value=s.cfg_mqtt_uri;$('mus').value=s.cfg_mqtt_user;$('ip').value=s.cfg_ip;$('gw').value=s.cfg_gw;$('mask').value=s.cfg_mask;$('dns').value=s.cfg_dns;}}catch(e){off();}}
+async function post(u,b){try{const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});if(r.status==401){location='/login';return;}}catch(e){off();}setTimeout(upd,300);}
 upd();setInterval(upd,2000);
 </script></body></html>)HTML";
 
@@ -1239,6 +1552,7 @@ bool cookieOk() {   // weboldal: tartós süti (a kezdőképernyőre tett app is
 
 bool apiAuth() {   // API: süti (weboldal) vagy Basic jelszó (iOS-app, más kliensek)
   if (cookieOk() || web.authenticate("admin", ncfg.webPass)) return true;
+  if (web.hasHeader("Authorization")) vTaskDelay(pdMS_TO_TICKS(1000));   // rossz jelszó: próbálgatás lassítása
   web.send(401, "text/plain", "Bejelentkezes szukseges");
   return false;
 }
@@ -1285,6 +1599,10 @@ void webIcon() {   // bejelentkezés nélkül: a kezdőképernyő ikonja
   web.send_P(200, "image/png", (const char *)ICON_PNG, sizeof ICON_PNG);
 }
 
+void webId() {   // jelszó nélkül: csak azonosít (az iOS-app IP-szkennelése ez alapján találja meg)
+  web.send(200, "application/json", "{\"device\":\"erosito\",\"board\":\"" BOARD_NAME "\"}");
+}
+
 void webManifest() {
   web.send(200, "application/manifest+json; charset=utf-8", MANIFEST);
 }
@@ -1295,7 +1613,7 @@ void webRoot() {
 
 void webStatus() {
   if (!apiAuth()) return;
-  char js[1200];
+  char js[1600];   // leghosszabb beállításokkal is elfér
   buildState(js, sizeof js, true);
   web.send(200, "application/json; charset=utf-8", js);
 }
@@ -1304,13 +1622,49 @@ void webPower() {   // mint a gomb / Home Assistant: ugyanazok a szabályok
   if (!apiAuth()) return;
   if (web.arg("state") == "on") remoteOnReq = true;
   else if (web.arg("state") == "off") remoteOffReq = true;
+  else { web.send(400, "text/plain", "state=on vagy state=off kell"); return; }
   web.send(200, "text/plain", "OK");
 }
 
-void webTrigger() {
+void webTrigger() {   // csak egyértelmű kérésre változtat
   if (!apiAuth()) return;
-  remoteTrigReq = (web.arg("enabled") == "1") ? 1 : 0;
+  if (web.arg("enabled") == "1") remoteTrigReq = 1;
+  else if (web.arg("enabled") == "0") remoteTrigReq = 0;
+  else { web.send(400, "text/plain", "enabled=1 vagy enabled=0 kell"); return; }
   web.send(200, "text/plain", "OK");
+}
+
+// fix IP a kérés mezőiből (ip, gw, mask, dns): üres IP vagy hiba -> DHCP; nullptr = rendben, egyébként a hiba oka
+const char *ipFromArgs(NetCfg &n) {
+  uint32_t o[4];
+  String ip = web.arg("ip"), gw = web.arg("gw"), mask = web.arg("mask"), dnsIp = web.arg("dns");
+  ip.trim(); gw.trim(); mask.trim(); dnsIp.trim();
+  const char *err = ip.length() ? ipCheck(ip.c_str(), gw.c_str(), mask.c_str(), dnsIp.c_str(), o) : nullptr;
+  if (!ip.length() || err) {
+    n.ip[0] = n.gw[0] = n.mask[0] = n.dns[0] = 0;
+    return err;
+  }
+  char *dst[4] = {n.ip, n.gw, n.mask, n.dns};   // egységes alak (pl. 192.168.01.5 -> 192.168.1.5)
+  for (int i = 0; i < 4; i++)
+    snprintf(dst[i], sizeof n.ip, "%lu.%lu.%lu.%lu", (unsigned long)(o[i] >> 24), (unsigned long)((o[i] >> 16) & 0xFF),
+             (unsigned long)((o[i] >> 8) & 0xFF), (unsigned long)(o[i] & 0xFF));
+  if (!dnsIp.length()) n.dns[0] = 0;   // üres DNS: marad az átjáró (később is követi)
+  return nullptr;
+}
+
+void webNetIp() {   // iOS-app: fix IP vagy DHCP (JSON válasz); hibás beállításnál DHCP
+  if (!apiAuth()) return;
+  NetCfg n = ncfg;
+  const char *err = ipFromArgs(n);
+  bool wifiChanged = ipCfgDiffers(n, ncfg);
+  ncfg = n;
+  bool ok = netCfgSave();
+  requestReconfig(wifiChanged, false);
+  slogc("IP beallitas (app): %s%s%s\n", ncfg.ip[0] ? ncfg.ip : "DHCP", err ? ", hiba: " : "", err ? err : "");
+  char js[200];
+  snprintf(js, sizeof js, "{\"ok\":%s,\"mode\":\"%s\",\"ip\":\"%s\",\"error\":\"%s\"}", (ok && !err) ? "true" : "false",
+           ncfg.ip[0] ? "fix" : "dhcp", ncfg.ip, err ? err : (ok ? "" : "a mentés nem sikerült"));
+  web.send(200, "application/json; charset=utf-8", js);
 }
 
 void webConfig() {   // mentés NVS-be, majd élő újracsatlakozás (nincs újraindítás: a relék nem engednek el)
@@ -1324,20 +1678,31 @@ void webConfig() {   // mentés NVS-be, majd élő újracsatlakozás (nincs újr
   bool pwOk = web.arg("web_pass").length() == 0 || web.arg("web_pass").length() >= 8;
   bool pwChanged = pwOk && web.arg("web_pass").length() && strcmp(web.arg("web_pass").c_str(), ncfg.webPass) != 0;
   if (pwChanged) strlcpy(n.webPass, web.arg("web_pass").c_str(), sizeof n.webPass);
+  const char *ipError = ipFromArgs(n);
+  bool wifiChanged = strcmp(n.ssid, ncfg.ssid) || strcmp(n.pass, ncfg.pass) || ipCfgDiffers(n, ncfg);
+  bool mqttChanged = strcmp(n.mqttUri, ncfg.mqttUri) || strcmp(n.mqttUser, ncfg.mqttUser) || strcmp(n.mqttPass, ncfg.mqttPass);
   ncfg = n;
   bool ok = netCfgSave();
   if (pwChanged) {   // jelszócsere: a többi bejelentkezés érvénytelen, ez a böngésző új sütit kap
     tokenNew();
     setAuthCookie();
   }
-  netReconfig = true;
-  slogc("Halozati beallitasok %s (weboldal): WiFi \"%s\", MQTT \"%s\"\n", ok ? "mentve" : "NEM mentve", ncfg.ssid, ncfg.mqttUri);
-  char html[400];
+  requestReconfig(wifiChanged, mqttChanged);
+  slogc("Halozati beallitasok %s (weboldal): WiFi \"%s\", MQTT \"%s\", IP %s\n", ok ? "mentve" : "NEM mentve", ncfg.ssid,
+        ncfg.mqttUri, ncfg.ip[0] ? ncfg.ip : "DHCP");
+  char back[48], ipMsg[160];
+  if (ncfg.ip[0]) snprintf(back, sizeof back, "http://%s/", ncfg.ip);   // fix IP: az új címre irányít
+  else strlcpy(back, "/", sizeof back);
+  if (ipError) snprintf(ipMsg, sizeof ipMsg, "<p>Hibás fix IP-beállítás (%s): DHCP-t használ.</p>", ipError);
+  else if (ncfg.ip[0]) snprintf(ipMsg, sizeof ipMsg, "<p>Fix IP: <a href=\"%s\">%s</a></p>", back, ncfg.ip);
+  else strlcpy(ipMsg, "<p>IP-cím: DHCP (a router adja; elérhető: http://" NET_ID ".local)</p>", sizeof ipMsg);
+  char html[900];
   snprintf(html, sizeof html,
-           "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"8;url=/\"></head>"
-           "<body style=\"font-family:sans-serif\"><p>%s</p>%s<p><a href=\"/\">Vissza</a></p></body></html>",
-           ok ? "Mentve. Újracsatlakozás…" : "HIBA: a mentés nem sikerült.",
-           pwOk ? "" : "<p>A weboldal jelszó túl rövid (legalább 8 karakter), nem változott.</p>");
+           "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+           "<meta http-equiv=\"refresh\" content=\"10;url=%s\"></head>"
+           "<body style=\"font-family:sans-serif;padding:16px\"><p>%s</p>%s%s<p><a href=\"%s\">Vissza</a></p></body></html>",
+           back, !ok ? "HIBA: a mentés nem sikerült." : (wifiChanged ? "Mentve. Újracsatlakozás…" : "Mentve."), ipMsg,
+           pwOk ? "" : "<p>A weboldal jelszó túl rövid (legalább 8 karakter), nem változott.</p>", back);
   web.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -1350,18 +1715,234 @@ void webNotFound() {   // AP módban minden ismeretlen cím a weboldalra irány�
   }
 }
 
-// ---- mDNS / Bonjour: "_erosito._tcp" szolgáltatás és erosito.local név (az első csatlakozáskor, utána magától követi) ----
-void mdnsStart() {
-  mdnsStarted = true;
+// ---- mDNS / Bonjour: erosito.local, "_erosito._tcp" és "_http._tcp" (ESPmDNS, vagy ha a core-ban nincs: saját válaszoló) ----
 #if MDNS_ENABLED
-  if (!MDNS.begin(NET_ID)) { slogc("mDNS inditas sikertelen\n"); return; }
+void mdnsStart() {
+  mdnsLastTry = millis();
+  if (!MDNS.begin(NET_ID)) {
+    mdnsState = 2;
+    slogc("mDNS inditas sikertelen, ujraprobalas 60 s mulva\n");
+    return;
+  }
   MDNS.setInstanceName("Erosito");
   MDNS.addService("http", "tcp", 80);
   MDNS.addService("erosito", "tcp", 80);
   MDNS.addServiceTxt("erosito", "tcp", "board", BOARD_NAME);
-  slogc("mDNS: http://" NET_ID ".local\n");
-#endif
+  mdnsState = 1;
+  slogc("mDNS: OK, http://" NET_ID ".local\n");
 }
+
+void mdnsService() {
+  if (WiFi.status() == WL_CONNECTED && (mdnsState == 0 || (mdnsState == 2 && millis() - mdnsLastTry >= 60000))) mdnsStart();
+}
+#else
+// ---- Saját mDNS válaszoló (RFC 6762): minden rá vonatkozó kérdésre a teljes rekordkészlettel válaszol ----
+// MDNS_PURE_BEGIN
+const char *MD_HOST = NET_ID ".local";
+const char *MD_SVC[2]  = {"_erosito._tcp.local", "_http._tcp.local"};
+const char *MD_INST[2] = {"Erosito._erosito._tcp.local", "Erosito._http._tcp.local"};
+const char *MD_TXT[2]  = {"board=" BOARD_NAME, "path=/"};
+const char *MD_ENUM = "_services._dns-sd._udp.local";
+
+int mdPutName(uint8_t *p, int pos, int cap, const char *dotted) {   // "a.b.c" -> DNS címkék
+  for (const char *s = dotted; *s;) {
+    const char *dot = strchr(s, '.');
+    int n = dot ? (int)(dot - s) : (int)strlen(s);
+    if (n == 0 || n > 63 || pos + n + 1 >= cap) return -1;
+    p[pos++] = (uint8_t)n;
+    memcpy(p + pos, s, n);
+    pos += n;
+    s += n;
+    if (*s == '.') s++;
+  }
+  if (pos >= cap) return -1;
+  p[pos++] = 0;
+  return pos;
+}
+
+int mdPutRec(uint8_t *p, int pos, int cap, const char *name, uint16_t type, bool unique, uint32_t ttl,
+             const uint8_t *rd, int rdLen) {
+  pos = mdPutName(p, pos, cap, name);
+  if (pos < 0 || pos + 10 + rdLen > cap) return -1;
+  uint16_t cls = unique ? 0x8001 : 0x0001;   // egyedi rekordnál cache-flush bit
+  p[pos++] = type >> 8; p[pos++] = type & 0xFF;
+  p[pos++] = cls >> 8;  p[pos++] = cls & 0xFF;
+  p[pos++] = ttl >> 24; p[pos++] = (ttl >> 16) & 0xFF; p[pos++] = (ttl >> 8) & 0xFF; p[pos++] = ttl & 0xFF;
+  p[pos++] = rdLen >> 8; p[pos++] = rdLen & 0xFF;
+  memcpy(p + pos, rd, rdLen);
+  return pos + rdLen;
+}
+
+int mdPutNameRec(uint8_t *p, int pos, int cap, const char *name, uint16_t type, bool unique, uint32_t ttl, const char *target) {
+  uint8_t rd[96];
+  int n = mdPutName(rd, 0, sizeof rd, target);
+  return n < 0 ? -1 : mdPutRec(p, pos, cap, name, type, unique, ttl, rd, n);
+}
+
+// teljes válasz: A, 2 x (PTR, SRV, TXT), 2 x szolgáltatás-felsorolás; legacy (nem 5353-as port): azonosító + kérdések vissza, rövid TTL
+int mdBuild(uint8_t *out, int cap, const uint8_t ip[4], const uint8_t *q, int qLen, int qCount, uint16_t id, bool legacy) {
+  if (cap < 12 + qLen) return -1;
+  memset(out, 0, 12);
+  out[0] = id >> 8; out[1] = id & 0xFF;
+  out[2] = 0x84;                       // válasz, hiteles
+  out[5] = legacy ? qCount : 0;
+  out[7] = 9;                          // válaszrekordok száma
+  int pos = 12;
+  if (legacy) { memcpy(out + pos, q, qLen); pos += qLen; }
+  uint32_t tHost = legacy ? 10 : 120, tSvc = legacy ? 10 : 4500;
+  bool uq = !legacy;                   // legacy válaszban nincs cache-flush bit (RFC 6762 6.7)
+  pos = mdPutRec(out, pos, cap, MD_HOST, 1, uq, tHost, ip, 4);
+  for (int i = 0; i < 2 && pos > 0; i++) {
+    pos = mdPutNameRec(out, pos, cap, MD_SVC[i], 12, false, tSvc, MD_INST[i]);
+    if (pos < 0) break;
+    uint8_t srv[96] = {0, 0, 0, 0, 0, 80};   // prioritás, súly, port 80
+    int n = mdPutName(srv, 6, sizeof srv, MD_HOST);
+    if (n < 0) return -1;
+    pos = mdPutRec(out, pos, cap, MD_INST[i], 33, uq, tHost, srv, n);
+    if (pos < 0) break;
+    uint8_t txt[64];
+    int tl = (int)strlen(MD_TXT[i]);
+    if (tl > 62) return -1;
+    txt[0] = (uint8_t)tl;
+    memcpy(txt + 1, MD_TXT[i], tl);
+    pos = mdPutRec(out, pos, cap, MD_INST[i], 16, uq, tSvc, txt, tl + 1);
+  }
+  for (int i = 0; i < 2 && pos > 0; i++) pos = mdPutNameRec(out, pos, cap, MD_ENUM, 12, false, tSvc, MD_SVC[i]);
+  return pos;
+}
+
+int mdReadName(const uint8_t *p, int len, int pos, char *out, int outCap) {   // tömörítést is kezel; a név utáni pozíció, -1 = hiba
+  int after = -1, o = 0, jumps = 0;
+  for (;;) {
+    if (pos >= len) return -1;
+    uint8_t n = p[pos];
+    if (n == 0) { pos++; break; }
+    if ((n & 0xC0) == 0xC0) {
+      if (pos + 1 >= len || ++jumps > 8) return -1;
+      if (after < 0) after = pos + 2;
+      pos = ((n & 0x3F) << 8) | p[pos + 1];
+      continue;
+    }
+    if (n > 63 || pos + 1 + n > len || o + n + 2 > outCap) return -1;
+    if (o) out[o++] = '.';
+    memcpy(out + o, p + pos + 1, n);
+    o += n;
+    pos += 1 + n;
+  }
+  out[o] = 0;
+  return after >= 0 ? after : pos;
+}
+
+bool mdIsOurs(const char *name) {
+  if (strcasecmp(name, MD_HOST) == 0 || strcasecmp(name, MD_ENUM) == 0) return true;
+  for (int i = 0; i < 2; i++)
+    if (strcasecmp(name, MD_SVC[i]) == 0 || strcasecmp(name, MD_INST[i]) == 0) return true;
+  return false;
+}
+
+// kérdés -> válasz hossza (0 = nem nekünk szól)
+int mdHandle(const uint8_t *q, int qLen, uint8_t *out, int cap, const uint8_t ip[4], bool legacy) {
+  if (qLen < 12 || (q[2] & 0x80)) return 0;   // csak kérdésre
+  int qd = (q[4] << 8) | q[5], pos = 12;
+  bool match = false;
+  char name[128];
+  for (int i = 0; i < qd && i < 16; i++) {
+    int np = mdReadName(q, qLen, pos, name, sizeof name);
+    if (np < 0 || np + 4 > qLen) return 0;
+    uint16_t type = (q[np] << 8) | q[np + 1];
+    pos = np + 4;
+    if (mdIsOurs(name) && (type == 1 || type == 12 || type == 16 || type == 33 || type == 255)) match = true;
+  }
+  if (!match) return 0;
+  int n = mdBuild(out, cap, ip, q + 12, pos - 12, qd, (q[0] << 8) | q[1], legacy);
+  return n > 0 ? n : 0;
+}
+// MDNS_PURE_END
+
+int mdSock = -1;
+uint8_t mdIp[4];
+uint8_t mdAnnounceLeft = 0;
+unsigned long mdAnnounceLast = 0;
+
+void mdClose() {
+  if (mdSock >= 0) { close(mdSock); mdSock = -1; }
+}
+
+bool mdOpen(const uint8_t ip[4]) {   // UDP 5353, csatlakozás a 224.0.0.251 csoporthoz a WiFi címén
+  mdClose();
+  int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (s < 0) return false;
+  int one = 1;
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  struct sockaddr_in a = {};
+  a.sin_family = AF_INET;
+  a.sin_port = htons(5353);
+  a.sin_addr.s_addr = htonl(INADDR_ANY);
+  struct ip_mreq m = {};
+  m.imr_multiaddr.s_addr = inet_addr("224.0.0.251");
+  memcpy(&m.imr_interface.s_addr, ip, 4);
+  struct in_addr ifa;
+  memcpy(&ifa.s_addr, ip, 4);
+  uint8_t ttl = 255;
+  if (bind(s, (struct sockaddr *)&a, sizeof a) < 0 ||
+      setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m) < 0) {
+    close(s);
+    return false;
+  }
+  setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, &ifa, sizeof ifa);
+  setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof ttl);
+  mdSock = s;
+  memcpy(mdIp, ip, 4);
+  mdAnnounceLeft = 3;   // bejelentés 3-szor, 1 s-onként
+  mdAnnounceLast = millis() - 1000;
+  return true;
+}
+
+void mdSendMulticast(const uint8_t *b, int n) {
+  struct sockaddr_in d = {};
+  d.sin_family = AF_INET;
+  d.sin_port = htons(5353);
+  d.sin_addr.s_addr = inet_addr("224.0.0.251");
+  sendto(mdSock, b, n, 0, (struct sockaddr *)&d, sizeof d);
+}
+
+void mdnsService() {   // a hálózati taskból ~10 ms-onként: socket a WiFi címéhez, bejelentés, válaszok
+  if (WiFi.status() != WL_CONNECTED) {
+    mdClose();
+    if (mdnsState == 1) mdnsState = 0;
+    return;
+  }
+  IPAddress l = WiFi.localIP();
+  uint8_t ip[4] = {l[0], l[1], l[2], l[3]};
+  if (mdSock < 0 || memcmp(ip, mdIp, 4) != 0) {   // új csatlakozás vagy új IP: újra be kell lépni a csoportba
+    if (mdSock < 0 && mdnsState == 2 && millis() - mdnsLastTry < 60000) return;
+    mdnsLastTry = millis();
+    bool ok = mdOpen(ip);
+    mdnsState = ok ? 1 : 2;
+    if (ok) slogc("mDNS (beepitett): OK, http://" NET_ID ".local -> %u.%u.%u.%u\n", ip[0], ip[1], ip[2], ip[3]);
+    else slogc("mDNS (beepitett) inditas sikertelen, ujraprobalas 60 s mulva\n");
+    if (!ok) return;
+  }
+  static uint8_t in[512], out[600];
+  if (mdAnnounceLeft && millis() - mdAnnounceLast >= 1000) {
+    mdAnnounceLast = millis();
+    mdAnnounceLeft--;
+    int n = mdBuild(out, sizeof out, ip, nullptr, 0, 0, 0, false);
+    if (n > 0) mdSendMulticast(out, n);
+  }
+  for (int k = 0; k < 4; k++) {
+    struct sockaddr_in from;
+    socklen_t fl = sizeof from;
+    int n = recvfrom(mdSock, in, sizeof in, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+    if (n <= 0) break;
+    bool legacy = ntohs(from.sin_port) != 5353;   // egyszerű (nem mDNS) kérdező: közvetlen válasz
+    int r = mdHandle(in, n, out, sizeof out, ip, legacy);
+    if (r <= 0) continue;
+    if (legacy) sendto(mdSock, out, r, 0, (struct sockaddr *)&from, fl);
+    else mdSendMulticast(out, r);
+  }
+}
+#endif
 
 // ---- Hálózati task ----
 void netService() {
@@ -1372,19 +1953,40 @@ void netService() {
     netCfgClear();
     netCfgLoad();
     tokenNew();
-    netReconfig = true;
+    requestReconfig(true, true);
+    reconfAt = millis() - RECONF_DELAY_MS;   // nincs HTTP-válasz: azonnal
     slogc("Halozati beallitasok torolve\n");
   }
-  if (netReconfig) {   // új beállítások: MQTT és WiFi újraindítása (a relék nem érintettek)
-    netReconfig = false;
+  if (netRecoverReq) {   // memória-őr: WiFi, MQTT, mDNS leáll és újraindul (felszabadítja a pufferjeit)
+    netRecoverReq = false;
+    slogc("Memoria: halozat ujrainditasa (a relek nem erintettek)\n");
     mqttStop();
     mqttTried = false;
-    WiFi.disconnect();
-    staLastOk = millis();   // új időkeret a csatlakozásra
-    if (apOn) WiFi.mode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
+#if !MDNS_ENABLED
+    mdClose();
+    if (mdnsState == 1) mdnsState = 0;
+#endif
+    if (apOn) { dns.stop(); apOn = false; }
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    wifiMode(WIFI_STA);
+    staLastOk = millis();
+    apTried = false;
     staBegin();
   }
-  if (!mdnsStarted && WiFi.status() == WL_CONNECTED) mdnsStart();
+  if ((reconfWifi || reconfMqtt) && millis() - reconfAt >= RECONF_DELAY_MS) {   // csak ami változott; a relék nem érintettek
+    mqttStop();   // WiFi-váltásnál is: új kapcsolat kell
+    mqttTried = false;
+    if (reconfWifi) {
+      WiFi.disconnect();
+      staLastOk = millis();   // új időkeret a csatlakozásra
+      if (apOn) wifiMode(ncfg.ssid[0] ? WIFI_AP_STA : WIFI_AP);
+      staBegin();
+    }
+    reconfWifi = reconfMqtt = false;
+  }
+  mdnsService();
   if (!netStarted && ncfg.mqttUri[0] && WiFi.status() == WL_CONNECTED && (!mqttTried || millis() - mqttLastTry >= MQTT_RETRY_MS)) {
     mqttTried = true;
     mqttLastTry = millis();
@@ -1401,12 +2003,12 @@ void netInit() {   // beállítások betöltése, WiFi indítása, weboldal útv
   WiFi.persistent(false);   // a WiFi könyvtár ne írja a flash-t
   WiFi.setHostname(NET_ID);
   WiFi.setAutoReconnect(true);
-  WiFi.mode(WIFI_STA);
+  wifiMode(WIFI_STA);
   if (!webToken[0]) tokenNew();   // a rádió már fut: valódi véletlenszám
   staLastOk = millis();
   staBegin();
-  const char *hdrs[] = {"Cookie"};
-  web.collectHeaders(hdrs, 1);
+  const char *hdrs[] = {"Cookie", "Authorization"};
+  web.collectHeaders(hdrs, 2);
   web.on("/", HTTP_GET, webRoot);
   web.on("/login", HTTP_ANY, webLogin);
   web.on("/logout", HTTP_GET, webLogout);
@@ -1414,10 +2016,12 @@ void netInit() {   // beállítások betöltése, WiFi indítása, weboldal útv
   web.on("/apple-touch-icon-precomposed.png", HTTP_GET, webIcon);
   web.on("/favicon.ico", HTTP_GET, webIcon);
   web.on("/manifest.json", HTTP_GET, webManifest);
+  web.on("/api/id", HTTP_GET, webId);
   web.on("/api/status", HTTP_GET, webStatus);
   web.on("/api/power", HTTP_POST, webPower);
   web.on("/api/trigger", HTTP_POST, webTrigger);
   web.on("/api/config", HTTP_POST, webConfig);
+  web.on("/api/netip", HTTP_POST, webNetIp);
   web.onNotFound(webNotFound);
   web.begin();
   slogc("Halozat: %s\n", ncfg.ssid[0] ? "csatlakozas a mentett / secrets.h WiFi-hez" : "nincs WiFi beallitas, AP mod");
@@ -1433,13 +2037,14 @@ void netTask(void *) {
 
 void netStart() {
   netQ = xQueueCreate(16, sizeof(NetEvt));
-  if (netQ) xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, AUX_PRIO, nullptr, AUX_CORE);
+  if (netQ) xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, AUX_PRIO, &netTaskH, AUX_CORE);
 }
 
 void netStatusLine() {
   bool sta = WiFi.status() == WL_CONNECTED;
-  slogc("  Halozat: WiFi %s%s (%d dBm), IP %s, MQTT %s\n", sta ? "OK" : "nincs", apOn ? " + AP" : "", (int)WiFi.RSSI(),
-        sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"),
+  slogc("  Halozat: WiFi %s%s (%d dBm), IP %s (%s%s%s), mDNS %s, MQTT %s\n", sta ? "OK" : "nincs", apOn ? " + AP" : "",
+        (int)WiFi.RSSI(), sta ? WiFi.localIP().toString().c_str() : (apOn ? WiFi.softAPIP().toString().c_str() : "-"),
+        ipMode == 1 ? "fix" : "DHCP", ipErr ? ", hibas fix IP: " : "", ipErr ? ipErr : "", mdnsName(),
         !ncfg.mqttUri[0] ? "nincs beallitva" : (mqttUp ? "OK" : "nincs"));
 }
 #else
@@ -1457,13 +2062,15 @@ void printHelp() {
 void printStatus() {
   char lk[48] = "";
   if (powerHold) snprintf(lk, sizeof lk, " [aramszunet utan: %lu s]", timeLeft(holdStart, holdDur) / 1000);
-  else if (lockoutLeft() > 0) snprintf(lk, sizeof lk, " [tiltas: %lu ms]", lockoutLeft());
+  else if (lockoutLeft() > 0) snprintf(lk, sizeof lk, " [tiltas: %lu ms%s]", lockoutLeft(), autoPaused() ? ", ismetlodo" : "");
+  else if (autoPaused()) snprintf(lk, sizeof lk, lossPaused() ? " [sorozatos kieses: auto szunetel]" : " [ismetlodo hiba: trigger szunetel]");
   char rq[48] = "";
   if (onReqBtn || onReqTrig) snprintf(rq, sizeof rq, " [bekapcs. %s, %lu ms]", onReqBtn ? "gomb" : "trigger", minOffLeft());
   slogc("ALLAPOT: RL1=%s RL2=%s LED=%s%s%s%s\n", on ? "BE" : "KI", rl2On ? "BE" : "KI",
         ledFaultBlink ? "hiba" : (ledBase ? "be" : "ki"), offPending ? " [kikapcs. fuggoben]" : "", rq, lk);
   slogc("  GOMB: %s, TRIGGER: %s (%s)\n", btn.stable == LOW ? "nyomva" : "fent",
         trig.stable == LOW ? "aktiv" : "nincs", trigOff ? "TILTVA" : "engedelyezve");
+  if (SPEAKER_PROTECT) slogc("  HANGSZOROK: %s, DC: %s\n", spkOn ? "BE" : "KI", dcActive ? "VAN" : "nincs");
   if (MAINS_CHECK)
     slogc("  RL1 kimenet: %s%s, LOW minta: %u (kuszob %u)\n",
           !fbValid ? "meres..." : (fbPresent ? "halozat VAN" : "halozat nincs"),
@@ -1483,8 +2090,18 @@ void printHealth() {
         (unsigned long)((uint64_t)st.relayCount * 100 / RELAY_LIFE));
   slogc("  Halozatkieses: %lu, hiba: %lu, aramszunet utani indulas: %lu\n", (unsigned long)st.mainsLoss,
         (unsigned long)st.faults, (unsigned long)st.powerUps);
-  slogc("  Futasido: %lu ora, szabad memoria: %lu bajt (legkisebb: %lu)\n", uptimeHours(),
-        (unsigned long)esp_get_free_heap_size(), (unsigned long)esp_get_minimum_free_heap_size());
+  slogc("  Futasido: %lu ora, szabad memoria: %lu bajt (legkisebb: %lu, legnagyobb blokk: %lu)\n", uptimeHours(),
+        (unsigned long)memFree(), (unsigned long)memMinFree(), (unsigned long)memBlock());
+  {
+    const char *tn;
+    uint32_t sf = stackMinFree(&tn);
+    slogc("  Szabad verem (legkevesebb): %lu bajt (%s); memoria-ujrainditasok egymas utan: %lu\n", (unsigned long)sf, tn,
+          (unsigned long)(memInfo & 0xFF));
+    slogc("  Memoriahatarok (belso RAM): figyelm. %lu / %lu / %lu, ujrainditas %lu / %lu / %lu, azonnal %lu / %lu / %lu bajt (szabad / blokk / verem)\n",
+          (unsigned long)HEAP_WARN_BYTES, (unsigned long)HEAP_BLOCK_WARN, (unsigned long)STACK_WARN_BYTES,
+          (unsigned long)HEAP_CRIT_BYTES, (unsigned long)HEAP_BLOCK_CRIT, (unsigned long)STACK_CRIT_BYTES,
+          (unsigned long)HEAP_EMERG_BYTES, (unsigned long)HEAP_BLOCK_EMERG, (unsigned long)STACK_EMERG_BYTES);
+  }
   if (MAINS_CHECK) {
     unsigned a = (unsigned)(st.optoAvg * 10 + 0.5f), b = (unsigned)(st.optoBase * 10 + 0.5f),
              l = (unsigned)(lastSessMean * 10 + 0.5f);
@@ -1525,14 +2142,14 @@ void handleSerial() {
     st.optoBaseN = 0;
     lastSessMean = 0;
     stDirty = true;
-    statsSave();
+    statsSave(true);
     slogc("Opto alapertek torolve: a kovetkezo %u meresi szakaszbol ujra kepzodik\n", (unsigned)OPTO_BASE_SESSIONS);
   }
   if (relayReq) {   // relécsere után
     relayReq = false;
     st.relayCount = 0;
     stDirty = true;
-    statsSave();
+    statsSave(true);
     slogc("Rele szamlalo nullazva\n");
   }
 }
@@ -1556,6 +2173,7 @@ void initOutputs() {   // relék és LED KI (a pinMode előtti írás hatástala
   pinMode(PIN_RL1, OUTPUT);
   pinMode(PIN_RL2, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
+  if (SPEAKER_PROTECT) { pinMode(PIN_SPK, OUTPUT); digitalWrite(PIN_SPK, LOW); }
   digitalWrite(PIN_RL1, LOW);
   digitalWrite(PIN_RL2, LOW);
   digitalWrite(PIN_LED, LOW);
@@ -1582,6 +2200,7 @@ bool loadSettings() {   // NVS: trigger tiltás, mentett hiba, állapotfigyelés
 void initInputs() {
   pinMode(PIN_BTN,  INPUT_PULLUP);
   pinMode(PIN_TRIG, INPUT_PULLUP);
+  if (SPEAKER_PROTECT) pinMode(PIN_DC, INPUT_PULLUP);   // a külső 10k mellett: bekötés nélkül sincs hamis DC
   if (MAINS_CHECK) {
     pinMode(PIN_FB1, INPUT);   // külső 43k felhúzó
     mainsCmd();
@@ -1607,7 +2226,8 @@ void setup() {
   initOutputs();
   Serial.begin(115200);
   logQ = xQueueCreate(24, sizeof(LogMsg));   // tele sornál az üzenet elvész, a vezérlés nem áll meg
-  if (logQ) xTaskCreatePinnedToCore(logTask, "slog", 4096, nullptr, AUX_PRIO, nullptr, AUX_CORE);
+  if (logQ) xTaskCreatePinnedToCore(logTask, "slog", 4096, nullptr, AUX_PRIO, &logTaskH, AUX_CORE);
+  loopTaskH = xTaskGetCurrentTaskHandle();   // a setup és a loop ugyanabban a taskban fut
   bool nvsOk = loadSettings();
   initInputs();
   initWatchdog();
@@ -1617,6 +2237,12 @@ void setup() {
                      (rr == ESP_RST_BROWNOUT && !BROWNOUT_IS_POWERLOSS));
   bool powerLoss = (rr == ESP_RST_POWERON) || (rr == ESP_RST_BROWNOUT && BROWNOUT_IS_POWERLOSS);
   unsigned long holdMs = powerLoss ? POWERUP_HOLD_MS : holdLoad();   // reset a várakozás alatt: folytatódik
+  memInfoLoad();
+  if (powerLoss) memInfoSave(0);
+  bool memRestarted = (rr == ESP_RST_SW) && (memInfo & 0x20000UL);   // a memória-őr indította újra
+  bool memWasOn = memRestarted && (memInfo & 0x10000UL);
+  int memReason = (int)((memInfo >> 8) & 0xFF);
+  if (memInfo & 0x30000UL) memInfoSave(memInfo & 0xFFUL);   // csak az egymás utáni számláló marad
   if (holdMs > 0) {
     powerHold = true;
     holdStart = lastHoldSave = millis();
@@ -1631,11 +2257,16 @@ void setup() {
   slogc("TRIGGER: %s, %s; halozatfigyeles: %s\n", trig.stable == LOW ? "aktiv" : "nincs",
         trigOff ? "TILTVA" : "engedelyezve", MAINS_CHECK ? "BE" : "KI");
   if (!nvsOk) slogc("FIGYELEM: NVS hiba, alapertelmezett beallitasok\n");
+  if (memRestarted) {
+    slogc("Memoria miatti ujrainditas utan (%s, %lu. egymas utan)%s\n", memReasonName(memReason), (unsigned long)(memInfo & 0xFF),
+          memWasOn ? ": a relek visszakapcsolnak" : "");
+  }
   if (powerHold) slogc("Aramszunet utan: %lu s varakozas\n", holdMs / 1000);
-  if (powerLoss) { st.powerUps++; stDirty = true; statsSave(); }
+  if (powerLoss) { st.powerUps++; stDirty = true; statsSave(true); }
   printHelp();
   netStart();
   netEvent("boot", "Indulás: %s%s", resetName(rr), powerHold ? ", áramszünet utáni várakozás" : "");
+  if (memRestarted) netEvent("warning", "Memória miatti újraindítás: %s", memReasonName(memReason));
   checkWarnings();
   if (lastWarnCount > 0) {
     char w[120];
@@ -1653,6 +2284,11 @@ void setup() {
     lockoutDur = wait;
     slogc("Mentett hiba (%s): %lu ms mulva ellenorzes\n",
           storedFault == F_STUCK ? "beragadt gomb" : "halozat KI relenel", wait);
+  } else if (memWasOn) {   // a memória-őr kapcsolta ki: a korábbi állapot visszaáll (minimális kikapcsolt idő után)
+    if (powerHold) holdBtnUsed = true;
+    switchOn("memoria ujrainditas utan", true);
+  } else if (memRestarted) {   // kikapcsolt relénél indult újra: KI is marad (a trigger következő aktív éle kapcsol be)
+    slogc("Memoria miatti ujrainditas kikapcsolt relenel: KI marad\n");
   } else if (!powerHold && !trigOff && trig.stable == LOW && (crashReset || TRIGGER_ON_BOOT)) {
     switchOn(crashReset ? "fagyas utan" : "indulaskor aktiv trigger", false);
   }
@@ -1675,7 +2311,8 @@ void endPowerHold() {
   holdClear();
   resyncInputs();
   slogc("Aramszunet utani varakozas vege\n");
-  if (!lockoutPending && TRIGGER_ON_BOOT && !trigOff && trig.stable == LOW) switchOn("aktiv trigger aramszunet utan", false);
+  if (!lockoutPending && !autoPaused() && !manualWait && TRIGGER_ON_BOOT && !trigOff && trig.stable == LOW)
+    switchOn("aktiv trigger aramszunet utan", false);
 }
 
 void handlePowerHold(unsigned long now, bool btnChanged) {   // áramszünet utáni várakozás: trigger hatástalan, kézi bekapcsolás egyszer
@@ -1687,6 +2324,7 @@ void handlePowerHold(unsigned long now, bool btnChanged) {   // áramszünet ut�
   if (on) {
     int mf = mainsFault();
     if (mf != F_NONE) startFault(IN_FB1, mf);
+    dcCheck();
   }
   if (!faultActive) holdButton(now, btnChanged);
   handleRemote(true);
@@ -1696,19 +2334,109 @@ void handlePowerHold(unsigned long now, bool btnChanged) {   // áramszünet ut�
 void handleNormal(bool btnChanged, bool trigChanged) {
   int mf = mainsFault();
   if (mf != F_NONE && (on || !faultHold)) startFault(IN_FB1, mf);
+  dcCheck();
   if (!faultActive && !faultHold) checkInputFaults();
   if (!faultActive) buttonLogic(btnChanged);
   handleRemote(false);
   if (!faultActive && trigChanged && !trigOff) triggerEdge();
   processPendingOn(false);
   if (!faultActive && lockoutPending && lockoutLeft() == 0) endLockout();
+  if (faultStreak && !faultActive) {   // a sorozat csak akkor nullázódik, ha a bemenetek közben is nyugodtak (KI relénél is figyelve)
+    if (checkFault(IN_BTN) != F_NONE || (!trigOff && checkFault(IN_TRIG) != F_NONE)) faultQuietT = millis();
+  }
+  if (faultStreak && !faultActive && !lockoutPending && millis() - faultQuietT >= FAULT_STREAK_RESET_MS) {
+    bool wasPaused = autoPaused();   // FAULT_STREAK_RESET_MS hibamentes idő: a sorozat nullázódik
+    faultStreak = 0;
+    slog("Hibasorozat nullazva (%lu s hibamentes)\n", FAULT_STREAK_RESET_MS / 1000);
+    if (wasPaused && !autoPaused() && AUTO_ON_AFTER_FAULT && !on && !trigOff && trig.stable == LOW && !manualWait)
+      switchOn("aktiv trigger, ismetlodo hiba utan stabil", false);
+  }
+  if (lossStreak && !faultActive && millis() - lossLastT >= FAULT_STREAK_RESET_MS) {
+    bool wasPaused = autoPaused();
+    lossStreak = 0;
+    slog("Halozatkieses-sorozat nullazva (%lu s kieses nelkul)\n", FAULT_STREAK_RESET_MS / 1000);
+    if (wasPaused && !autoPaused() && !lockoutPending && !manualWait && !on && !trigOff && trig.stable == LOW)
+      switchOn("aktiv trigger, sorozatos kieses utan", false);
+  }
 }
 
-void handleStatsTimer(unsigned long now) {   // bekapcsolva óránként mentés
+// ---- Memória-őr: másodpercenként; figyelmeztetés a statsWarnings-ban, itt a kritikus és a vészhelyzeti szint ----
+unsigned long memLastCheck = 0, memCritSince = 0, memEmergSince = 0, memOkSince = 0, netRecoverT = 0;
+bool memCrit = false, memEmerg = false, netRecoverDone = false, memWaitLogged = false, memLimitLogged = false;
+
+int memProblem(uint32_t heapLim, uint32_t blockLim, uint32_t stackLim) {   // 0 = rendben, különben az ok kódja
+  if (memFree() < heapLim) return 1;
+  if (memBlock() < blockLim) return 2;
+  if (stackMinFree(nullptr) < stackLim) return 3;
+  return 0;
+}
+
+void memRestart(int reason, bool emergency) {   // szabályos újraindítás: relék KI, mentés, nyom az RTC-ben
+  bool wasOn = on;
+  slogc("!!! MEMORIA %s (szabad %lu, blokk %lu, verem %lu bajt): %s\n", memReasonName(reason), (unsigned long)memFree(),
+        (unsigned long)memBlock(), (unsigned long)stackMinFree(nullptr),
+        emergency ? "AZONNALI ujrainditas (relek KI, utana visszakapcsol)" : "szabalyos ujrainditas (relek KI-kapcsolt allapotban)");
+  setState(false, "memoria ujrainditas");
+  statsSave(true);
+  if (powerHold) holdSave(timeLeft(holdStart, holdDur));
+  uint32_t cnt = (memInfo & 0xFF) + 1;
+  memInfoSave((cnt & 0xFF) | ((uint32_t)reason << 8) | (wasOn ? 0x10000UL : 0) | 0x20000UL);
+  for (int i = 0; i < 4; i++) { esp_task_wdt_reset(); delay(50); }   // a napló kiírása
+  esp_restart();
+}
+
+void memGuard(unsigned long now) {
+  if (now - memLastCheck < 1000) return;
+  memLastCheck = now;
+  if ((memInfo & 0xFF) && esp_timer_get_time() / 1000 >= (int64_t)MEM_RESTART_OK_MS) memInfoSave(0);   // zavartalan futás: számláló nulla
+  bool limit = (memInfo & 0xFF) >= MEM_RESTART_MAX;
+  int emerg = memProblem(HEAP_EMERG_BYTES, HEAP_BLOCK_EMERG, STACK_EMERG_BYTES);
+  int crit = emerg ? emerg : memProblem(HEAP_CRIT_BYTES, HEAP_BLOCK_CRIT, STACK_CRIT_BYTES);
+  if (!emerg) memEmerg = false;
+  else if (!memEmerg) { memEmerg = true; memEmergSince = now; }
+  if (!crit) {
+    if (memCrit) slog("Memoria: ismet rendben\n");
+    memCrit = false;
+    memWaitLogged = false;
+    if (!memOkSince) memOkSince = now;
+    if (netRecoverDone && now - memOkSince >= MEM_OK_RESET_MS) netRecoverDone = false;
+    return;
+  }
+  memOkSince = 0;
+  if (!memCrit) {
+    memCrit = true;
+    memCritSince = now;
+    slogc("!!! MEMORIA kritikus: %s (szabad %lu, blokk %lu, verem %lu bajt)\n", memReasonName(crit), (unsigned long)memFree(),
+          (unsigned long)memBlock(), (unsigned long)stackMinFree(nullptr));
+    netEvent("warning", "Memória kritikus: %s", memReasonName(crit));
+  }
+  if (limit) {   // újraindítási hurok ellen: csak jelzés
+    if (!memLimitLogged) slogc("!!! MEMORIA: %u egymas utani ujrainditas utan nincs tobb automatikus ujrainditas\n", (unsigned)MEM_RESTART_MAX);
+    memLimitLogged = true;
+    return;
+  }
+  if (memEmerg && now - memEmergSince >= MEM_EMERG_MS) { memRestart(emerg, true); return; }
+  if (now - memCritSince < MEM_CRIT_MS) return;
+#if NET_ENABLED
+  if (crit != 3 && !netRecoverDone) {   // először a hálózat (a verem nem javul tőle)
+    netRecoverDone = true;
+    netRecoverT = now;
+    netRecoverReq = true;
+    return;
+  }
+  if (crit != 3 && now - netRecoverT < NET_RECOVER_WAIT_MS) return;
+#endif
+  if (!on && !faultActive && !onReqBtn && !onReqTrig) { memRestart(crit, false); return; }
+  if (!memWaitLogged) slogc("Memoria: ujrainditas a relek kikapcsolasa utan\n");
+  memWaitLogged = true;
+}
+
+void handleStatsTimer(unsigned long now) {   // halasztott mentés (STATS_MIN_GAP_MS), bekapcsolva óránként mentés
+  if (stDirty && !on && now - stLastSave >= STATS_MIN_GAP_MS) statsSave();   // bekapcsolva a kikapcsolás / az óránkénti mentés viszi
   if (!on || now - stLastSave < STATS_SAVE_MS) return;
   statsAccount();
   statsFold();
-  statsSave();
+  statsSave(true);
   stLastSave = now;
   checkWarnings();
 }
@@ -1720,7 +2448,9 @@ void loop() {
   bool btnChanged  = updateInput(IN_BTN);
   bool trigChanged = updateInput(IN_TRIG);
   mainsUpdate();
+  dcUpdate();
   if (rl2On && !rl2Settled && now - rl2Time >= RL2_MIN_ON_MS) rl2Settled = true;   // letelt állapotok rögzítése:
+  if (rl2On && !spkReady && now - rl2Time >= SPK_DELAY_MS) spkReady = true;
   if (minOffActive && !on && now - offTime >= MIN_OFF_MS) minOffActive = false;     // régi időbélyeg nem zavarhat be
   if (trigChanged) netStateDirty = true;
 
@@ -1729,10 +2459,12 @@ void loop() {
   else                handleNormal(btnChanged, trigChanged);
 
   updateRl2(now);
+  updateSpeakers();
   ledUpdate();
   handleRemoteTrigger();
   handleSerial();
   handleStatsTimer(now);
+  memGuard(now);
   logWindow();
   delay(1);
 }

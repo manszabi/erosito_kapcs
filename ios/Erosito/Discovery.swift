@@ -1,10 +1,10 @@
-// Keresés a helyi hálózaton: Bonjour "_erosito._tcp" (az ESP mDNS-sel hirdeti), majd IPv4-címre feloldás
+// Keresés a helyi hálózaton: Bonjour "_erosito._tcp" (ha az ESP mDNS-sel hirdeti) és IP-szkennelés (/api/id), ha a multicast nem jut át
 import Foundation
 import Network
 import Observation
 
 struct FoundDevice: Identifiable, Hashable, Sendable {
-    let id: String     // Bonjour szolgáltatásnév
+    let id: String     // Bonjour szolgáltatásnév vagy IP-cím
     let name: String
     let host: String   // IPv4-cím (és port, ha nem 80)
 }
@@ -15,7 +15,7 @@ final class Discovery {
     private(set) var devices: [FoundDevice] = []
     private(set) var searching = false
     private var browser: NWBrowser?
-    private var stopTask: Task<Void, Never>?
+    private var scanTask: Task<Void, Never>?
 
     func start() {
         stop()
@@ -26,33 +26,31 @@ final class Discovery {
             let endpoints = results.map(\.endpoint)
             Task { @MainActor in await self?.resolveAll(endpoints) }
         }
-        newBrowser.stateUpdateHandler = { [weak self] state in
-            if case .failed = state {
-                Task { @MainActor in self?.searching = false }
-            }
-        }
         newBrowser.start(queue: .main)
         browser = newBrowser
-        stopTask = Task { [weak self] in   // a "Keresés…" felirat 10 s után eltűnik; a böngészés közben tovább fut
-            try? await Task.sleep(for: .seconds(10))
-            self?.searching = false
+        scanTask = Task { [weak self] in   // a Bonjourral párhuzamosan: végigpróbálja a saját /24 hálózatot
+            await self?.scanSubnet()
+            if !Task.isCancelled { self?.searching = false }   // egy leállított régi keresés ne írja felül az újat
         }
     }
 
     func stop() {
         browser?.cancel()
         browser = nil
-        stopTask?.cancel()
+        scanTask?.cancel()
         searching = false
     }
 
+    private func add(name: String, host: String) {
+        if devices.contains(where: { $0.host == host }) { return }
+        devices.append(FoundDevice(id: host, name: name, host: host))
+    }
+
+    // ---- Bonjour ----
     private func resolveAll(_ endpoints: [NWEndpoint]) async {
         for endpoint in endpoints {
             guard case let .service(name, _, _, _) = endpoint else { continue }
-            if devices.contains(where: { $0.id == name }) { continue }
-            if let host = await Self.resolve(endpoint) {
-                devices.append(FoundDevice(id: name, name: name, host: host))
-            }
+            if let host = await Self.resolve(endpoint) { add(name: name, host: host) }
         }
     }
 
@@ -97,6 +95,68 @@ final class Discovery {
                 }
             }
         }
+    }
+
+    // ---- IP-szkennelés: a saját /24 hálózat címein az /api/id (jelszó nélkül, csak azonosít) ----
+    private func scanSubnet() async {
+        guard let (ip, mask) = Self.localIPv4() else { return }
+        var net = ip & mask
+        var size = ~mask
+        if size > 255 {   // nagy hálózatnál csak a telefon saját /24 tartománya
+            net = ip & 0xFFFF_FF00
+            size = 255
+        }
+        guard size >= 2 else { return }
+        let candidates = (1..<size).map { net | $0 }.filter { $0 != ip }
+        var iterator = candidates.makeIterator()
+        await withTaskGroup(of: String?.self) { group in
+            for _ in 0..<32 {   // egyszerre legfeljebb 32 kérés
+                if let next = iterator.next() { group.addTask { await Self.probe(Self.ipString(next)) } }
+            }
+            while let result = await group.next() {
+                if Task.isCancelled { group.cancelAll(); return }
+                if let host = result { add(name: "Erősítő", host: host) }
+                if let next = iterator.next() { group.addTask { await Self.probe(Self.ipString(next)) } }
+            }
+        }
+    }
+
+    nonisolated static let scanSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 1.5
+        config.timeoutIntervalForResource = 2
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
+
+    nonisolated static func probe(_ host: String) async -> String? {
+        guard let url = URL(string: "http://\(host)/api/id"),
+              let result = try? await scanSession.data(from: url),
+              (result.1 as? HTTPURLResponse)?.statusCode == 200,
+              let object = try? JSONSerialization.jsonObject(with: result.0) as? [String: Any],
+              object["device"] as? String == "erosito" else { return nil }
+        return host
+    }
+
+    nonisolated static func ipString(_ a: UInt32) -> String {
+        "\(a >> 24 & 0xFF).\(a >> 16 & 0xFF).\(a >> 8 & 0xFF).\(a & 0xFF)"
+    }
+
+    /// A telefon WiFi (en0) IPv4-címe és hálózati maszkja
+    nonisolated static func localIPv4() -> (UInt32, UInt32)? {
+        var list: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&list) == 0, let first = list else { return nil }
+        defer { freeifaddrs(list) }
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let entry = pointer.pointee
+            guard String(cString: entry.ifa_name) == "en0",
+                  let addr = entry.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET),
+                  let netmask = entry.ifa_netmask else { continue }
+            let ip = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }
+            let mask = netmask.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { UInt32(bigEndian: $0.pointee.sin_addr.s_addr) }
+            return (ip, mask)
+        }
+        return nil
     }
 }
 

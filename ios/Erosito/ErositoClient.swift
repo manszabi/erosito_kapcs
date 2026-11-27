@@ -6,6 +6,8 @@ import Observation
 struct AmpStatus: Decodable, Sendable {
     var power: String?
     var rl2: String?
+    var spk: String?
+    var dc: String?
     var trigger: String?
     var trigEnabled: Bool?
     var hold: Bool?
@@ -21,6 +23,12 @@ struct AmpStatus: Decodable, Sendable {
     var ip: String?
     var mqtt: String?
     var board: String?
+    var ipMode: String?
+    var ipError: String?
+    var cfgIp: String?
+    var cfgGw: String?
+    var cfgMask: String?
+    var cfgDns: String?
 
     var isOn: Bool { power == "ON" }
     var triggerEnabled: Bool { trigEnabled ?? false }
@@ -33,7 +41,7 @@ enum ClientError: LocalizedError {
         switch self {
         case .noHost: "Nincs kiválasztott eszköz (fogaskerék ikon)."
         case .unauthorized: "Hibás jelszó."
-        case .badResponse(let code): "Váratlan válasz az eszköztől (HTTP \(code))."
+        case .badResponse(let code): code == 200 ? "Hibás állapotválasz az eszköztől." : "Váratlan válasz az eszköztől (HTTP \(code))."
         case .unreachable(let host): "Az eszköz nem érhető el: \(host)"
         }
     }
@@ -48,6 +56,8 @@ final class ErositoClient {
     private(set) var lastError: String?
     private(set) var busy = false
     private var pollTask: Task<Void, Never>?
+    private var failures = 0                    // egymás utáni sikertelen lekérdezések
+    private var quietUntil = Date.distantPast   // IP-váltás után az ESP pár másodpercig nem érhető el: ezt nem jelezzük hibaként
 
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
@@ -62,13 +72,23 @@ final class ErositoClient {
     }
 
     /// Eszköz és jelszó mentése (cím: UserDefaults, jelszó: Kulcskarika)
-    func configure(host newHost: String, password newPassword: String) {
+    func configure(host rawHost: String, password newPassword: String) {
+        let newHost = Self.normalize(rawHost)
         host = newHost
         password = newPassword
         UserDefaults.standard.set(newHost, forKey: "host")
         Keychain.save(newPassword, account: "web")
         status = nil
+        failures = 0
         Task { await refresh() }
+    }
+
+    /// "http://192.168.1.50/" -> "192.168.1.50": séma, útvonal és szóközök nélkül
+    static func normalize(_ raw: String) -> String {
+        var h = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for scheme in ["http://", "https://"] where h.lowercased().hasPrefix(scheme) { h = String(h.dropFirst(scheme.count)) }
+        if let slash = h.firstIndex(of: "/") { h = String(h[..<slash]) }
+        return h
     }
 
     /// Állapot lekérdezése 2 s-onként, amíg az app előtérben van
@@ -92,9 +112,15 @@ final class ErositoClient {
             let data = try await request("/api/status", body: nil)
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
-            status = try decoder.decode(AmpStatus.self, from: data)
+            let decoded = try decoder.decode(AmpStatus.self, from: data)
+            guard decoded.power != nil else { throw ClientError.badResponse(200) }   // üres / sérült válasz ne látsszon "Kikapcsolva"-nak
+            status = decoded
             lastError = nil
+            failures = 0
         } catch {
+            if Date() < quietUntil { return }
+            failures += 1
+            if failures >= 3 { status = nil }   // ne mutasson elavult állapotot (pl. "Bekapcsolva"), ha az eszköz nem érhető el
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
@@ -107,6 +133,30 @@ final class ErositoClient {
     /// Trigger figyelés be / ki (az ESP elmenti)
     func setTrigger(_ enabled: Bool) async {
         await send("/api/trigger", body: enabled ? "enabled=1" : "enabled=0")
+    }
+
+    /// Az erősítő IP-címe: fix (ip + átjáró, maszk és DNS opcionális) vagy üres IP-vel DHCP.
+    /// Hibás beállításnál az ESP DHCP-t használ. Siker esetén az app az új címre vált.
+    func setNetworkIP(ip: String, gateway: String, mask: String, dns: String) async -> String {
+        var form = URLComponents()
+        form.queryItems = [URLQueryItem(name: "ip", value: ip), URLQueryItem(name: "gw", value: gateway),
+                           URLQueryItem(name: "mask", value: mask), URLQueryItem(name: "dns", value: dns)]
+        busy = true
+        defer { busy = false }
+        do {
+            let data = try await request("/api/netip", body: form.percentEncodedQuery ?? "")
+            struct Reply: Decodable { let ok: Bool; let mode: String; let ip: String; let error: String }
+            let reply = try JSONDecoder().decode(Reply.self, from: data)
+            quietUntil = Date().addingTimeInterval(15)   // az ESP ~1,5 s múlva bont, majd újracsatlakozik
+            if reply.mode == "fix", !reply.ip.isEmpty {
+                configure(host: reply.ip, password: password)
+                return "Mentve: fix IP \(reply.ip). Az app erre a címre váltott."
+            }
+            if !reply.error.isEmpty { return "Hibás beállítás (\(reply.error)): az erősítő DHCP-t használ. Keresd meg újra." }
+            return "Mentve: DHCP. Az új címet a keresés találja meg."
+        } catch {
+            return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
     }
 
     private func send(_ path: String, body: String) async {
