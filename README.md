@@ -18,7 +18,7 @@ A program a XIAO D-lábneveit használja, így a bekötés **mindkét lapon azon
 | D5 | 7 | 6 | RL2 tranzisztor |
 | D10 | 10 | 9 | RL1 tranzisztor |
 | D7 | 20 | 44 | Hangszórórelék (bal + jobb) tranzisztora |
-| D8 | 8 | 7 | Hangszóróvédő: 2 optó (bal, jobb) közösítve, LOW = DC (22k felhúzó, 100 nF) |
+| D8 | 8 | 7 | Hangszóróvédő: 2 optó (bal, jobb) közösítve, LOW = DC (47k felhúzó, 100 nF) |
 
 A relé-tranzisztorok bázisán legyen lehúzó ellenállás, hogy reset alatt ne kattanjanak be.
 
@@ -44,19 +44,19 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
 DC-érzékelő csatornánként (LTV814 / PC814: AC-bemenetű optó, mindkét polaritást érzékeli):
 
 ```
- erősítő kimenet ──[4,7k 0,5 W]──┬──────── LTV814 1
+ erősítő kimenet ──[22k 0,25 W]──┬──────── LTV814 1
                                  │
-                         220 µF bipoláris   (vagy 2×470 µF/16 V szembekötve)
+                          47 µF bipoláris   (vagy 2×100 µF/16 V szembekötve)
                                  │
  erősítő föld ───────────────────┴──────── LTV814 2
 
- 3V3 ──[22k]──┬── D8 ──[100 nF]── GND       D7 ──[470]──┬── B (NPN, pl. BC337)
+ 3V3 ──[47k]──┬── D8 ──[100 nF]── GND       D7 ──[470]──┬── B (NPN, pl. BC337)
               ├── LTV814 4 (bal)                         └─[10k]── GND
               └── LTV814 4 (jobb)            C ── hangszórórelék tekercse (+ dióda tekercsenként) ── relétáp
    LTV814 3 (mindkettő) ── ESP GND           E ── GND
 ```
 
-- Szűrő: 4,7k × 220 µF ≈ 0,15 Hz; zene (20 Hz-en teljes kivezérlés is) nem kapcsol le, a tápra ragadt kimenet (±36 V) kb. 35 ms alatt jelez, a program szűrésével együtt kb. 55–60 ms alatt válnak le a hangszórók.
+- Szűrő: 22k × 47 µF ≈ 0,15 Hz; zene (20 Hz-en teljes kivezérlés is) nem kapcsol le, a tápra ragadt kimenet (±36 V) kb. 35–50 ms alatt jelez, a program szűrésével együtt kb. 60–70 ms alatt válnak le a hangszórók. DC-küszöb a 47k felhúzóval (és a belső felhúzóval) tipikusan kb. 3,5 V, a leggyengébb LTV814-gyel kb. 13 V (LTV-814A-val kb. 6 V).
 - A két optó kimenete közösítve: bármelyik csatornán DC = LOW. A D8 C3-on indítási láb, ezért a felhúzó kötelező, és induláskor nem lehet LOW (bekapcsolatlan erősítőnél az optók nem vezetnek).
 - Hangszórórelé: Finder 40.52 (8 A, DPDT). ±36 V-on egy érintkező kb. 3 A DC-t szakít meg biztosan, két sorba kötött érintkező 8 A-t (adatlap, H 40 görbe): csatornánként egy relé, a két érintkező sorban (erősítő → 14, 11 → 24, 21 → hangszóró +).
 - A relé-tranzisztor bázisán 10k lehúzó: reset alatt a hangszórók biztosan le vannak választva. A 470 Ω-os bázisellenállással a BC337 két Finder tekercsét (2 × 59 mA) telítésben kapcsolja.

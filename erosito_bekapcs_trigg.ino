@@ -75,7 +75,7 @@ const int PIN_RL2  = D5;   // RL2 tranzisztor                                   
 const int PIN_RL1  = D10;  // RL1 tranzisztor                                            C3: GPIO10, S3: GPIO9
 const int PIN_SPK  = D7;   // hangszórórelék (bal + jobb) tranzisztora, bázis 10k lehúzó C3: GPIO20, S3: GPIO44
 const int PIN_DC   = D8;   // hangszóróvédő: 2 opto (LTV814) közösítve, LOW = DC        C3: GPIO8 (indítási láb:
-                           // 22k felhúzó + 100 nF kell, induláskor ne legyen LOW),          S3: GPIO7
+                           // 47k felhúzó + 100 nF kell, induláskor ne legyen LOW),          S3: GPIO7
 
 // ======================================================================= Beállítások
 // Relék, indulás
@@ -2200,7 +2200,7 @@ bool loadSettings() {   // NVS: trigger tiltás, mentett hiba, állapotfigyelés
 void initInputs() {
   pinMode(PIN_BTN,  INPUT_PULLUP);
   pinMode(PIN_TRIG, INPUT_PULLUP);
-  if (SPEAKER_PROTECT) pinMode(PIN_DC, INPUT_PULLUP);   // a külső 22k mellett: bekötés nélkül sincs hamis DC
+  if (SPEAKER_PROTECT) pinMode(PIN_DC, INPUT_PULLUP);   // a külső 47k mellett: bekötés nélkül sincs hamis DC
   if (MAINS_CHECK) {
     pinMode(PIN_FB1, INPUT);   // külső 43k felhúzó
     mainsCmd();
