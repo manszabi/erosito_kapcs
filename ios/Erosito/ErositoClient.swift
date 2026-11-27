@@ -6,6 +6,8 @@ import Observation
 struct AmpStatus: Decodable, Sendable {
     var power: String?
     var rl2: String?
+    var spk: String?
+    var dc: String?
     var trigger: String?
     var trigEnabled: Bool?
     var hold: Bool?

@@ -47,6 +47,8 @@ struct ContentView: View {
                     Section("Állapot") {
                         row("Trigger jel", s.trigger == "ON" ? "aktív" : "nincs")
                         row("NTC áthidalva (RL2)", s.rl2 == "ON" ? "igen" : "nem")
+                        if let spk = s.spk { row("Hangszórók", spk == "ON" ? "csatlakoztatva" : "leválasztva") }
+                        if s.dc == "ON" { row("DC a hangszórókimeneten", "VAN", alert: true) }
                         if s.hold == true { row("Áramszünet utáni várakozás", "folyamatban") }
                         row("Hiba", s.fault ?? "-", alert: (s.fault ?? "nincs") != "nincs")
                         row("Figyelmeztetés", s.warning ?? "-", alert: (s.warning ?? "nincs") != "nincs")

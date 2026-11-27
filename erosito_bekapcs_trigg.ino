@@ -73,6 +73,9 @@ const int PIN_TRIG = D3;   // trigger opto, LOW = aktív, 10k felhúzó         
 const int PIN_FB1  = D4;   // RL1 kimenet opto (CNY17-3 + DB106 + 3x43k), LOW = hálózat  C3: GPIO6,  S3: GPIO5
 const int PIN_RL2  = D5;   // RL2 tranzisztor                                            C3: GPIO7,  S3: GPIO6
 const int PIN_RL1  = D10;  // RL1 tranzisztor                                            C3: GPIO10, S3: GPIO9
+const int PIN_SPK  = D7;   // hangszórórelék (bal + jobb) tranzisztora, bázis 10k lehúzó C3: GPIO20, S3: GPIO44
+const int PIN_DC   = D8;   // hangszóróvédő: 2 opto (bal, jobb) közösítve, LOW = DC     C3: GPIO8 (indítási láb:
+                           // 10k felhúzó kell, induláskor ne legyen LOW),                    S3: GPIO7
 
 // ======================================================================= Beállítások
 // Relék, indulás
@@ -82,6 +85,12 @@ const unsigned long MIN_OFF_MS       = 5000;     // minimális kikapcsolt idő (
 const unsigned long POWERUP_HOLD_MS  = 120000UL; // áramszünet után ennyi ideig nincs trigger (a gomb egyszer bekapcsolhat)
 const bool          TRIGGER_ON_BOOT  = true;     // induláskor aktív triggerre bekapcsol
 const bool          BROWNOUT_IS_POWERLOSS = true; // brownout reset = áramszünet (különben fagyás)
+
+// Hangszóróvédő
+const bool          SPEAKER_PROTECT  = true;     // false: a D7 / D8 nincs használva
+const unsigned long SPK_DELAY_MS     = 1000;     // az RL2 után ennyivel kapcsolnak a hangszórók (mint az RL2 késleltetése)
+const unsigned long DC_FILTER_MS     = 20;       // ennyi ideig folyamatos LOW = DC (relé-zavar ellen)
+const unsigned long DC_START_WAIT_MS = 2000;     // bekapcsoláskor ennyi ideig várhat a DC megszűnésére a hangszórók előtt
 
 // Gomb, LED
 const unsigned long DEBOUNCE_MS      = 30;
@@ -168,8 +177,8 @@ static_assert(HEAP_BLOCK_WARN > HEAP_BLOCK_CRIT && HEAP_BLOCK_CRIT > HEAP_BLOCK_
 static_assert(STACK_WARN_BYTES > STACK_CRIT_BYTES && STACK_CRIT_BYTES > STACK_EMERG_BYTES, "verem hatarok sorrendje");
 
 // ======================================================================= Típusok, kódok (int, nem enum: az Arduino IDE prototípusai miatt)
-const int F_NONE = 0, F_STUCK = 1, F_CHATTER = 2, F_PRESSES = 3, F_NOMAINS = 4, F_MAINSOFF = 5, F_MAINSLOST = 6;
-const int IN_BTN = 0, IN_TRIG = 1, IN_FB1 = 2;
+const int F_NONE = 0, F_STUCK = 1, F_CHATTER = 2, F_PRESSES = 3, F_NOMAINS = 4, F_MAINSOFF = 5, F_MAINSLOST = 6, F_DC = 7;
+const int IN_BTN = 0, IN_TRIG = 1, IN_FB1 = 2, IN_DC = 3;
 
 struct Input {
   uint8_t pin;
@@ -207,6 +216,11 @@ bool rl2Settled = false;        // az RL2 már legalább RL2_MIN_ON_MS-ig behúz
 unsigned long onTime = 0, rl2Time = 0;
 unsigned long offTime = 0;      // utolsó kikapcsolás (0 = boot)
 bool minOffActive = true;       // a minimális kikapcsolt idő fut (bootkor is)
+bool spkOn = false;             // hangszórórelék BE
+bool spkReady = false;          // az RL2 óta letelt SPK_DELAY_MS (rögzítve: túlcsordulás-biztos)
+bool dcActive = false;          // szűrt DC-jel (hangszóróvédő)
+bool dcRawPrev = false, spkWait = false;
+unsigned long dcLowSince = 0, spkWaitT = 0;
 bool powerHold = false;         // áramszünet utáni várakozás
 bool holdBtnUsed = false;       // a várakozás alatt egy kézi (gomb / távoli) bekapcsolás engedett
 unsigned long holdStart = 0, holdDur = 0, lastHoldSave = 0;
@@ -232,7 +246,7 @@ uint8_t lossStreak = 0;             // egymás utáni hálózatkiesések
 unsigned long lossLastT = 0;        // az utolsó hálózatkiesés
 uint8_t faultStreak = 0;            // egymás utáni hardverhibák (zaj, beragadás, RL1 kimenet)
 unsigned long faultQuietT = 0;      // az utolsó hiba vége (a sorozat nullázásához)
-bool noMainsWait = false;           // F_NOMAINS után: csak gomb / távoli / új trigger él kapcsol be
+bool manualWait = false;           // F_NOMAINS / F_DC után: csak gomb / távoli / új trigger él kapcsol be
 
 // Bemenetek, gomb
 Input inputs[2] = {
@@ -608,6 +622,30 @@ void checkWarnings() {
   lastWarnCount = n;
 }
 
+// ======================================================================= Hangszórók (az RL2 után SPK_DELAY_MS-mal, DC nélkül)
+void spkSet(bool s) {
+  if (!SPEAKER_PROTECT || s == spkOn) return;
+  digitalWrite(PIN_SPK, s ? HIGH : LOW);
+  spkOn = s;
+  netStateDirty = true;
+  slog(s ? "Hangszorok BE\n" : "Hangszorok KI\n");
+}
+
+void dcUpdate() {   // LOW = DC valamelyik csatornán; DC_FILTER_MS szűrés
+  if (!SPEAKER_PROTECT) return;
+  unsigned long now = millis();
+  bool raw = digitalRead(PIN_DC) == LOW;
+  if (raw && !dcRawPrev) dcLowSince = now;
+  dcRawPrev = raw;
+  if (!raw) dcActive = false;
+  else if (!dcActive && now - dcLowSince >= DC_FILTER_MS) dcActive = true;
+}
+
+void updateSpeakers() {   // a hibakezelés után fut: hiba, DC vagy kikapcsolt RL2 mellett azonnal KI
+  if (!SPEAKER_PROTECT) return;
+  spkSet(on && rl2On && spkReady && !faultActive && !dcActive);
+}
+
 // ======================================================================= Relék
 void setState(bool s, const char *src) {
   if (s == on) return;
@@ -618,7 +656,7 @@ void setState(bool s, const char *src) {
   onReqTrig = false;
   if (on) {
     digitalWrite(PIN_RL1, HIGH);
-    noMainsWait = false;
+    manualWait = false;
     onTime = millis();
     ledBase = true;
     mainsCmd();
@@ -633,10 +671,13 @@ void setState(bool s, const char *src) {
     stDirty = true;
     statsSave();
   } else {
+    spkSet(false);   // a hangszórók elsőként válnak le
     digitalWrite(PIN_RL2, LOW);
     digitalWrite(PIN_RL1, LOW);
     rl2On = false;
     rl2Settled = false;
+    spkReady = false;
+    spkWait = false;
     offTime = millis();
     minOffActive = true;
     ledBase = false;
@@ -653,11 +694,13 @@ void setState(bool s, const char *src) {
 }
 
 void updateRl2(unsigned long now) {   // RL2 késleltetve (csak igazolt hálózat után), függő kikapcsolás az RL2 minimum után
-  if (on && !rl2On && !faultActive && (!MAINS_CHECK || fbConfirmed) && now - onTime >= RL2_DELAY_MS) {
+  if (on && !rl2On && !faultActive && (!MAINS_CHECK || (fbConfirmed && now - fbLastLow <= MAINS_GAP_MS)) &&   // épp van hálózat (nem kiesés eleje)
+      now - onTime >= RL2_DELAY_MS) {
     digitalWrite(PIN_RL2, HIGH);
     rl2On = true;
     rl2Time = millis();
     rl2Settled = false;
+    spkReady = false;
     st.rl2Count++;
     stDirty = true;
     netStateDirty = true;
@@ -684,6 +727,7 @@ const char *faultName(int f) {
     case F_NOMAINS:   return "nincs hálózat az RL1 után";
     case F_MAINSOFF:  return "hálózat van kikapcsolt relénél (összehegedt érintkező?)";
     case F_MAINSLOST: return "hálózatkiesés";
+    case F_DC:        return "DC a hangszórókimeneten (végfok hiba?)";
     default:          return "nincs";
   }
 }
@@ -705,6 +749,10 @@ void startFault(int idx, int f) {
     lossLastT = millis();
     pauseLogged = false;
   }
+  if (idx == IN_DC) {   // DC a kimeneten: hangszórók és relék azonnal KI
+    spkSet(false);
+    setState(false, "DC a hangszorokimeneten");
+  }
   if (idx == IN_FB1) {   // hálózati hiba: relék azonnal KI
     bool retry = on && !offPending;
     setState(false, (f == F_MAINSLOST) ? "halozatkieses" : "halozati hiba");
@@ -721,12 +769,16 @@ void startFault(int idx, int f) {
   saveFault(f);
   if (f == F_MAINSLOST) netEvent("mains_loss", "Hálózatkiesés bekapcsolt állapotban%s", onReqTrig ? ", újrakapcsolás aktív triggerre"
                                  : lossPaused() ? ", sorozatos kiesés: nincs automatikus visszakapcsolás" : "");
-  else netEvent("fault", "%s: %s", idx == IN_FB1 ? "RL1 kimenet" : inputs[idx].name, faultName(f));
+  else netEvent("fault", "%s: %s", idx == IN_FB1 ? "RL1 kimenet" : idx == IN_DC ? "Hangszóróvédő" : inputs[idx].name, faultName(f));
   faultActive = true;
   faultStart = millis();
   ledFaultBlink = true;
   ledFlashes = 0;
   ledT = faultStart;
+  if (idx == IN_DC) {
+    slogc("!!! HANGSZOROVEDO: DC a kimeneten -> hangszorok es relek AZONNAL KI (ujra: gomb, tavoli vagy uj trigger el)\n");
+    return;
+  }
   if (idx == IN_FB1) {
     if (f == F_MAINSLOST)
       slogc("!!! HALOZATKIESES: relek AZONNAL KI%s\n",
@@ -783,9 +835,23 @@ void endLockout() {   // tiltás vége: ok ellenőrzése, mentett hiba törlése
     int was = lastFault;
     lastFault = F_NONE;
     saveFault(F_NONE);
-    noMainsWait = (was == F_NOMAINS);
-    if (was == F_NOMAINS) slog("Nincs automatikus ujrakapcsolas: gomb vagy uj trigger kell\n");
+    manualWait = (was == F_NOMAINS || was == F_DC);
+    if (manualWait) slog("Nincs automatikus ujrakapcsolas: gomb vagy uj trigger kell\n");
     else if (AUTO_ON_AFTER_FAULT && !trigOff && trig.stable == LOW && !autoPaused()) switchOn("aktiv trigger hiba utan", false);
+  }
+}
+
+void dcCheck() {   // bekapcsolva: DC a hangszórók alatt = azonnali hiba; csatlakozás előtt DC_START_WAIT_MS türelem
+  if (!SPEAKER_PROTECT || !on || faultActive) return;
+  if (!dcActive) { spkWait = false; return; }
+  if (spkOn) { startFault(IN_DC, F_DC); return; }
+  if (!(rl2On && spkReady)) return;   // még nem esedékes: a bekapcsolási tranziens nem hiba
+  if (!spkWait) {
+    spkWait = true;
+    spkWaitT = millis();
+    slog("DC a kimeneten: a hangszorok varnak (%lu ms)\n", DC_START_WAIT_MS);
+  } else if (millis() - spkWaitT >= DC_START_WAIT_MS) {
+    startFault(IN_DC, F_DC);
   }
 }
 
@@ -1198,11 +1264,11 @@ void buildState(char *js, size_t len, bool forWeb) {
   unsigned a = (unsigned)(st.optoAvg * 10 + 0.5f), b = (unsigned)(st.optoBase * 10 + 0.5f);
   bool flt = faultActive || lockoutPending;
   int n = snprintf(js, len,
-           "{\"power\":\"%s\",\"rl2\":\"%s\",\"trigger\":\"%s\",\"trig_enabled\":%s,\"trig_en\":\"%s\",\"hold\":%s,"
+           "{\"power\":\"%s\",\"rl2\":\"%s\",\"spk\":\"%s\",\"dc\":\"%s\",\"trigger\":\"%s\",\"trig_enabled\":%s,\"trig_en\":\"%s\",\"hold\":%s,"
            "\"fault\":\"%s\",\"warning\":\"%s\",\"problem\":\"%s\",\"on_hours\":%lu.%lu,\"on_count\":%lu,"
            "\"relay_count\":%lu,\"mains_loss\":%lu,\"faults\":%lu,\"power_ups\":%lu,\"opto_now\":%u,"
            "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d,\"heap_free\":%lu,\"heap_min\":%lu,\"heap_block\":%lu",
-           on ? "ON" : "OFF", rl2On ? "ON" : "OFF", trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
+           on ? "ON" : "OFF", rl2On ? "ON" : "OFF", spkOn ? "ON" : "OFF", dcActive ? "ON" : "OFF", trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
            trigOff ? "OFF" : "ON", powerHold ? "true" : "false", flt ? faultName(lastFault) : "nincs", w[0] ? w + 1 : "nincs",
            (flt || w[0]) ? "ON" : "OFF", h10 / 10, h10 % 10, (unsigned long)st.onCount, (unsigned long)st.relayCount,
            (unsigned long)st.mainsLoss, (unsigned long)st.faults, (unsigned long)st.powerUps, (unsigned)fbCount,
@@ -1281,6 +1347,10 @@ void netDiscovery() {
   netDisc("switch", "trig_en", "\"Trigger figyelés\"", ",\"cmd_t\":\"" NET_ID "/trigger/set\",\"ic\":\"mdi:import\"");
   netDisc("binary_sensor", "rl2", "\"NTC áthidalva (RL2)\"", ",\"ent_cat\":\"diagnostic\"");
   netDisc("binary_sensor", "trigger", "\"Trigger\"", "");
+  if (SPEAKER_PROTECT) {
+    netDisc("binary_sensor", "spk", "\"Hangszórók\"", "");
+    netDisc("binary_sensor", "dc", "\"DC a hangszórókimeneten\"", ",\"dev_cla\":\"problem\"");
+  }
   netDisc("binary_sensor", "problem", "\"Probléma\"", ",\"dev_cla\":\"problem\"");
   netDisc("sensor", "fault", "\"Hiba\"", "");
   netDisc("sensor", "warning", "\"Figyelmeztetés\"", "");
@@ -1444,7 +1514,7 @@ label{display:block;margin-top:8px;font-size:.9em}input{width:100%;padding:7px;b
 <button type="submit">Mentés</button></form></details></section><p><a href="/logout">Kijelentkezés</a></p>
 <script>
 let tr=false,cf=false;const $=i=>document.getElementById(i);
-const L={rl2:'NTC áthidalva (RL2)',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
+const L={rl2:'NTC áthidalva (RL2)',spk:'Hangszórók',dc:'DC a kimeneten',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
 fault:'Hiba',warning:'Figyelmeztetés',on_hours:'Üzemidő (óra)',on_count:'Bekapcsolások',relay_count:'Relé kapcsolások',
 mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',ip_mode:'IP mód',ip_error:'IP-hiba',
 rssi:'WiFi jel (dBm)',mdns:'mDNS',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',heap_block:'Legnagyobb szabad blokk (B)',board:'Alaplap'};
@@ -1994,6 +2064,7 @@ void printStatus() {
         ledFaultBlink ? "hiba" : (ledBase ? "be" : "ki"), offPending ? " [kikapcs. fuggoben]" : "", rq, lk);
   slogc("  GOMB: %s, TRIGGER: %s (%s)\n", btn.stable == LOW ? "nyomva" : "fent",
         trig.stable == LOW ? "aktiv" : "nincs", trigOff ? "TILTVA" : "engedelyezve");
+  if (SPEAKER_PROTECT) slogc("  HANGSZOROK: %s, DC: %s\n", spkOn ? "BE" : "KI", dcActive ? "VAN" : "nincs");
   if (MAINS_CHECK)
     slogc("  RL1 kimenet: %s%s, LOW minta: %u (kuszob %u)\n",
           !fbValid ? "meres..." : (fbPresent ? "halozat VAN" : "halozat nincs"),
@@ -2096,6 +2167,7 @@ void initOutputs() {   // relék és LED KI (a pinMode előtti írás hatástala
   pinMode(PIN_RL1, OUTPUT);
   pinMode(PIN_RL2, OUTPUT);
   pinMode(PIN_LED, OUTPUT);
+  if (SPEAKER_PROTECT) { pinMode(PIN_SPK, OUTPUT); digitalWrite(PIN_SPK, LOW); }
   digitalWrite(PIN_RL1, LOW);
   digitalWrite(PIN_RL2, LOW);
   digitalWrite(PIN_LED, LOW);
@@ -2122,6 +2194,7 @@ bool loadSettings() {   // NVS: trigger tiltás, mentett hiba, állapotfigyelés
 void initInputs() {
   pinMode(PIN_BTN,  INPUT_PULLUP);
   pinMode(PIN_TRIG, INPUT_PULLUP);
+  if (SPEAKER_PROTECT) pinMode(PIN_DC, INPUT_PULLUP);   // a külső 10k mellett: bekötés nélkül sincs hamis DC
   if (MAINS_CHECK) {
     pinMode(PIN_FB1, INPUT);   // külső 43k felhúzó
     mainsCmd();
@@ -2232,7 +2305,7 @@ void endPowerHold() {
   holdClear();
   resyncInputs();
   slogc("Aramszunet utani varakozas vege\n");
-  if (!lockoutPending && !autoPaused() && !noMainsWait && TRIGGER_ON_BOOT && !trigOff && trig.stable == LOW)
+  if (!lockoutPending && !autoPaused() && !manualWait && TRIGGER_ON_BOOT && !trigOff && trig.stable == LOW)
     switchOn("aktiv trigger aramszunet utan", false);
 }
 
@@ -2245,6 +2318,7 @@ void handlePowerHold(unsigned long now, bool btnChanged) {   // áramszünet ut�
   if (on) {
     int mf = mainsFault();
     if (mf != F_NONE) startFault(IN_FB1, mf);
+    dcCheck();
   }
   if (!faultActive) holdButton(now, btnChanged);
   handleRemote(true);
@@ -2254,6 +2328,7 @@ void handlePowerHold(unsigned long now, bool btnChanged) {   // áramszünet ut�
 void handleNormal(bool btnChanged, bool trigChanged) {
   int mf = mainsFault();
   if (mf != F_NONE && (on || !faultHold)) startFault(IN_FB1, mf);
+  dcCheck();
   if (!faultActive && !faultHold) checkInputFaults();
   if (!faultActive) buttonLogic(btnChanged);
   handleRemote(false);
@@ -2267,14 +2342,14 @@ void handleNormal(bool btnChanged, bool trigChanged) {
     bool wasPaused = autoPaused();   // FAULT_STREAK_RESET_MS hibamentes idő: a sorozat nullázódik
     faultStreak = 0;
     slog("Hibasorozat nullazva (%lu s hibamentes)\n", FAULT_STREAK_RESET_MS / 1000);
-    if (wasPaused && !autoPaused() && AUTO_ON_AFTER_FAULT && !on && !trigOff && trig.stable == LOW && !noMainsWait)
+    if (wasPaused && !autoPaused() && AUTO_ON_AFTER_FAULT && !on && !trigOff && trig.stable == LOW && !manualWait)
       switchOn("aktiv trigger, ismetlodo hiba utan stabil", false);
   }
   if (lossStreak && !faultActive && millis() - lossLastT >= FAULT_STREAK_RESET_MS) {
     bool wasPaused = autoPaused();
     lossStreak = 0;
     slog("Halozatkieses-sorozat nullazva (%lu s kieses nelkul)\n", FAULT_STREAK_RESET_MS / 1000);
-    if (wasPaused && !autoPaused() && !lockoutPending && !noMainsWait && !on && !trigOff && trig.stable == LOW)
+    if (wasPaused && !autoPaused() && !lockoutPending && !manualWait && !on && !trigOff && trig.stable == LOW)
       switchOn("aktiv trigger, sorozatos kieses utan", false);
   }
 }
@@ -2367,7 +2442,9 @@ void loop() {
   bool btnChanged  = updateInput(IN_BTN);
   bool trigChanged = updateInput(IN_TRIG);
   mainsUpdate();
+  dcUpdate();
   if (rl2On && !rl2Settled && now - rl2Time >= RL2_MIN_ON_MS) rl2Settled = true;   // letelt állapotok rögzítése:
+  if (rl2On && !spkReady && now - rl2Time >= SPK_DELAY_MS) spkReady = true;
   if (minOffActive && !on && now - offTime >= MIN_OFF_MS) minOffActive = false;     // régi időbélyeg nem zavarhat be
   if (trigChanged) netStateDirty = true;
 
@@ -2376,6 +2453,7 @@ void loop() {
   else                handleNormal(btnChanged, trigChanged);
 
   updateRl2(now);
+  updateSpeakers();
   ledUpdate();
   handleRemoteTrigger();
   handleSerial();

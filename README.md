@@ -17,6 +17,8 @@ A program a XIAO D-lábneveit használja, így a bekötés **mindkét lapon azon
 | D4 | 6 | 5 | Hálózatfigyelő optó, LOW = van hálózat (43k felhúzó) |
 | D5 | 7 | 6 | RL2 tranzisztor |
 | D10 | 10 | 9 | RL1 tranzisztor |
+| D7 | 20 | 44 | Hangszórórelék (bal + jobb) tranzisztora |
+| D8 | 8 | 7 | Hangszóróvédő: 2 optó (bal, jobb) közösítve, LOW = DC (10k felhúzó) |
 
 A relé-tranzisztorok bázisán legyen lehúzó ellenállás, hogy reset alatt ne kattanjanak be.
 
@@ -37,6 +39,23 @@ A relé-tranzisztorok bázisán legyen lehúzó ellenállás, hogy reset alatt n
 
 Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalább 6 mm legyen.
 
+## Hangszóróvédő
+
+```
+ 3V3 ──[10k]──┬── D8            D7 ──[470]──┬── B (NPN, pl. BC337)
+              ├── optó BAL  C               └─[10k]── GND
+              └── optó JOBB C               C ── mindkét relé tekercse (+ szabadonfutó dióda tekercsenként) ── tápfeszültség
+    optó E (mindkettő) ── GND               E ── GND
+```
+
+- A két optó kimenete közösítve: bármelyik csatornán DC = LOW. A D8 C3-on indítási láb, ezért a 10k felhúzó kötelező, és induláskor nem lehet LOW (bekapcsolatlan erősítőnél az optók nem vezetnek).
+- A relé-tranzisztor bázisán 10k lehúzó: reset alatt a hangszórók biztosan le vannak választva. A 470 Ω-os bázisellenállással (kb. 5 mA) a BC337 két relé tekercsáramát (100–200 mA) is telítésben kapcsolja.
+- **Bekapcsolás:** RL1 → 1 s → RL2 → 1 s (`SPK_DELAY_MS`) → hangszórók.
+- **Kikapcsolás, hálózatkiesés, bármilyen hiba:** a hangszórók elsőként (ugyanabban a ms-ban) válnak le.
+- **DC a kimeneten** (20 ms szűrés, `DC_FILTER_MS`): a hangszórók és a relék azonnal KI, hibajelzés (LED, napló, weboldal, Home Assistant). Utána csak gomb, távoli parancs vagy a trigger új éle kapcsol be; magától nem.
+- **Bekapcsoláskor DC** (pl. bekapcsolási tranziens): a hangszórók legfeljebb 2 s-ig várnak (`DC_START_WAIT_MS`); ha addig nem szűnik meg, hiba.
+- A rövid (20 ms alatti) tüske nem hiba. `SPEAKER_PROTECT = false`: a D7 / D8 nincs használva.
+
 ## Kezelés
 
 - **Gomb, hosszú nyomás (≥ 0,4 s):** be / ki.
@@ -55,6 +74,7 @@ Az ellenállások 0,6 W-osak. A hálózati és a 3,3 V-os oldal között legalá
 | Beállítás | Érték | Jelentés |
 |---|---|---|
 | `RL2_DELAY_MS` | 1 s | Lágyindítás: az RL1 után ennyivel húz be az RL2 |
+| `SPK_DELAY_MS` | 1 s | Az RL2 után ennyivel kapcsolnak a hangszórók |
 | `RL2_MIN_ON_MS` | 2 s | Kikapcsolás előtt az RL2 legalább ennyi ideig be van húzva |
 | `MIN_OFF_MS` | 5 s | Minimális kikapcsolt idő; az ez alatti kérést a program megjegyzi |
 | `POWERUP_HOLD_MS` | 2 perc | Áramszünet után eddig nincs trigger, a gomb csak egyszer kapcsolhat be |
