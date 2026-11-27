@@ -30,7 +30,7 @@ final class Discovery {
         browser = newBrowser
         scanTask = Task { [weak self] in   // a Bonjourral párhuzamosan: végigpróbálja a saját /24 hálózatot
             await self?.scanSubnet()
-            self?.searching = false
+            if !Task.isCancelled { self?.searching = false }   // egy leállított régi keresés ne írja felül az újat
         }
     }
 
@@ -114,7 +114,7 @@ final class Discovery {
                 if let next = iterator.next() { group.addTask { await Self.probe(Self.ipString(next)) } }
             }
             while let result = await group.next() {
-                if Task.isCancelled { group.cancelAll(); break }
+                if Task.isCancelled { group.cancelAll(); return }
                 if let host = result { add(name: "Erősítő", host: host) }
                 if let next = iterator.next() { group.addTask { await Self.probe(Self.ipString(next)) } }
             }

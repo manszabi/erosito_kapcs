@@ -72,7 +72,8 @@ final class ErositoClient {
     }
 
     /// Eszköz és jelszó mentése (cím: UserDefaults, jelszó: Kulcskarika)
-    func configure(host newHost: String, password newPassword: String) {
+    func configure(host rawHost: String, password newPassword: String) {
+        let newHost = Self.normalize(rawHost)
         host = newHost
         password = newPassword
         UserDefaults.standard.set(newHost, forKey: "host")
@@ -80,6 +81,14 @@ final class ErositoClient {
         status = nil
         failures = 0
         Task { await refresh() }
+    }
+
+    /// "http://192.168.1.50/" -> "192.168.1.50": séma, útvonal és szóközök nélkül
+    static func normalize(_ raw: String) -> String {
+        var h = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for scheme in ["http://", "https://"] where h.lowercased().hasPrefix(scheme) { h = String(h.dropFirst(scheme.count)) }
+        if let slash = h.firstIndex(of: "/") { h = String(h[..<slash]) }
+        return h
     }
 
     /// Állapot lekérdezése 2 s-onként, amíg az app előtérben van

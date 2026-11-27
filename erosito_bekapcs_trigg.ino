@@ -165,6 +165,9 @@ const uint8_t       MEM_RESTART_MAX  = 3;          // ennyi egymás utáni memó
 const unsigned long MEM_RESTART_OK_MS = 3600000UL; // ennyi zavartalan futás után a számláló nullázódik
 
 static_assert(OPTO_MIN_AVG > MAINS_MIN_LOW, "OPTO_MIN_AVG > MAINS_MIN_LOW kell");
+#if !defined(ARDUINO_USB_CDC_ON_BOOT) || (ARDUINO_USB_CDC_ON_BOOT == 0)
+static_assert(!SPEAKER_PROTECT, "A D7 (hangszororele) a soros port RX laba: Eszkozok > USB CDC On Boot > Enabled kell");
+#endif
 static_assert(MAINS_LOSS_MS >= 20, "MAINS_LOSS_MS >= 20 ms kell (2 felperiodus)");
 static_assert(MAINS_GAP_MS < MAINS_LOSS_MS, "MAINS_GAP_MS < MAINS_LOSS_MS kell");
 static_assert(MAINS_FAULT_MS > MAINS_WIN_MS, "MAINS_FAULT_MS > MAINS_WIN_MS kell");
@@ -1498,7 +1501,7 @@ label{display:block;margin-top:8px;font-size:.9em}input{width:100%;padding:7px;b
 </style></head><body><h1>Erősítő bekapcsoló</h1>
 <section><div id="st" class="st">Betöltés…</div>
 <button class="on big" onclick="post('/api/power','state=on')">Bekapcsolás</button><button class="off big" onclick="post('/api/power','state=off')">Kikapcsolás</button>
-<button id="tb" class="wide" onclick="post('/api/trigger','enabled='+(tr?0:1))">Trigger figyelés</button></section>
+<button id="tb" class="wide" disabled onclick="post('/api/trigger','enabled='+(tr?0:1))">Trigger figyelés</button></section>
 <section><h2>Állapot</h2><table id="t"></table></section>
 <section><details><summary>Beállítások</summary><form method="post" action="/api/config">
 <label>WiFi hálózat neve<input name="ssid" id="ssid" maxlength="32"></label>
@@ -1518,12 +1521,15 @@ const L={rl2:'NTC áthidalva (RL2)',spk:'Hangszórók',dc:'DC a kimeneten',trigg
 fault:'Hiba',warning:'Figyelmeztetés',on_hours:'Üzemidő (óra)',on_count:'Bekapcsolások',relay_count:'Relé kapcsolások',
 mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',ip_mode:'IP mód',ip_error:'IP-hiba',
 rssi:'WiFi jel (dBm)',mdns:'mDNS',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',heap_block:'Legnagyobb szabad blokk (B)',board:'Alaplap'};
-const V=x=>x===true?'igen':x===false?'nem':x==='ON'?'BE':x==='OFF'?'KI':x;
-async function upd(){try{const r=await fetch('/api/status');if(r.status==401){location='/login';return;}const s=await r.json();tr=s.trig_enabled;let h='';
+const E=x=>String(x).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const V=x=>x===true?'igen':x===false?'nem':x==='ON'?'BE':x==='OFF'?'KI':E(x);let fails=0;
+function off(){if(++fails<3)return;const st=$('st');st.textContent='Nincs kapcsolat';st.className='st';$('t').innerHTML='';$('tb').disabled=true;}
+async function upd(){try{const r=await fetch('/api/status',{cache:'no-store'});if(r.status==401){location='/login';return;}const s=await r.json();
+if(!('power' in s)){off();return;}fails=0;tr=s.trig_enabled;$('tb').disabled=false;let h='';
 for(const k in L)if(k in s&&s[k]!=='')h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
 $('t').innerHTML=h;const st=$('st');st.textContent=s.power=='ON'?'Bekapcsolva':'Kikapcsolva';st.className='st'+(s.power=='ON'?' on1':'');$('tb').textContent='Trigger figyelés: '+(tr?'BE – kikapcsolás':'KI – bekapcsolás');
-if(!cf){cf=true;$('ssid').value=s.cfg_ssid;$('mu').value=s.cfg_mqtt_uri;$('mus').value=s.cfg_mqtt_user;$('ip').value=s.cfg_ip;$('gw').value=s.cfg_gw;$('mask').value=s.cfg_mask;$('dns').value=s.cfg_dns;}}catch(e){}}
-async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});if(r.status==401){location='/login';return;}setTimeout(upd,300);}
+if(!cf&&'cfg_ssid' in s){cf=true;$('ssid').value=s.cfg_ssid;$('mu').value=s.cfg_mqtt_uri;$('mus').value=s.cfg_mqtt_user;$('ip').value=s.cfg_ip;$('gw').value=s.cfg_gw;$('mask').value=s.cfg_mask;$('dns').value=s.cfg_dns;}}catch(e){off();}}
+async function post(u,b){try{const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});if(r.status==401){location='/login';return;}}catch(e){off();}setTimeout(upd,300);}
 upd();setInterval(upd,2000);
 </script></body></html>)HTML";
 
