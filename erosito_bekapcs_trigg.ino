@@ -262,7 +262,10 @@ uint8_t lossStreak = 0;             // egymás utáni hálózatkiesések
 unsigned long lossLastT = 0;        // az utolsó hálózatkiesés
 uint8_t faultStreak = 0;            // egymás utáni hardverhibák (zaj, beragadás, RL1 kimenet)
 unsigned long faultQuietT = 0;      // az utolsó hiba vége (a sorozat nullázásához)
-bool manualWait = false;           // F_NOMAINS / F_DC után: csak gomb / távoli / új trigger él kapcsol be
+bool manualWait = false;           // F_NOMAINS után: csak gomb / távoli / új trigger él kapcsol be
+uint8_t sevFault = F_NONE;         // mentett súlyos hiba (DC / erősítő-táp, NVS): csak a fizikai gomb kapcsolhat be
+uint32_t sevCount = 0;             // súlyos hibák száma (NVS)
+bool onReqPhys = false;            // a függő kézi kérést a fizikai gomb adta
 
 // Bemenetek, gomb
 Input inputs[2] = {
@@ -309,7 +312,7 @@ volatile bool netResetReq = false;    // 'W': hálózati beállítások törlés
 volatile bool netRecoverReq = false;  // memória-őr: a hálózat újraindítása (a relék nem érintettek)
 volatile bool netStateDirty = true;
 void netEvent(const char *type, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-void switchOn(const char *src, bool manual);   // előre deklarálva: a hibakezelés is hívja
+void switchOn(const char *src, bool manual, bool phys = false);   // előre deklarálva; phys: a fizikai gomb kérte
 
 // Taskok (verem-figyeléshez)
 TaskHandle_t loopTaskH = nullptr, logTaskH = nullptr, netTaskH = nullptr;
@@ -749,6 +752,21 @@ void saveFault(int f) {   // csak az ellenőrizhető hardverhibát mentjük (ber
   prefs.end();
 }
 
+void sevSave() {
+  if (!prefs.begin("relay", false)) return;
+  prefs.putUChar("sev", sevFault);
+  prefs.putUInt("sevCnt", sevCount);
+  prefs.end();
+}
+
+void sevClear(const char *why) {   // csak a fizikai gombos bekapcsolás nyugtázza (a trigger visszakapcsolása nem)
+  if (sevFault == F_NONE) return;
+  sevFault = F_NONE;
+  sevSave();
+  netStateDirty = true;
+  slogc("Mentett DC / tap hiba nyugtazva (%s)\n", why);
+}
+
 const char *faultName(int f) {
   switch (f) {
     case F_STUCK:     return "beragadt gomb / zárlat";
@@ -784,6 +802,15 @@ void startFault(int idx, int f) {
   if (idx == IN_DC || idx == IN_RAIL) {   // DC a kimeneten / hiányzó erősítő-táp: hangszórók és relék azonnal KI
     spkSet(false);
     setState(false, idx == IN_DC ? "DC a hangszorokimeneten" : "erosito-tap hiba");
+    sevFault = (uint8_t)f;                // mentve: áramszünet után is megmarad
+    if (sevCount < UINT32_MAX) sevCount++;
+    sevSave();
+    if (!trigOff) {                       // felügyelet nélkül se kapcsolhasson vissza: trigger figyelés KI (mentve)
+      trigOff = true;
+      if (prefs.begin("relay", false)) { prefs.putBool("trigOff", true); prefs.end(); }
+      slogc("Trigger figyeles KIKAPCSOLVA (DC / tap hiba): visszakapcsolas kezzel (2 rovid nyomas, app, weboldal)\n");
+    }
+    netStateDirty = true;
   }
   if (idx == IN_FB1) {   // hálózati hiba: relék azonnal KI
     bool retry = on && !offPending;
@@ -808,11 +835,11 @@ void startFault(int idx, int f) {
   ledFlashes = 0;
   ledT = faultStart;
   if (idx == IN_DC) {
-    slogc("!!! HANGSZOROVEDO: DC a kimeneten -> hangszorok es relek AZONNAL KI (ujra: gomb, tavoli vagy uj trigger el)\n");
+    slogc("!!! HANGSZOROVEDO: DC a kimeneten -> hangszorok es relek AZONNAL KI (ujra csak a fizikai gombbal)\n");
     return;
   }
   if (idx == IN_RAIL) {
-    slogc("!!! EROSITO TAP: %s -> hangszorok es relek AZONNAL KI (ujra: gomb, tavoli vagy uj trigger el)\n",
+    slogc("!!! EROSITO TAP: %s -> hangszorok es relek AZONNAL KI (ujra csak a fizikai gombbal)\n",
           railFaultMask == 3 ? "mindket erosito" : railFaultMask == 1 ? "BAL erosito" : "JOBB erosito");
     return;
   }
@@ -873,6 +900,7 @@ void endLockout() {   // tiltás vége: ok ellenőrzése, mentett hiba törlése
     lastFault = F_NONE;
     saveFault(F_NONE);
     manualWait = (was == F_NOMAINS || was == F_DC || was == F_RAIL);
+    if (sevFault != F_NONE) slog("Mentett DC / tap hiba: bekapcsolas csak a fizikai gombbal\n");
     if (manualWait) slog("Nincs automatikus ujrakapcsolas: gomb vagy uj trigger kell\n");
     else if (AUTO_ON_AFTER_FAULT && !trigOff && trig.stable == LOW && !autoPaused()) switchOn("aktiv trigger hiba utan", false);
   }
@@ -930,15 +958,19 @@ void requestOff(const char *src, bool byBtn) {   // az RL2 legalább RL2_MIN_ON_
 
 bool btnBusy() { return onReqBtn || (offPending && offByBtn); }   // függő kézi kérés alatt a gomb hatástalan
 
-void switchOn(const char *src, bool manual) {
+void switchOn(const char *src, bool manual, bool phys) {
   if (on || faultActive) return;
+  if (sevFault != F_NONE && !phys) {   // DC / táp hiba után: trigger, távoli parancs és automatika nem kapcsolhat be
+    slog("Bekapcsolas tiltva (%s): mentett %s, csak a fizikai gombbal\n", src, sevFault == F_DC ? "DC hiba" : "tap hiba");
+    return;
+  }
   if (lockoutLeft() > 0) {   // hiba utáni tiltás: a kérés elvész
     slog("Bekapcsolas tiltva (%s): meg %lu ms\n", src, lockoutLeft());
     return;
   }
   unsigned long left = minOffLeft();
   if (left > 0) {   // minimális kikapcsolt idő: a kérés megmarad
-    if (manual) onReqBtn = true;
+    if (manual) { onReqBtn = true; onReqPhys = phys; }
     else onReqTrig = true;
     onReqSrc = src;
     slog("Bekapcsolas (%s) %lu ms mulva%s\n", src, left, manual ? "" : ", ha a trigger meg aktiv");
@@ -952,6 +984,7 @@ void switchOn(const char *src, bool manual) {
     startFault(IN_FB1, F_MAINSOFF);
     return;
   }
+  if (phys) sevClear("bekapcsolas a gombbal");
   setState(true, src);
   if (manual && trigOff) ledFlash(2);   // tiltott trigger + kézi bekapcsolás
 }
@@ -959,7 +992,7 @@ void switchOn(const char *src, bool manual) {
 void processPendingOn(bool inHold) {   // függő bekapcsolás a minimális kikapcsolt idő végén
   if (faultActive || on || minOffLeft() > 0) return;
   if (inHold) {   // várakozás alatt csak a kézi kérés
-    if (onReqBtn) { onReqBtn = false; switchOn("gomb aramszunet utan", true); }
+    if (onReqBtn) { onReqBtn = false; switchOn("gomb aramszunet utan", true, onReqPhys); }
     return;
   }
   if (!onReqBtn && !onReqTrig) return;
@@ -967,7 +1000,7 @@ void processPendingOn(bool inHold) {   // függő bekapcsolás a minimális kika
   const char *src = onReqSrc;
   onReqBtn = false;
   onReqTrig = false;
-  if (byBtn) switchOn(src, true);
+  if (byBtn) switchOn(src, true, onReqPhys);
   else if (!trigOff && trig.stable == LOW) switchOn(src, false);
   else slog("Fuggo bekapcsolas elmarad: a trigger nem aktiv\n");
 }
@@ -1053,7 +1086,7 @@ void buttonLogic(bool changed) {   // hosszú = be / ki; 2 rövid = trigger tilt
     shortCount = 0;
     burstTaint = false;
     if (on) requestOff("gomb", true);
-    else switchOn("gomb", true);
+    else switchOn("gomb", true, true);
   }
   if (shortCount > 0 && btn.raw == HIGH && btn.stable == HIGH && (now - lastShortRel) > DOUBLE_GAP_MS) {
     uint8_t n = shortCount;
@@ -1073,7 +1106,7 @@ void holdButton(unsigned long now, bool changed) {   // áramszünet utáni vár
   if (btn.stable == LOW && !pressConsumed && (now - pressStart) >= LONG_PRESS_MS) {
     pressConsumed = true;
     holdBtnUsed = true;
-    switchOn("gomb aramszunet utan", true);
+    switchOn("gomb aramszunet utan", true, true);
     if (on || onReqBtn) slogc("Gomb a varakozas alatt elfogadva: tovabbi gombnyomas a varakozas vegeig hatastalan\n");
   }
 }
@@ -1317,13 +1350,15 @@ void buildState(char *js, size_t len, bool forWeb) {
   unsigned a = (unsigned)(st.optoAvg * 10 + 0.5f), b = (unsigned)(st.optoBase * 10 + 0.5f);
   bool flt = faultActive || lockoutPending;
   int n = snprintf(js, len,
-           "{\"power\":\"%s\",\"rl2\":\"%s\",\"spk\":\"%s\",\"dc\":\"%s\",\"rail_l\":\"%s\",\"rail_r\":\"%s\",\"trigger\":\"%s\",\"trig_enabled\":%s,\"trig_en\":\"%s\",\"hold\":%s,"
+           "{\"power\":\"%s\",\"rl2\":\"%s\",\"spk\":\"%s\",\"dc\":\"%s\",\"rail_l\":\"%s\",\"rail_r\":\"%s\",\"latched\":\"%s\",\"trigger\":\"%s\",\"trig_enabled\":%s,\"trig_en\":\"%s\",\"hold\":%s,"
            "\"fault\":\"%s\",\"warning\":\"%s\",\"problem\":\"%s\",\"on_hours\":%lu.%lu,\"on_count\":%lu,"
            "\"relay_count\":%lu,\"mains_loss\":%lu,\"faults\":%lu,\"power_ups\":%lu,\"opto_now\":%u,"
            "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d,\"heap_free\":%lu,\"heap_min\":%lu,\"heap_block\":%lu",
-           on ? "ON" : "OFF", rl2On ? "ON" : "OFF", spkOn ? "ON" : "OFF", dcActive ? "ON" : "OFF", rails[0].ok ? "ON" : "OFF", rails[1].ok ? "ON" : "OFF", trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
+           on ? "ON" : "OFF", rl2On ? "ON" : "OFF", spkOn ? "ON" : "OFF", dcActive ? "ON" : "OFF", rails[0].ok ? "ON" : "OFF", rails[1].ok ? "ON" : "OFF",
+           sevFault == F_DC ? "DC hiba: csak gombbal kapcsolható be" : sevFault == F_RAIL ? "tápfeszültség-hiba: csak gombbal kapcsolható be" : "nincs",
+           trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
            trigOff ? "OFF" : "ON", powerHold ? "true" : "false", flt ? faultName(lastFault) : "nincs", w[0] ? w + 1 : "nincs",
-           (flt || w[0]) ? "ON" : "OFF", h10 / 10, h10 % 10, (unsigned long)st.onCount, (unsigned long)st.relayCount,
+           (flt || w[0] || sevFault != F_NONE) ? "ON" : "OFF", h10 / 10, h10 % 10, (unsigned long)st.onCount, (unsigned long)st.relayCount,
            (unsigned long)st.mainsLoss, (unsigned long)st.faults, (unsigned long)st.powerUps, (unsigned)fbCount,
            a / 10, a % 10, b / 10, b % 10, (int)WiFi.RSSI(), (unsigned long)memFree(),
            (unsigned long)memMinFree(), (unsigned long)memBlock());
@@ -1408,6 +1443,7 @@ void netDiscovery() {
     netDisc("binary_sensor", "rail_l", "\"Bal erősítő táp\"", ",\"dev_cla\":\"power\"");
     netDisc("binary_sensor", "rail_r", "\"Jobb erősítő táp\"", ",\"dev_cla\":\"power\"");
   }
+  netDisc("sensor", "latched", "\"Mentett súlyos hiba\"", ",\"ic\":\"mdi:alert-octagon\"");
   netDisc("binary_sensor", "problem", "\"Probléma\"", ",\"dev_cla\":\"problem\"");
   netDisc("sensor", "fault", "\"Hiba\"", "");
   netDisc("sensor", "warning", "\"Figyelmeztetés\"", "");
@@ -1571,7 +1607,7 @@ label{display:block;margin-top:8px;font-size:.9em}input{width:100%;padding:7px;b
 <button type="submit">Mentés</button></form></details></section><p><a href="/logout">Kijelentkezés</a></p>
 <script>
 let tr=false,cf=false;const $=i=>document.getElementById(i);
-const L={rl2:'NTC áthidalva (RL2)',spk:'Hangszórók',dc:'DC a kimeneten',rail_l:'Bal erősítő táp',rail_r:'Jobb erősítő táp',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
+const L={rl2:'NTC áthidalva (RL2)',latched:'Mentett súlyos hiba',spk:'Hangszórók',dc:'DC a kimeneten',rail_l:'Bal erősítő táp',rail_r:'Jobb erősítő táp',trigger:'Trigger jel',trig_enabled:'Trigger figyelés',hold:'Áramszünet utáni várakozás',
 fault:'Hiba',warning:'Figyelmeztetés',on_hours:'Üzemidő (óra)',on_count:'Bekapcsolások',relay_count:'Relé kapcsolások',
 mains_loss:'Hálózatkiesések',faults:'Hibák',opto_now:'Optó minta',opto_avg:'Optó átlag',wifi:'WiFi',ip:'IP-cím',ip_mode:'IP mód',ip_error:'IP-hiba',
 rssi:'WiFi jel (dBm)',mdns:'mDNS',mqtt:'MQTT',uptime_h:'Futásidő (óra)',heap_free:'Szabad memória (B)',heap_min:'Legkisebb szabad memória (B)',heap_block:'Legnagyobb szabad blokk (B)',board:'Alaplap'};
@@ -1580,7 +1616,7 @@ const V=x=>x===true?'igen':x===false?'nem':x==='ON'?'BE':x==='OFF'?'KI':E(x);let
 function off(){if(++fails<3)return;const st=$('st');st.textContent='Nincs kapcsolat';st.className='st';$('t').innerHTML='';$('tb').disabled=true;}
 async function upd(){try{const r=await fetch('/api/status',{cache:'no-store'});if(r.status==401){location='/login';return;}const s=await r.json();
 if(!('power' in s)){off();return;}fails=0;tr=s.trig_enabled;$('tb').disabled=false;let h='';
-for(const k in L)if(k in s&&s[k]!=='')h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
+for(const k in L)if(k in s&&s[k]!=='')h+='<tr><td>'+L[k]+'</td><td'+((k=='fault'||k=='warning'||k=='latched')&&s[k]!='nincs'?' class="warn"':'')+'>'+V(s[k])+'</td></tr>';
 $('t').innerHTML=h;const st=$('st');st.textContent=s.power=='ON'?'Bekapcsolva':'Kikapcsolva';st.className='st'+(s.power=='ON'?' on1':'');$('tb').textContent='Trigger figyelés: '+(tr?'BE – kikapcsolás':'KI – bekapcsolás');
 if(!cf&&'cfg_ssid' in s){cf=true;$('ssid').value=s.cfg_ssid;$('mu').value=s.cfg_mqtt_uri;$('mus').value=s.cfg_mqtt_user;$('ip').value=s.cfg_ip;$('gw').value=s.cfg_gw;$('mask').value=s.cfg_mask;$('dns').value=s.cfg_dns;}}catch(e){off();}}
 async function post(u,b){try{const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});if(r.status==401){location='/login';return;}}catch(e){off();}setTimeout(upd,300);}
@@ -1674,6 +1710,11 @@ void webStatus() {
 
 void webPower() {   // mint a gomb / Home Assistant: ugyanazok a szabályok
   if (!apiAuth()) return;
+  if (web.arg("state") == "on" && sevFault != F_NONE) {   // DC / táp hiba után csak a fizikai gomb kapcsolhat be
+    web.send(409, "text/plain; charset=utf-8", sevFault == F_DC ? "Mentett DC hiba: bekapcsolás csak a gombbal"
+                                                                : "Mentett tápfeszültség-hiba: bekapcsolás csak a gombbal");
+    return;
+  }
   if (web.arg("state") == "on") remoteOnReq = true;
   else if (web.arg("state") == "off") remoteOffReq = true;
   else { web.send(400, "text/plain", "state=on vagy state=off kell"); return; }
@@ -2126,6 +2167,7 @@ void printStatus() {
         trig.stable == LOW ? "aktiv" : "nincs", trigOff ? "TILTVA" : "engedelyezve");
   if (SPEAKER_PROTECT) slogc("  HANGSZOROK: %s, DC: %s\n", spkOn ? "BE" : "KI", dcActive ? "VAN" : "nincs");
   if (RAIL_MONITOR) slogc("  EROSITO TAP: bal %s, jobb %s\n", rails[0].ok ? "OK" : "nincs", rails[1].ok ? "OK" : "nincs");
+  if (sevFault != F_NONE) slogc("  MENTETT %s: bekapcsolas csak a fizikai gombbal\n", sevFault == F_DC ? "DC HIBA" : "TAP HIBA");
   if (MAINS_CHECK)
     slogc("  RL1 kimenet: %s%s, LOW minta: %u (kuszob %u)\n",
           !fbValid ? "meres..." : (fbPresent ? "halozat VAN" : "halozat nincs"),
@@ -2143,8 +2185,8 @@ void printHealth() {
         (unsigned long)st.onCount, (unsigned long)st.rl2Count);
   slogc("  Rele: %lu / %lu kapcsolas (%lu %%)\n", (unsigned long)st.relayCount, (unsigned long)RELAY_LIFE,
         (unsigned long)((uint64_t)st.relayCount * 100 / RELAY_LIFE));
-  slogc("  Halozatkieses: %lu, hiba: %lu, aramszunet utani indulas: %lu\n", (unsigned long)st.mainsLoss,
-        (unsigned long)st.faults, (unsigned long)st.powerUps);
+  slogc("  Halozatkieses: %lu, hiba: %lu (ebbol DC / tap: %lu), aramszunet utani indulas: %lu\n", (unsigned long)st.mainsLoss,
+        (unsigned long)st.faults, (unsigned long)sevCount, (unsigned long)st.powerUps);
   slogc("  Futasido: %lu ora, szabad memoria: %lu bajt (legkisebb: %lu, legnagyobb blokk: %lu)\n", uptimeHours(),
         (unsigned long)memFree(), (unsigned long)memMinFree(), (unsigned long)memBlock());
   {
@@ -2239,6 +2281,9 @@ bool loadSettings() {   // NVS: trigger tiltás, mentett hiba, állapotfigyelés
   if (ok) {
     trigOff = prefs.getBool("trigOff", false);
     storedFault = prefs.getUChar("fault", 0);
+    sevFault = prefs.getUChar("sev", F_NONE);
+    sevCount = prefs.getUInt("sevCnt", 0);
+    if (sevFault != F_DC && sevFault != F_RAIL) sevFault = F_NONE;
     if (prefs.getBytes("stats", &st, sizeof st) != sizeof st || st.ver != STATS_VER) {
       memset(&st, 0, sizeof st);
       st.ver = STATS_VER;
@@ -2313,6 +2358,9 @@ void setup() {
   slogc("TRIGGER: %s, %s; halozatfigyeles: %s\n", trig.stable == LOW ? "aktiv" : "nincs",
         trigOff ? "TILTVA" : "engedelyezve", MAINS_CHECK ? "BE" : "KI");
   if (!nvsOk) slogc("FIGYELEM: NVS hiba, alapertelmezett beallitasok\n");
+  if (sevFault != F_NONE)
+    slogc("MENTETT %s: bekapcsolas csak a fizikai gombbal (trigger figyeles: %s)\n",
+          sevFault == F_DC ? "DC HIBA A HANGSZOROKIMENETEN" : "EROSITO-TAP HIBA", trigOff ? "KI" : "BE");
   if (memRestarted) {
     slogc("Memoria miatti ujrainditas utan (%s, %lu. egymas utan)%s\n", memReasonName(memReason), (unsigned long)(memInfo & 0xFF),
           memWasOn ? ": a relek visszakapcsolnak" : "");

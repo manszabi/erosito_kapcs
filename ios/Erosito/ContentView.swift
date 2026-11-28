@@ -46,6 +46,7 @@ struct ContentView: View {
                 if let s = client.status {
                     Section("Állapot") {
                         row("Trigger jel", s.trigger == "ON" ? "aktív" : "nincs")
+                        if let l = s.latched, l != "nincs" { row("Mentett súlyos hiba", l, alert: true) }
                         row("NTC áthidalva (RL2)", s.rl2 == "ON" ? "igen" : "nem")
                         if let spk = s.spk { row("Hangszórók", spk == "ON" ? "csatlakoztatva" : "leválasztva") }
                         if s.dc == "ON" { row("DC a hangszórókimeneten", "VAN", alert: true) }

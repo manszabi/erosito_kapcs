@@ -10,6 +10,7 @@ struct AmpStatus: Decodable, Sendable {
     var dc: String?
     var railL: String?
     var railR: String?
+    var latched: String?
     var trigger: String?
     var trigEnabled: Bool?
     var hold: Bool?
@@ -37,7 +38,7 @@ struct AmpStatus: Decodable, Sendable {
 }
 
 enum ClientError: LocalizedError {
-    case noHost, unauthorized, badResponse(Int), unreachable(String)
+    case noHost, unauthorized, badResponse(Int), unreachable(String), rejected(String)
 
     var errorDescription: String? {
         switch self {
@@ -45,6 +46,7 @@ enum ClientError: LocalizedError {
         case .unauthorized: "Hibás jelszó."
         case .badResponse(let code): code == 200 ? "Hibás állapotválasz az eszköztől." : "Váratlan válasz az eszköztől (HTTP \(code))."
         case .unreachable(let host): "Az eszköz nem érhető el: \(host)"
+        case .rejected(let text): text
         }
     }
 }
@@ -192,6 +194,7 @@ final class ErositoClient {
         }
         guard let http = response as? HTTPURLResponse else { throw ClientError.badResponse(0) }
         if http.statusCode == 401 { throw ClientError.unauthorized }
+        if http.statusCode == 409 { throw ClientError.rejected(String(decoding: data, as: UTF8.self)) }   // pl. mentett DC / táp hiba: csak gombbal
         guard http.statusCode == 200 else { throw ClientError.badResponse(http.statusCode) }
         return data
     }

@@ -75,7 +75,7 @@ DC-érzékelő csatornánként (LTV814 / PC814: AC-bemenetű optó, mindkét pol
 - A relé-tranzisztor bázisán 10k lehúzó: reset alatt a hangszórók biztosan le vannak választva. A 470 Ω-os bázisellenállással a BC337 két Finder tekercsét (2 × 59 mA) telítésben kapcsolja.
 - **Bekapcsolás:** RL1 → 1 s → RL2 → 1 s (`SPK_DELAY_MS`) → hangszórók.
 - **Kikapcsolás, hálózatkiesés, bármilyen hiba:** a hangszórók elsőként (ugyanabban a ms-ban) válnak le.
-- **DC a kimeneten** (20 ms szűrés, `DC_FILTER_MS`): a hangszórók és a relék azonnal KI, hibajelzés (LED, napló, weboldal, Home Assistant). Utána csak gomb, távoli parancs vagy a trigger új éle kapcsol be; magától nem.
+- **DC a kimeneten** (20 ms szűrés, `DC_FILTER_MS`): a hangszórók és a relék azonnal KI, hibajelzés (LED, napló, weboldal, Home Assistant). Utána **csak a fizikai gomb** kapcsolhat be (lásd: Súlyos hiba).
 - **Bekapcsoláskor DC** (pl. bekapcsolási tranziens): a hangszórók legfeljebb 2 s-ig várnak (`DC_START_WAIT_MS`); ha addig nem szűnik meg, hiba.
 - A rövid (20 ms alatti) tüske nem hiba. `SPEAKER_PROTECT = false`: a D7 / D8 nincs használva.
 
@@ -93,9 +93,19 @@ Erősítőnként két optó (pl. EL817 / LTV817): az egyik a +36 V-os, a másik 
 
 - 36 V-on kb. 5 mA LED-áram; a küszöb kb. 26 V (hálózati −10% és terhelés alatti esés mellett is van tartalék). A brumm völgyeit a program 50 ms-os szűrése elnyeli.
 - A hangszórók csak akkor csatlakoznak, ha mindkét erősítő tápja rendben van (a bekapcsoláskor legfeljebb +1 s várakozás, `RAIL_START_WAIT_MS`).
-- Működés közben kieső táp (pl. kiolvadt biztosíték, hibás egyenirányító): 50 ms után a hangszórók és a relék azonnal KI, hibajelzés („nincs tápfeszültség: bal / jobb erősítő”); újra csak gomb, távoli parancs vagy a trigger új éle kapcsol be.
+- Működés közben kieső táp (pl. kiolvadt biztosíték, hibás egyenirányító): 50 ms után a hangszórók és a relék azonnal KI, hibajelzés („nincs tápfeszültség: bal / jobb erősítő”); újra **csak a fizikai gomb** kapcsolhat be (lásd: Súlyos hiba).
 - **`RAIL_MONITOR = false`, amíg nincs bekötve** (különben a hangszórók nem csatlakoznak, és minden bekapcsolás tápfeszültség-hibával ér véget).
 - A D6 a soros port TX lába: induláskor az ESP kiír rá, ezért kell az 1k soros ellenállás. A D2 a C3-on szabad láb; az S3-on (GPIO3) csak egy külön beégetett eFuse esetén lenne indítási láb (alapból nem).
+
+## Súlyos hiba (DC a kimeneten, erősítő-táp hiba)
+
+Felügyelet nélkül sem kapcsolhat vissza az erősítő:
+
+- A hiba **mentődik (NVS)**: áramszünet és újraindítás után is megmarad; a soros `s`, a weboldal, az app és a Home Assistant „Mentett súlyos hiba” sora mutatja, a `h` a darabszámot is.
+- A **trigger figyelés automatikusan KI** kapcsol (mentve).
+- Bekapcsolni **csak a fizikai gomb** hosszú nyomásával lehet; a trigger, az app, a weboldal (HTTP 409 + üzenet), a Home Assistant és minden automatika (hiba utáni, áramszünet utáni, újraindulás utáni bekapcsolás) tiltva. A gombos bekapcsolás nyugtázza (törli) a mentett hibát.
+- A trigger figyelés kézzel visszakapcsolható (2 rövid nyomás, app, weboldal, Home Assistant), de amíg a mentett hibát a gomb nem nyugtázta, a trigger sem kapcsol be.
+- Ha a hiba újra előjön: ismét KI, mentés, trigger figyelés KI.
 
 ## Kezelés
 
