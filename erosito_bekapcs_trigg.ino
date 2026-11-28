@@ -102,7 +102,9 @@ const unsigned long RAIL_START_WAIT_MS = 1000;   // a hangszórók csatlakozása
 
 // Gomb, LED
 const unsigned long DEBOUNCE_MS      = 30;
-const unsigned long LONG_PRESS_MS    = 400;      // hosszú nyomás = be / ki
+const unsigned long LONG_PRESS_MS    = 400;      // hosszú nyomás = be / ki (elengedéskor, ha rövidebb NET_RESET_MIN_MS-nál)
+const unsigned long NET_RESET_MIN_MS = 5000;     // 5-8 s nyomás, majd elengedés = hálózati beállítások törlése
+const unsigned long NET_RESET_MAX_MS = 8000;     // ennél hosszabb nyomás: nincs teendő (BTN_STUCK_MS-nál beragadt gomb)
 const unsigned long DOUBLE_GAP_MS    = 800;      // rövid nyomások közti max. szünet
 const uint8_t       SHORT_FAULT_COUNT = 3;       // ennyi rövid nyomás = hiba (2 = trigger tiltás / engedés)
 const unsigned long FLASH_ON_MS      = 150;
@@ -182,6 +184,8 @@ static_assert(MAINS_FAULT_MS > MAINS_WIN_MS, "MAINS_FAULT_MS > MAINS_WIN_MS kell
 static_assert(RL2_DELAY_MS > MAINS_WIN_MS + MAINS_FAULT_MS, "RL2_DELAY_MS: az RL1 visszajelzes az RL2 elott derul ki");
 static_assert(MAINS_OFF_GRACE_MS < MIN_OFF_MS, "MAINS_OFF_GRACE_MS < MIN_OFF_MS kell");
 static_assert(LONG_PRESS_MS < DOUBLE_GAP_MS, "LONG_PRESS_MS < DOUBLE_GAP_MS kell");
+static_assert(LONG_PRESS_MS < NET_RESET_MIN_MS && NET_RESET_MIN_MS < NET_RESET_MAX_MS && NET_RESET_MAX_MS < BTN_STUCK_MS,
+              "LONG_PRESS_MS < NET_RESET_MIN_MS < NET_RESET_MAX_MS < BTN_STUCK_MS kell");
 static_assert(WDT_MS >= 1000, "WDT_MS >= 1000 kell (NVS iras)");
 static_assert(HEAP_WARN_BYTES > HEAP_CRIT_BYTES && HEAP_CRIT_BYTES > HEAP_EMERG_BYTES, "memoria hatarok sorrendje");
 static_assert(HEAP_BLOCK_WARN > HEAP_BLOCK_CRIT && HEAP_BLOCK_CRIT > HEAP_BLOCK_EMERG, "blokk hatarok sorrendje");
@@ -278,6 +282,7 @@ bool pressConsumed = false;
 unsigned long pressStart = 0, lastShortRel = 0;
 uint8_t shortCount = 0;
 bool burstTaint = false;        // hibás nyomássorozat folytatása nem válthat
+bool btnResetWindow = false;    // a gomb NET_RESET_MIN..MAX ms óta nyomva: elengedésre hálózati törlés (LED gyorsan villog)
 
 // LED
 bool ledBase = false, ledFlashOn = false, ledFaultBlink = false;
@@ -452,6 +457,8 @@ void ledUpdate() {
   bool level = ledBase;
   if (ledFaultBlink) {
     level = (((now - ledT) / FAULT_HALF_MS) % 2) == 0;
+  } else if (btnResetWindow) {   // "most engedd el": hálózati beállítások törlése
+    level = ((now / 60) % 2) == 0;
   } else if (ledFlashes > 0) {
     if (ledFlashOn) {
       if (now - ledT >= FLASH_ON_MS) { ledFlashOn = false; ledT = now; }
@@ -1065,7 +1072,21 @@ void handleRemoteTrigger() {   // weboldal / Home Assistant: trigger figyelés b
   if ((r == 0) != trigOff) toggleTrigOff();
 }
 
-void buttonLogic(bool changed) {   // hosszú = be / ki; 2 rövid = trigger tiltás / engedés; 3+ rövid = hiba
+void netResetByButton() {   // 5-8 s nyomás után elengedve: mentett WiFi / MQTT / IP / weboldal-jelszó törlése
+#if NET_ENABLED
+  netResetReq = true;
+  ledFlash(6);
+  slogc("GOMB: halozati beallitasok torlese (vissza a secrets.h / AP modhoz; a relek nem erintettek)\n");
+#else
+  slogc("GOMB: 5-8 s nyomas, de a halozat nincs a programban (HOME_ASSISTANT false)\n");
+#endif
+}
+
+void btnResetWindowUpdate(unsigned long now) {
+  btnResetWindow = btn.stable == LOW && !pressConsumed && now - pressStart >= NET_RESET_MIN_MS && now - pressStart < NET_RESET_MAX_MS;
+}
+
+void buttonLogic(bool changed) {   // hosszú (0,4-5 s, elengedéskor) = be / ki; 5-8 s = hálózat törlés; 2 rövid = trigger; 3+ rövid = hiba
   unsigned long now = millis();
   if (btnBusy()) {
     if (changed && btn.stable == LOW) {
@@ -1074,12 +1095,27 @@ void buttonLogic(bool changed) {   // hosszú = be / ki; 2 rövid = trigger tilt
     }
     shortCount = 0;
     burstTaint = false;
+    btnResetWindow = false;
     return;
   }
   if (changed) {
     if (btn.stable == LOW) {
       pressStart = btn.t;
       pressConsumed = false;
+    } else if (!pressConsumed && btn.t - pressStart >= LONG_PRESS_MS) {   // hosszú nyomás: elengedéskor dönt a hossza
+      unsigned long held = btn.t - pressStart;
+      pressConsumed = true;
+      shortCount = 0;
+      burstTaint = false;
+      lastShortRel = now;
+      if (held < NET_RESET_MIN_MS) {
+        if (on) requestOff("gomb", true);
+        else switchOn("gomb", true, true);
+      } else if (held < NET_RESET_MAX_MS) {
+        netResetByButton();
+      } else {
+        slog("Gomb: %lu ms nyomas, nincs teendo\n", held);
+      }
     } else if (!pressConsumed) {
       shortCount++;
       lastShortRel = now;
@@ -1092,13 +1128,7 @@ void buttonLogic(bool changed) {   // hosszú = be / ki; 2 rövid = trigger tilt
       lastShortRel = now;
     }
   }
-  if (btn.stable == LOW && !pressConsumed && (now - pressStart) >= LONG_PRESS_MS) {
-    pressConsumed = true;
-    shortCount = 0;
-    burstTaint = false;
-    if (on) requestOff("gomb", true);
-    else switchOn("gomb", true, true);
-  }
+  btnResetWindowUpdate(now);
   if (shortCount > 0 && btn.raw == HIGH && btn.stable == HIGH && (now - lastShortRel) > DOUBLE_GAP_MS) {
     uint8_t n = shortCount;
     shortCount = 0;
@@ -1108,18 +1138,22 @@ void buttonLogic(bool changed) {   // hosszú = be / ki; 2 rövid = trigger tilt
   if (burstTaint && shortCount == 0 && btn.stable == HIGH && now - lastShortRel > DOUBLE_GAP_MS) burstTaint = false;   // új sorozat
 }
 
-void holdButton(unsigned long now, bool changed) {   // áramszünet utáni várakozás: egy hosszú nyomás bekapcsolhat
-  if (holdBtnUsed) return;
+void holdButton(unsigned long now, bool changed) {   // áramszünet utáni várakozás: egy hosszú nyomás bekapcsolhat (elengedéskor)
   if (changed && btn.stable == LOW) {
     pressStart = btn.t;
     pressConsumed = false;
-  }
-  if (btn.stable == LOW && !pressConsumed && (now - pressStart) >= LONG_PRESS_MS) {
+  } else if (changed && !pressConsumed) {   // elengedés
+    unsigned long held = btn.t - pressStart;
     pressConsumed = true;
-    holdBtnUsed = true;
-    switchOn("gomb aramszunet utan", true, true);
-    if (on || onReqBtn) slogc("Gomb a varakozas alatt elfogadva: tovabbi gombnyomas a varakozas vegeig hatastalan\n");
+    if (held >= NET_RESET_MIN_MS && held < NET_RESET_MAX_MS) {
+      netResetByButton();
+    } else if (held >= LONG_PRESS_MS && held < NET_RESET_MIN_MS && !holdBtnUsed) {
+      holdBtnUsed = true;
+      switchOn("gomb aramszunet utan", true, true);
+      if (on || onReqBtn) slogc("Gomb a varakozas alatt elfogadva: tovabbi gombnyomas a varakozas vegeig hatastalan\n");
+    }
   }
+  btnResetWindowUpdate(now);
 }
 
 // ======================================================================= Hálózat: WiFi (STA / AP), weboldal, MQTT – külön taskban; a vezérlés csak jelzőket és nem blokkoló sort használ

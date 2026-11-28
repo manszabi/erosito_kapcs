@@ -166,7 +166,7 @@ void checkInv(Stress &x){
     if(fdc && !x.pfDc){ x.dcFaults++; if(!dcl || T - x.dcLowSince < DC_FILTER_MS) x.bad("DC-hiba rovid tuskere"); }
     x.pfDc=fdc; x.ps=sp; }
   int led=pins[D1];
-  if(!faultActive && ledFlashes==0 && !((powerHold || autoPaused() || sevFault) && !on) && led != (int)on) x.bad("LED nem koveti a releket");
+  if(!faultActive && ledFlashes==0 && !((powerHold || autoPaused() || sevFault) && !on) && !btnResetWindow && led != (int)on) x.bad("LED nem koveti a releket");
   if(faultActive){ if(!x.pf){ x.faultToggles=0; x.faultOnSince=T; } if(led!=x.pled) x.faultToggles++;
     if(r1 && T - x.faultOnSince > FAULT_BLINK_MS + 5) x.bad("hiba-villogas alatt a relek tul sokaig be"); }
   if(!faultActive && x.pf){ x.faultBlinks++; if(x.faultToggles < 6) x.bad("hibanal a LED nem villogott"); }
@@ -185,11 +185,11 @@ void stressHook(){
   Stress &x = X;
   // ---- gomb: rovid / hosszu / nagyon hosszu (beragadas), sorozatok, pergessel ----
   if(!x.btnDown && T>=x.btnNext){
-    double k=x.u(); unsigned long dur = k<0.55? x.r(60,300) : k<0.85? x.r(450,1500) : k<0.97? x.r(300,460) : x.r(9000,14000);
+    double k=x.u(); unsigned long dur = k<0.55? x.r(60,300) : k<0.83? x.r(450,1500) : k<0.85? x.r(4800,8300) : k<0.97? x.r(300,460) : x.r(9000,14000);
     x.btnDown=true; x.lastBtnDownT=T; x.btnUntil=T+dur; x.bounceUntil=T+x.r(0,15); x.presses++;
     if(dur>=430){ x.longPresses++; if(powerHold) x.holdManual=true; }
   }
-  if(x.btnDown && T>=x.btnUntil){ x.btnDown=false; x.bounceUntil=T+x.r(0,15); x.btnNext=T+(x.u()<0.35? x.r(120,700) : x.r(2000,40000)); }
+  if(x.btnDown && T>=x.btnUntil){ x.btnDown=false; x.lastBtnDownT=T; x.bounceUntil=T+x.r(0,15); x.btnNext=T+(x.u()<0.35? x.r(120,700) : x.r(2000,40000)); }
   pins[PIN_BTN] = (T<x.bounceUntil) ? (x.rng()&1) : (x.btnDown?LOW:HIGH);
   // ---- trigger: veletlen valtasok pergessel, idonkent zajos sorozat ----
   if(T>=x.trgNext){ x.trgWant=!x.trgWant; x.trgToggles++; x.trgBounceUntil=T+x.r(0,20); x.trgNext=T+(x.u()<0.06? x.r(50,600) : x.r(3000,60000)); }
@@ -485,6 +485,39 @@ int main(int argc,char**argv){
       argv[2], hours, rr, X.viol, X.ons, X.rl2s, X.presses, X.longPresses, X.trgToggles, X.drops, (unsigned long)st.faults, (unsigned long)st.mainsLoss, X.faultBlinks, X.fastOffs, nvs/hours);
     printf("  hangszorok BE %ld, DC tuske %ld, valodi DC %ld, DC-hiba %ld, tap tuske %ld, valodi tapkieses %ld, tap-hiba %ld, mentett hiba %ld\n", X.spkOns, X.dcGlitches, X.dcEvents, X.dcFaults, X.railGlitch, X.railEvents, X.railFaults, X.sevBlocks);
     return X.viol?1:0; }
+  if(sc==69){   // gomb: be / ki elengedeskor; 5-8 s nyomas = halozati beallitasok torlese
+    quiet=!getenv("LOUD"); rr=ESP_RST_EXT; pins[PIN_BTN]=HIGH; setTrig(false); int fails=0;
+    auto ok=[&](bool c,const char*t){ printf("  %s %s\n", c?"OK  ":"HIBA", t); if(!c) fails++; };
+#if NET_ENABLED
+    nvsStr={{"ssid","otthon"},{"pass","jelszo123"},{"mqttUri","mqtt://x"},{"mqttUser",""},{"mqttPass",""},{"webPass","admin1234"}};
+#endif
+    setup();
+#if NET_ENABLED
+    netInit();
+    scen=[]{ static unsigned long lp=0; if(T-lp>=50){lp=T; netPoll();} };
+#endif
+    auto runTo=[&](unsigned long t){ while(T<t) loop(); };
+    runTo(8000);
+#if NET_ENABLED
+    ok(nvsStr.count("ssid") && strcmp(ncfg.webPass,"admin1234")==0, "kiindulas: mentett WiFi / weboldal-jelszo");
+#endif
+    unsigned long t0=T; setBtn(true); runTo(t0+3000); ok(!rl1(), "3 s nyomva: meg nincs bekapcsolas (elengedeskor dont)");
+    setBtn(false); runTo(T+100); ok(rl1(), "3 s utan elengedve: BE");
+    runTo(T+5000);
+    setBtn(true); runTo(T+5500); ok(rl1(), "5,5 s nyomva: a relek nem valtoztak");
+    int fl=0, pv=pins[D1]; for(unsigned long e=T+1000; T<e;){ loop(); int l=pins[D1]; if(l&&!pv) fl++; pv=l; }
+    ok(fl>=6 && btnResetWindow, "5-8 s kozott a LED gyorsan villog (most kell elengedni)");
+    setBtn(false); runTo(T+500);
+#if NET_ENABLED
+    ok(rl1() && !nvsStr.count("ssid") && strcmp(ncfg.webPass, AP_PASS)==0, "6,5 s utan elengedve: halozati beallitasok torolve, a relek BE maradtak");
+#else
+    ok(rl1(), "6,5 s utan elengedve (HA nelkul): nincs teendo, a relek BE maradtak");
+#endif
+    setBtn(true); runTo(T+9000); setBtn(false); runTo(T+500); ok(rl1() && !faultActive, "9 s nyomas: nincs teendo (nincs be / ki, nincs hiba)");
+    setBtn(true); runTo(T+4900); setBtn(false); runTo(T+3000); ok(!rl1(), "4,9 s utan elengedve: KI");
+    setBtn(true); runTo(T+11000); ok(faultActive || lockoutPending, "11 s nyomva: beragadt gomb hiba"); setBtn(false); runTo(T+20000);
+    ok(!rl1(), "beragadt gomb utan elengedve: nincs bekapcsolas");
+    printf("69: %s (%d hiba)\n", fails?"BUKOTT":"RENDBEN", fails); return fails; }
   if(sc==67){   // DC / tap hiba: mentes, trigger KI, csak fizikai gomb; ujrainditas utan is
     quiet=!getenv("LOUD"); rr=ESP_RST_EXT; pins[PIN_BTN]=HIGH; setTrig(true); int fails=0;
     auto ok=[&](bool c,const char*t){ printf("  %s %s\n", c?"OK  ":"HIBA", t); if(!c) fails++; };

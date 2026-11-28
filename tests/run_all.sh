@@ -40,9 +40,9 @@ for v in C3_true S3_true; do for i in $(seq 20 28); do ./sim_$v $i > net_${v}_$i
 
 echo "== 5. Célzott tesztek"
 for v in C3_false C3_true S3_false S3_true; do
-  for t in "62" "64 A" "64 B" "64 C" "64 D" "64 E" "64 F" "65" "66" "67" "67 R" "67 H"; do
+  for t in "62" "64 A" "64 B" "64 C" "64 D" "64 E" "64 F" "65" "66" "67" "67 R" "67 H" "69"; do
     r=$(./sim_$v $t 2>&1 | tail -1); case "$r" in *RENDBEN*) ;; *) bad "$v $t: $r";; esac
-  done; ok "$v: sorozatos kiesés, memória-őr, hangszóróvédő, tápfigyelés, mentett súlyos hiba"
+  done; ok "$v: sorozatos kiesés, memória-őr, hangszóróvédő, tápfigyelés, mentett súlyos hiba, gomb (5-8 s: hálózat törlés)"
 done
 sed -n '/IPCFG_PURE_BEGIN/,/IPCFG_PURE_END/p' "$INO" > ip_pure.inc
 $CXX -O2 -w "$T/sim/iptest.cpp" -I. -o iptest && r=$(./iptest | tail -1) && case "$r" in *helyes*) ok "fix IP ellenőrzés: $r";; *) bad "fix IP: $r";; esac

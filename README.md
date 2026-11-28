@@ -110,7 +110,9 @@ Felügyelet nélkül sem kapcsolhat vissza az erősítő:
 
 ## Kezelés
 
-- **Gomb, hosszú nyomás (≥ 0,4 s):** be / ki.
+- **Gomb, hosszú nyomás (0,4–5 s), elengedéskor:** be / ki.
+- **Gomb, 5–8 s nyomás, majd elengedés:** a hálózati beállítások törlése (WiFi, MQTT, fix IP, weboldal-jelszó; mint a soros `W`). 5 s-nál a LED gyorsan villogni kezd: ekkor kell elengedni. Utána a `secrets.h` WiFi-jével csatlakozik, vagy 30 s múlva AP módba lép (`Erosito-XXXX`, http://192.168.4.1). A relék, a trigger tiltás, a statisztika és a mentett hibák megmaradnak.
+- **Gomb, 8 s-nál hosszabb nyomás:** nincs teendő; 10 s-nál beragadt gomb hiba.
 - **Gomb, 2 rövid nyomás:** a trigger tiltása vagy engedélyezése (megmarad újraindítás után is).
 - **Gomb, 3+ rövid nyomás:** hibának számít.
 - **Trigger:** aktív élre be, inaktív élre ki.
