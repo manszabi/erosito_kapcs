@@ -4,3 +4,4 @@ ios/Info.plist
 ios/build/
 ios/Payload/
 ios/*.ipa
+tests/build/

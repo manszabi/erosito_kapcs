@@ -269,3 +269,7 @@ A program hónapokig, évekig megszakítás nélkül futhat:
 - Eszközök → **USB CDC On Boot: Enabled**
 - Soros napló 115200 baud. Az `s` parancs a hálózatfigyelő optó LOW mintaszámát is kiírja (bekapcsolt állapotban normálisan kb. 28–37).
 - `MAINS_CHECK = true`: optó nélkül állítsd `false`-ra.
+
+## Tesztek
+
+A firmware ESP nélkül, a gépen is tesztelhető: `tests/run_all.sh` (gyors) vagy `FULL=1 tests/run_all.sh` (teljes, többhetes szimulációval). Részletek: [tests/README.md](tests/README.md).
