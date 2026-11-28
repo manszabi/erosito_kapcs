@@ -48,9 +48,9 @@ struct ContentView: View {
                         row("Trigger jel", s.trigger == "ON" ? "aktív" : "nincs")
                         if let l = s.latched, l != "nincs" { row("Mentett súlyos hiba", l, alert: true) }
                         row("NTC áthidalva (RL2)", s.rl2 == "ON" ? "igen" : "nem")
-                        if let spk = s.spk { row("Hangszórók", spk == "ON" ? "csatlakoztatva" : "leválasztva") }
+                        if let spk = s.spk, !spk.isEmpty { row("Hangszórók", spk == "ON" ? "csatlakoztatva" : "leválasztva") }
                         if s.dc == "ON" { row("DC a hangszórókimeneten", "VAN", alert: true) }
-                        if let l = s.railL, let r = s.railR {
+                        if let l = s.railL, let r = s.railR, !l.isEmpty, !r.isEmpty {
                             row("Erősítő táp (bal / jobb)", "\(l == "ON" ? "OK" : "nincs") / \(r == "ON" ? "OK" : "nincs")",
                                 alert: s.isOn && (l != "ON" || r != "ON"))
                         }

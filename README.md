@@ -101,9 +101,10 @@ Erősítőnként két optó (pl. EL817 / LTV817): az egyik a +36 V-os, a másik 
 
 Felügyelet nélkül sem kapcsolhat vissza az erősítő:
 
-- A hiba **mentődik (NVS)**: áramszünet és újraindítás után is megmarad; a soros `s`, a weboldal, az app és a Home Assistant „Mentett súlyos hiba” sora mutatja, a `h` a darabszámot is.
+- A hiba **mentődik (NVS)**: áramszünet és újraindítás után is megmarad; a LED kikapcsolt állapotban 3 s-onként hármat villan; a soros `s`, a weboldal, az app és a Home Assistant „Mentett súlyos hiba” sora mutatja, a `h` a darabszámot is.
 - A **trigger figyelés automatikusan KI** kapcsol (mentve).
 - Bekapcsolni **csak a fizikai gomb** hosszú nyomásával lehet; a trigger, az app, a weboldal (HTTP 409 + üzenet), a Home Assistant és minden automatika (hiba utáni, áramszünet utáni, újraindulás utáni bekapcsolás) tiltva. A gombos bekapcsolás nyugtázza (törli) a mentett hibát.
+- A távoli bekapcsolás az áramszünet utáni várakozás alatt sem fogyasztja el a gomb egyszeri lehetőségét.
 - A trigger figyelés kézzel visszakapcsolható (2 rövid nyomás, app, weboldal, Home Assistant), de amíg a mentett hibát a gomb nem nyugtázta, a trigger sem kapcsol be.
 - Ha a hiba újra előjön: ismét KI, mentés, trigger figyelés KI.
 
@@ -116,7 +117,9 @@ Felügyelet nélkül sem kapcsolhat vissza az erősítő:
 - **LED:**
   - világít = bekapcsolva;
   - gyors villogás = hiba;
-  - 3 s-onként felvillan = áramszünet utáni várakozás;
+  - 3 s-onként egy felvillanás = áramszünet utáni várakozás;
+  - 3 s-onként két felvillanás = ismétlődő hiba / sorozatos hálózatkiesés: az automatika szünetel;
+  - 3 s-onként három felvillanás = **mentett DC / tápfeszültség-hiba**: csak a gomb kapcsolhat be;
   - 2 villanás = a trigger tiltva (kézi bekapcsoláskor és tiltáskor);
   - 4 villanás = a trigger engedélyezve.
 

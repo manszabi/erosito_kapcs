@@ -238,7 +238,7 @@ bool railSeenOk = false, railWait = false;   // ebben a bekapcsolásban már ren
 unsigned long railWaitT = 0;
 uint8_t railFaultMask = 0;                   // hibánál: 1 = bal, 2 = jobb
 bool powerHold = false;         // áramszünet utáni várakozás
-bool holdBtnUsed = false;       // a várakozás alatt egy kézi (gomb / távoli) bekapcsolás engedett
+bool holdBtnUsed = false;       // a várakozás alatt egy kézi (gomb / távoli) bekapcsolás engedett (a tiltott távoli nem fogyasztja)
 unsigned long holdStart = 0, holdDur = 0, lastHoldSave = 0;
 
 // Kérések
@@ -262,7 +262,7 @@ uint8_t lossStreak = 0;             // egymás utáni hálózatkiesések
 unsigned long lossLastT = 0;        // az utolsó hálózatkiesés
 uint8_t faultStreak = 0;            // egymás utáni hardverhibák (zaj, beragadás, RL1 kimenet)
 unsigned long faultQuietT = 0;      // az utolsó hiba vége (a sorozat nullázásához)
-bool manualWait = false;           // F_NOMAINS után: csak gomb / távoli / új trigger él kapcsol be
+bool manualWait = false;           // F_NOMAINS / F_DC / F_RAIL után nincs automatikus bekapcsolás (DC / táp: sevFault is)
 uint8_t sevFault = F_NONE;         // mentett súlyos hiba (DC / erősítő-táp, NVS): csak a fizikai gomb kapcsolhat be
 uint32_t sevCount = 0;             // súlyos hibák száma (NVS)
 bool onReqPhys = false;            // a függő kézi kérést a fizikai gomb adta
@@ -314,7 +314,7 @@ volatile bool netStateDirty = true;
 void netEvent(const char *type, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void switchOn(const char *src, bool manual, bool phys = false);   // előre deklarálva; phys: a fizikai gomb kérte
 
-// Taskok (verem-figyeléshez)
+// ======================================================================= Memória: mérés (taskok verme, belső RAM) és az újraindítási nyom
 TaskHandle_t loopTaskH = nullptr, logTaskH = nullptr, netTaskH = nullptr;
 uint32_t stackMinFree(const char **name) {   // a legkevesebb szabad verem a taskok közül (bájt)
   uint32_t best = UINT32_MAX;
@@ -460,6 +460,9 @@ void ledUpdate() {
       if (ledFlashes > 0) { ledFlashOn = true; ledT = now; }
     }
     level = (ledFlashes > 0) ? ledFlashOn : ledBase;
+  } else if (!on && sevFault != F_NONE) {   // mentett DC / táp hiba (az áramszünet utáni várakozásnál is fontosabb): tripla felvillanás
+    unsigned long ph = now % HOLD_FLASH_PERIOD_MS;
+    level = ph < HOLD_FLASH_MS || (ph >= 4 * HOLD_FLASH_MS && ph < 5 * HOLD_FLASH_MS) || (ph >= 8 * HOLD_FLASH_MS && ph < 9 * HOLD_FLASH_MS);
   } else if (powerHold && !on) {
     level = (now % HOLD_FLASH_PERIOD_MS) < HOLD_FLASH_MS;
   } else if (!on && autoPaused()) {   // ismétlődő hiba / sorozatos kiesés: dupla felvillanás 3 s-onként
@@ -641,7 +644,7 @@ void checkWarnings() {
   lastWarnCount = n;
 }
 
-// ======================================================================= Hangszórók (az RL2 után SPK_DELAY_MS-mal, DC nélkül)
+// ======================================================================= Hangszórók és erősítő-táp (a hangszórók az RL2 után SPK_DELAY_MS-mal, DC nélkül, rendben lévő táppal)
 void spkSet(bool s) {
   if (!SPEAKER_PROTECT || s == spkOn) return;
   digitalWrite(PIN_SPK, s ? HIGH : LOW);
@@ -901,7 +904,7 @@ void endLockout() {   // tiltás vége: ok ellenőrzése, mentett hiba törlése
     saveFault(F_NONE);
     manualWait = (was == F_NOMAINS || was == F_DC || was == F_RAIL);
     if (sevFault != F_NONE) slog("Mentett DC / tap hiba: bekapcsolas csak a fizikai gombbal\n");
-    if (manualWait) slog("Nincs automatikus ujrakapcsolas: gomb vagy uj trigger kell\n");
+    else if (manualWait) slog("Nincs automatikus ujrakapcsolas: gomb, tavoli parancs vagy uj trigger el kell\n");
     else if (AUTO_ON_AFTER_FAULT && !trigOff && trig.stable == LOW && !autoPaused()) switchOn("aktiv trigger hiba utan", false);
   }
 }
@@ -1027,7 +1030,8 @@ void handleRemote(bool inHold) {   // Home Assistant: ON mint a gomb (várakozá
     if (faultActive || on) {
       // nincs teendő
     } else if (inHold) {
-      if (!holdBtnUsed) { holdBtnUsed = true; switchOn("tavoli aramszunet utan", true); }
+      if (sevFault != F_NONE) switchOn("tavoli aramszunet utan", true);   // elutasítja, de a gomb lehetősége megmarad
+      else if (!holdBtnUsed) { holdBtnUsed = true; switchOn("tavoli aramszunet utan", true); }
     } else if (!btnBusy()) {
       switchOn("tavoli", true);
     }
@@ -1052,6 +1056,13 @@ void toggleTrigOff() {
   netStateDirty = true;
   ledFlash(trigOff ? 2 : 4);   // tiltva: 2, engedélyezve: 4 villanás
   slogc("TRIGGER %s%s\n", trigOff ? "TILTVA" : "ENGEDELYEZVE", saved ? "" : " (FIGYELEM: NVS mentes sikertelen)");
+}
+
+void handleRemoteTrigger() {   // weboldal / Home Assistant: trigger figyelés be / ki (mentve, mint a két rövid nyomás)
+  int8_t r = remoteTrigReq;
+  if (r < 0) return;
+  remoteTrigReq = -1;
+  if ((r == 0) != trigOff) toggleTrigOff();
 }
 
 void buttonLogic(bool changed) {   // hosszú = be / ki; 2 rövid = trigger tiltás / engedés; 3+ rövid = hiba
@@ -1354,7 +1365,8 @@ void buildState(char *js, size_t len, bool forWeb) {
            "\"fault\":\"%s\",\"warning\":\"%s\",\"problem\":\"%s\",\"on_hours\":%lu.%lu,\"on_count\":%lu,"
            "\"relay_count\":%lu,\"mains_loss\":%lu,\"faults\":%lu,\"power_ups\":%lu,\"opto_now\":%u,"
            "\"opto_avg\":%u.%u,\"opto_base\":%u.%u,\"rssi\":%d,\"heap_free\":%lu,\"heap_min\":%lu,\"heap_block\":%lu",
-           on ? "ON" : "OFF", rl2On ? "ON" : "OFF", spkOn ? "ON" : "OFF", dcActive ? "ON" : "OFF", rails[0].ok ? "ON" : "OFF", rails[1].ok ? "ON" : "OFF",
+           on ? "ON" : "OFF", rl2On ? "ON" : "OFF", !SPEAKER_PROTECT ? "" : spkOn ? "ON" : "OFF", !SPEAKER_PROTECT ? "" : dcActive ? "ON" : "OFF",
+           !RAIL_MONITOR ? "" : rails[0].ok ? "ON" : "OFF", !RAIL_MONITOR ? "" : rails[1].ok ? "ON" : "OFF",
            sevFault == F_DC ? "DC hiba: csak gombbal kapcsolható be" : sevFault == F_RAIL ? "tápfeszültség-hiba: csak gombbal kapcsolható be" : "nincs",
            trig.stable == LOW ? "ON" : "OFF", trigOff ? "false" : "true",
            trigOff ? "OFF" : "ON", powerHold ? "true" : "false", flt ? faultName(lastFault) : "nincs", w[0] ? w + 1 : "nincs",
@@ -2221,13 +2233,6 @@ bool statusAllowed() {   // a soros kiírások legfeljebb STATUS_MIN_MS időnké
   return true;
 }
 
-void handleRemoteTrigger() {   // weboldal / Home Assistant: trigger figyelés be / ki (mentve, mint a két rövid nyomás)
-  int8_t r = remoteTrigReq;
-  if (r < 0) return;
-  remoteTrigReq = -1;
-  if ((r == 0) != trigOff) toggleTrigOff();
-}
-
 void handleSerial() {
   if (statusReq) { statusReq = false; if (statusAllowed()) printStatus(); }
   if (helpReq)   { helpReq = false;   if (statusAllowed()) printHelp(); }
@@ -2371,6 +2376,7 @@ void setup() {
   netStart();
   netEvent("boot", "Indulás: %s%s", resetName(rr), powerHold ? ", áramszünet utáni várakozás" : "");
   if (memRestarted) netEvent("warning", "Memória miatti újraindítás: %s", memReasonName(memReason));
+  if (sevFault != F_NONE) netEvent("fault", "Mentett %s induláskor: bekapcsolás csak a gombbal", sevFault == F_DC ? "DC hiba" : "tápfeszültség-hiba");
   checkWarnings();
   if (lastWarnCount > 0) {
     char w[120];
@@ -2398,75 +2404,7 @@ void setup() {
   }
 }
 
-// ======================================================================= Fő ciklus
-void handleFaultBlink(unsigned long now, bool btnChanged) {   // hibavillogás: a bemenetek nem számítanak
-  if (mainsLost()) {   // bemenet-hiba alatt (relék még BE) is azonnal KI
-    setState(false, "halozatkieses hiba alatt");
-    slogc("!!! HALOZATKIESES hiba alatt: relek AZONNAL KI\n");
-  }
-  if (btnChanged) lastShortRel = now;
-  remoteOnReq = remoteOffReq = false;   // hiba alatt a távoli parancs elvész
-  if (now - faultStart >= FAULT_BLINK_MS) endFault();
-}
-
-void endPowerHold() {
-  powerHold = false;
-  netStateDirty = true;
-  holdClear();
-  resyncInputs();
-  slogc("Aramszunet utani varakozas vege\n");
-  if (!lockoutPending && !autoPaused() && !manualWait && TRIGGER_ON_BOOT && !trigOff && trig.stable == LOW)
-    switchOn("aktiv trigger aramszunet utan", false);
-}
-
-void handlePowerHold(unsigned long now, bool btnChanged) {   // áramszünet utáni várakozás: trigger hatástalan, kézi bekapcsolás egyszer
-  if (timeLeft(holdStart, holdDur) == 0) { endPowerHold(); return; }
-  if (now - lastHoldSave >= 1000) {
-    lastHoldSave = now;
-    holdSave(timeLeft(holdStart, holdDur));
-  }
-  if (on) {
-    int mf = mainsFault();
-    if (mf != F_NONE) startFault(IN_FB1, mf);
-    dcCheck();
-    railCheck();
-  }
-  if (!faultActive) holdButton(now, btnChanged);
-  handleRemote(true);
-  processPendingOn(true);
-}
-
-void handleNormal(bool btnChanged, bool trigChanged) {
-  int mf = mainsFault();
-  if (mf != F_NONE && (on || !faultHold)) startFault(IN_FB1, mf);
-  dcCheck();
-  railCheck();
-  if (!faultActive && !faultHold) checkInputFaults();
-  if (!faultActive) buttonLogic(btnChanged);
-  handleRemote(false);
-  if (!faultActive && trigChanged && !trigOff) triggerEdge();
-  processPendingOn(false);
-  if (!faultActive && lockoutPending && lockoutLeft() == 0) endLockout();
-  if (faultStreak && !faultActive) {   // a sorozat csak akkor nullázódik, ha a bemenetek közben is nyugodtak (KI relénél is figyelve)
-    if (checkFault(IN_BTN) != F_NONE || (!trigOff && checkFault(IN_TRIG) != F_NONE)) faultQuietT = millis();
-  }
-  if (faultStreak && !faultActive && !lockoutPending && millis() - faultQuietT >= FAULT_STREAK_RESET_MS) {
-    bool wasPaused = autoPaused();   // FAULT_STREAK_RESET_MS hibamentes idő: a sorozat nullázódik
-    faultStreak = 0;
-    slog("Hibasorozat nullazva (%lu s hibamentes)\n", FAULT_STREAK_RESET_MS / 1000);
-    if (wasPaused && !autoPaused() && AUTO_ON_AFTER_FAULT && !on && !trigOff && trig.stable == LOW && !manualWait)
-      switchOn("aktiv trigger, ismetlodo hiba utan stabil", false);
-  }
-  if (lossStreak && !faultActive && millis() - lossLastT >= FAULT_STREAK_RESET_MS) {
-    bool wasPaused = autoPaused();
-    lossStreak = 0;
-    slog("Halozatkieses-sorozat nullazva (%lu s kieses nelkul)\n", FAULT_STREAK_RESET_MS / 1000);
-    if (wasPaused && !autoPaused() && !lockoutPending && !manualWait && !on && !trigOff && trig.stable == LOW)
-      switchOn("aktiv trigger, sorozatos kieses utan", false);
-  }
-}
-
-// ---- Memória-őr: másodpercenként; figyelmeztetés a statsWarnings-ban, itt a kritikus és a vészhelyzeti szint ----
+// ======================================================================= Memória-őr (másodpercenként; a figyelmeztetés a statsWarnings-ban, itt a kritikus és a vészhelyzeti szint)
 unsigned long memLastCheck = 0, memCritSince = 0, memEmergSince = 0, memOkSince = 0, netRecoverT = 0;
 bool memCrit = false, memEmerg = false, netRecoverDone = false, memWaitLogged = false, memLimitLogged = false;
 
@@ -2535,6 +2473,74 @@ void memGuard(unsigned long now) {
   if (!on && !faultActive && !onReqBtn && !onReqTrig) { memRestart(crit, false); return; }
   if (!memWaitLogged) slogc("Memoria: ujrainditas a relek kikapcsolasa utan\n");
   memWaitLogged = true;
+}
+
+// ======================================================================= Fő ciklus
+void handleFaultBlink(unsigned long now, bool btnChanged) {   // hibavillogás: a bemenetek nem számítanak
+  if (mainsLost()) {   // bemenet-hiba alatt (relék még BE) is azonnal KI
+    setState(false, "halozatkieses hiba alatt");
+    slogc("!!! HALOZATKIESES hiba alatt: relek AZONNAL KI\n");
+  }
+  if (btnChanged) lastShortRel = now;
+  remoteOnReq = remoteOffReq = false;   // hiba alatt a távoli parancs elvész
+  if (now - faultStart >= FAULT_BLINK_MS) endFault();
+}
+
+void endPowerHold() {
+  powerHold = false;
+  netStateDirty = true;
+  holdClear();
+  resyncInputs();
+  slogc("Aramszunet utani varakozas vege\n");
+  if (!lockoutPending && !autoPaused() && !manualWait && TRIGGER_ON_BOOT && !trigOff && trig.stable == LOW)
+    switchOn("aktiv trigger aramszunet utan", false);
+}
+
+void handlePowerHold(unsigned long now, bool btnChanged) {   // áramszünet utáni várakozás: trigger hatástalan, kézi bekapcsolás egyszer
+  if (timeLeft(holdStart, holdDur) == 0) { endPowerHold(); return; }
+  if (now - lastHoldSave >= 1000) {
+    lastHoldSave = now;
+    holdSave(timeLeft(holdStart, holdDur));
+  }
+  if (on) {
+    int mf = mainsFault();
+    if (mf != F_NONE) startFault(IN_FB1, mf);
+    dcCheck();
+    railCheck();
+  }
+  if (!faultActive) holdButton(now, btnChanged);
+  handleRemote(true);
+  processPendingOn(true);
+}
+
+void handleNormal(bool btnChanged, bool trigChanged) {
+  int mf = mainsFault();
+  if (mf != F_NONE && (on || !faultHold)) startFault(IN_FB1, mf);
+  dcCheck();
+  railCheck();
+  if (!faultActive && !faultHold) checkInputFaults();
+  if (!faultActive) buttonLogic(btnChanged);
+  handleRemote(false);
+  if (!faultActive && trigChanged && !trigOff) triggerEdge();
+  processPendingOn(false);
+  if (!faultActive && lockoutPending && lockoutLeft() == 0) endLockout();
+  if (faultStreak && !faultActive) {   // a sorozat csak akkor nullázódik, ha a bemenetek közben is nyugodtak (KI relénél is figyelve)
+    if (checkFault(IN_BTN) != F_NONE || (!trigOff && checkFault(IN_TRIG) != F_NONE)) faultQuietT = millis();
+  }
+  if (faultStreak && !faultActive && !lockoutPending && millis() - faultQuietT >= FAULT_STREAK_RESET_MS) {
+    bool wasPaused = autoPaused();   // FAULT_STREAK_RESET_MS hibamentes idő: a sorozat nullázódik
+    faultStreak = 0;
+    slog("Hibasorozat nullazva (%lu s hibamentes)\n", FAULT_STREAK_RESET_MS / 1000);
+    if (wasPaused && !autoPaused() && AUTO_ON_AFTER_FAULT && !on && !trigOff && trig.stable == LOW && !manualWait)
+      switchOn("aktiv trigger, ismetlodo hiba utan stabil", false);
+  }
+  if (lossStreak && !faultActive && millis() - lossLastT >= FAULT_STREAK_RESET_MS) {
+    bool wasPaused = autoPaused();
+    lossStreak = 0;
+    slog("Halozatkieses-sorozat nullazva (%lu s kieses nelkul)\n", FAULT_STREAK_RESET_MS / 1000);
+    if (wasPaused && !autoPaused() && !lockoutPending && !manualWait && !on && !trigOff && trig.stable == LOW)
+      switchOn("aktiv trigger, sorozatos kieses utan", false);
+  }
 }
 
 void handleStatsTimer(unsigned long now) {   // halasztott mentés (STATS_MIN_GAP_MS), bekapcsolva óránként mentés
