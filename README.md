@@ -58,7 +58,18 @@ DC-érzékelő csatornánként (LTV814 / PC814: AC-bemenetű optó, mindkét pol
 
 - Szűrő: 22k × 47 µF ≈ 0,15 Hz; zene (20 Hz-en teljes kivezérlés is) nem kapcsol le, a tápra ragadt kimenet (±36 V) kb. 35–50 ms alatt jelez, a program szűrésével együtt kb. 60–70 ms alatt válnak le a hangszórók. DC-küszöb a 47k felhúzóval (és a belső felhúzóval) tipikusan kb. 3,5 V, a leggyengébb LTV814-gyel kb. 13 V (LTV-814A-val kb. 6 V).
 - A két optó kimenete közösítve: bármelyik csatornán DC = LOW. A D8 C3-on indítási láb, ezért a felhúzó kötelező, és induláskor nem lehet LOW (bekapcsolatlan erősítőnél az optók nem vezetnek).
-- Hangszórórelé: Finder 40.52 (8 A, DPDT). ±36 V-on egy érintkező kb. 3 A DC-t szakít meg biztosan, két sorba kötött érintkező 8 A-t (adatlap, H 40 görbe): csatornánként egy relé, a két érintkező sorban (erősítő → 14, 11 → 24, 21 → hangszóró +).
+- Hangszórórelé: Finder 40.52 (8 A, DPDT), csatornánként egy. ±36 V-on egy érintkező kb. 3 A DC-t szakít meg biztosan, két sorba kötött érintkező 8 A-t (adatlap, H 40 görbe); ±35 V fölött a soros bekötést az Elliott Sound Products is javasolja. Elengedett relénél a hangszóró a földre záródik (ív esetén is védve marad):
+
+  ```
+   erősítő kimenet ── 14
+                      11 ── 24
+                            21 ── hangszóró +
+                            22 ──[T 4 A]── erősítő hangszóróföld   (elengedett relénél a hangszóró rövidre zárva)
+   hangszóró − ── erősítő hangszóróföld;  12 szabadon
+  ```
+
+  - A T 4 A (lomha, 5×20 mm) biztosíték kötelező: ha bekapcsoláskor a végfok kimenete már a tápon ragadt, a 22-es érintkező rövidre zárná; a biztosíték kiolvad, utána a DC-érzékelő jelez, és a program a hálózatot (RL1) is lekapcsolja. Lomha kell, mert zene közbeni kikapcsoláskor az LM3886 a tápfeszültség lecsengéséig (~1 s) a rövidzárba játszik (a saját áramkorlátja ezt bírja).
+  - A 22-es láb és a biztosíték az **erősítő hangszóróföldjére** menjen, ne az ESP GND-jére: a két föld csak az optókon és a relé-érintkezőkön át találkozhat (különben földhurok és nincs leválasztás). A hangszóró-vezetékek a NYÁK-on vastagok legyenek, és tartsanak távolságot a 3,3 V-os résztől.
 - A relé-tranzisztor bázisán 10k lehúzó: reset alatt a hangszórók biztosan le vannak választva. A 470 Ω-os bázisellenállással a BC337 két Finder tekercsét (2 × 59 mA) telítésben kapcsolja.
 - **Bekapcsolás:** RL1 → 1 s → RL2 → 1 s (`SPK_DELAY_MS`) → hangszórók.
 - **Kikapcsolás, hálózatkiesés, bármilyen hiba:** a hangszórók elsőként (ugyanabban a ms-ban) válnak le.
