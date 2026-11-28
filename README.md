@@ -12,7 +12,9 @@ A program a XIAO D-lábneveit használja, így a bekötés **mindkét lapon azon
 | Láb | C3 GPIO | S3 GPIO | Funkció |
 |---|---|---|---|
 | D1 | 3 | 2 | LED (tranzisztorral, HIGH = világít) |
-| D2 | 4 | 3 | Gomb a GND-re (belső felhúzó) |
+| D9 | 9 | 8 | Gomb a GND-re (felhúzó); C3-on a BOOT gombbal párhuzamos: induláskor nyomva letöltő mód |
+| D2 | 4 | 3 | Bal erősítő táp: 2 optó (+/− ág) sorban, LOW = rendben |
+| D6 | 21 | 43 | Jobb erősítő táp: ugyanígy, 1k soros ellenállással (TX láb) |
 | D3 | 5 | 4 | Trigger optó, LOW = aktív (10k felhúzó) |
 | D4 | 6 | 5 | Hálózatfigyelő optó, LOW = van hálózat (43k felhúzó) |
 | D5 | 7 | 6 | RL2 tranzisztor |
@@ -76,6 +78,24 @@ DC-érzékelő csatornánként (LTV814 / PC814: AC-bemenetű optó, mindkét pol
 - **DC a kimeneten** (20 ms szűrés, `DC_FILTER_MS`): a hangszórók és a relék azonnal KI, hibajelzés (LED, napló, weboldal, Home Assistant). Utána csak gomb, távoli parancs vagy a trigger új éle kapcsol be; magától nem.
 - **Bekapcsoláskor DC** (pl. bekapcsolási tranziens): a hangszórók legfeljebb 2 s-ig várnak (`DC_START_WAIT_MS`); ha addig nem szűnik meg, hiba.
 - A rövid (20 ms alatti) tüske nem hiba. `SPEAKER_PROTECT = false`: a D7 / D8 nincs használva.
+
+## Erősítő-tápfigyelés
+
+Erősítőnként két optó (pl. EL817 / LTV817): az egyik a +36 V-os, a másik a −36 V-os ágat figyeli, 24 V-os Zener-küszöbbel. A két optó kimenete sorban: a láb csak akkor LOW, ha mindkét ág rendben van.
+
+```
+ +36 V ──[Z 24 V]──[2,2k]── optó1 LED ── erősítő föld        (Zener katódja a +36 V felé)
+ erősítő föld ── optó2 LED ──[2,2k]──[Z 24 V]── −36 V         (Zener anódja a −36 V felé)
+
+ 3V3 ──[47k]──┬── D2 (bal) ──[100 nF]── GND      a jobb erősítőnél: ──[1k]── D6
+              └── optó1 C;  optó1 E ── optó2 C;  optó2 E ── ESP GND
+```
+
+- 36 V-on kb. 5 mA LED-áram; a küszöb kb. 26 V (hálózati −10% és terhelés alatti esés mellett is van tartalék). A brumm völgyeit a program 50 ms-os szűrése elnyeli.
+- A hangszórók csak akkor csatlakoznak, ha mindkét erősítő tápja rendben van (a bekapcsoláskor legfeljebb +1 s várakozás, `RAIL_START_WAIT_MS`).
+- Működés közben kieső táp (pl. kiolvadt biztosíték, hibás egyenirányító): 50 ms után a hangszórók és a relék azonnal KI, hibajelzés („nincs tápfeszültség: bal / jobb erősítő”); újra csak gomb, távoli parancs vagy a trigger új éle kapcsol be.
+- **`RAIL_MONITOR = false`, amíg nincs bekötve** (különben a hangszórók nem csatlakoznak, és minden bekapcsolás tápfeszültség-hibával ér véget).
+- A D6 a soros port TX lába: induláskor az ESP kiír rá, ezért kell az 1k soros ellenállás. A D2 a C3-on szabad láb; az S3-on (GPIO3) csak egy külön beégetett eFuse esetén lenne indítási láb (alapból nem).
 
 ## Kezelés
 

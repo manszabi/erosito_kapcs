@@ -8,6 +8,8 @@ struct AmpStatus: Decodable, Sendable {
     var rl2: String?
     var spk: String?
     var dc: String?
+    var railL: String?
+    var railR: String?
     var trigger: String?
     var trigEnabled: Bool?
     var hold: Bool?

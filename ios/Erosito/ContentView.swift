@@ -49,6 +49,10 @@ struct ContentView: View {
                         row("NTC áthidalva (RL2)", s.rl2 == "ON" ? "igen" : "nem")
                         if let spk = s.spk { row("Hangszórók", spk == "ON" ? "csatlakoztatva" : "leválasztva") }
                         if s.dc == "ON" { row("DC a hangszórókimeneten", "VAN", alert: true) }
+                        if let l = s.railL, let r = s.railR {
+                            row("Erősítő táp (bal / jobb)", "\(l == "ON" ? "OK" : "nincs") / \(r == "ON" ? "OK" : "nincs")",
+                                alert: s.isOn && (l != "ON" || r != "ON"))
+                        }
                         if s.hold == true { row("Áramszünet utáni várakozás", "folyamatban") }
                         row("Hiba", s.fault ?? "-", alert: (s.fault ?? "nincs") != "nincs")
                         row("Figyelmeztetés", s.warning ?? "-", alert: (s.warning ?? "nincs") != "nincs")
